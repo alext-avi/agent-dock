@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
 import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
+import { normalizeOpenCodeEvent } from '../worker/adapters/opencode.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -251,4 +252,51 @@ test('Claude Code implements the same wrapper contract and normalizes stream usa
     outputTokens: 3,
     totalTokens: 20
   });
+});
+
+test('OpenCode implements the same wrapper contract and normalizes multi-provider stream usage', async (t) => {
+  const token = 'opencode-worker-secret';
+  const worker = createWorkerServer({ token, adapter: 'opencode', demoMode: true, workspace: process.cwd() });
+  const workerUrl = await listen(worker);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    opencodeWorkerUrl: workerUrl,
+    opencodeWorkerToken: token,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const createdResponse = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'OpenCode Worker', adapter: 'opencode' })
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = (await createdResponse.json()).agent;
+  const status = await (await fetch(`${controlUrl}/api/v1/agents/${created.id}/status`)).json();
+  assert.equal(status.agent.adapter.id, 'opencode');
+  assert.equal(status.agent.adapter.provider, 'multi-provider');
+  assert.equal(status.authentication.method, 'provider_device_code');
+  assert.equal(status.capabilities.usage.accountActivity, false);
+
+  const normalized = normalizeOpenCodeEvent({
+    type: 'step_finish',
+    part: {
+      type: 'step-finish',
+      tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 80, write: 2 } },
+      cost: 0
+    }
+  });
+  assert.deepEqual(normalized.data.request, {
+    inputTokens: 182,
+    cachedInputTokens: 82,
+    outputTokens: 25,
+    totalTokens: 207
+  });
+  assert.equal(normalizeOpenCodeEvent({ type: 'text', part: { type: 'text', text: 'hello' } }).data.text, 'hello');
 });

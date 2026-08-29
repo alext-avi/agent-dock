@@ -8,6 +8,8 @@ services:
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CLAUDE_WORKER_URL: http://claude-worker:7777
       CLAUDE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      OPENCODE_WORKER_URL: http://opencode-worker:7777
+      OPENCODE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CONTROL_PLANE_DATA_PATH: /control-data/agents.json
     ports:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
@@ -17,6 +19,8 @@ services:
       worker:
         condition: service_healthy
       claude-worker:
+        condition: service_healthy
+      opencode-worker:
         condition: service_healthy
     restart: unless-stopped
 
@@ -81,6 +85,38 @@ services:
     init: true
     restart: unless-stopped
 
+  opencode-worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.opencode
+    environment:
+      PORT: "7777"
+      WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      AGENT_ID: opencode-worker-01
+      AGENT_ADAPTER: opencode
+      HOME: /opencode-home
+      XDG_DATA_HOME: /opencode-home/.local/share
+      XDG_CONFIG_HOME: /opencode-home/.config
+      OPENCODE_VERSION: ${OPENCODE_VERSION:-latest}
+      OPENCODE_AUTH_PROVIDER: ${OPENCODE_AUTH_PROVIDER:-github-copilot}
+      ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
+      AGENT_DATA_PATH: /agent-data/usage.json
+    volumes:
+      - opencode-auth:/opencode-home
+      - opencode-bin:/opt/opencode
+      - opencode-agent-data:/agent-data
+      - ./opencode-workspace:/workspace
+    expose:
+      - "7777"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7777/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    init: true
+    restart: unless-stopped
+
 volumes:
   codex-auth:
   codex-bin:
@@ -88,4 +124,7 @@ volumes:
   claude-auth:
   claude-bin:
   claude-agent-data:
+  opencode-auth:
+  opencode-bin:
+  opencode-agent-data:
   control-data:

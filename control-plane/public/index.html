@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=3">
+    <link rel="stylesheet" href="/styles.css?v=4">
   </head>
   <body>
     <header class="topbar">
@@ -84,12 +84,12 @@
             </dl>
             <div class="runtime-quota-grid" aria-label="Subscription quota windows">
               <div class="runtime-quota-card">
-                <div class="runtime-quota-heading"><span id="primary-quota-label">Primary quota</span><strong id="primary-quota-summary">—</strong></div>
+                <div class="runtime-quota-heading"><span id="primary-quota-label">Quota window</span><strong id="primary-quota-summary">—</strong></div>
                 <span class="quota-bar"><span id="primary-quota-bar"></span></span>
                 <small id="primary-quota-reset">Available after authentication</small>
               </div>
               <div class="runtime-quota-card">
-                <div class="runtime-quota-heading"><span id="secondary-quota-label">Secondary quota</span><strong id="secondary-quota-summary">—</strong></div>
+                <div class="runtime-quota-heading"><span id="secondary-quota-label">Additional window</span><strong id="secondary-quota-summary">—</strong></div>
                 <span class="quota-bar"><span id="secondary-quota-bar"></span></span>
                 <small id="secondary-quota-reset">Available after authentication</small>
               </div>
@@ -235,6 +235,7 @@
           <legend>Runtime template</legend>
           <label class="runtime-option selected"><input type="radio" name="runtimeTemplate" value="codex-cli" checked><span><strong>Codex CLI container</strong><small>Create the definition now; container provisioning follows separately.</small></span><span class="pill ready">available</span></label>
           <label class="runtime-option"><input type="radio" name="runtimeTemplate" value="claude-code"><span><strong>Claude Code container</strong><small>Official Claude Code CLI behind the same wrapper contract.</small></span><span class="pill ready">available</span></label>
+          <label class="runtime-option"><input type="radio" name="runtimeTemplate" value="opencode"><span><strong>OpenCode container</strong><small>Multi-provider CLI; this POC defaults login to GitHub Copilot.</small></span><span class="pill ready">available</span></label>
           <label class="runtime-option disabled"><input type="radio" name="runtimeTemplate" value="remote" disabled><span><strong>Pair existing worker</strong><small>One-time pairing without displaying worker credentials.</small></span><span class="pill neutral">planned</span></label>
         </fieldset>
         <p id="create-message" class="usage-error hidden"></p>

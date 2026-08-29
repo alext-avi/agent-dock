@@ -120,6 +120,10 @@ export function createControlPlane(options = {}) {
       'claude-code': {
         workerUrl: (options.claudeWorkerUrl ?? process.env.CLAUDE_WORKER_URL ?? '').replace(/\/$/, ''),
         workerToken: options.claudeWorkerToken ?? process.env.CLAUDE_WORKER_TOKEN ?? primaryWorkerToken
+      },
+      opencode: {
+        workerUrl: (options.opencodeWorkerUrl ?? process.env.OPENCODE_WORKER_URL ?? '').replace(/\/$/, ''),
+        workerToken: options.opencodeWorkerToken ?? process.env.OPENCODE_WORKER_TOKEN ?? primaryWorkerToken
       }
     },
     publicDir: options.publicDir ?? join(moduleDir, 'public'),

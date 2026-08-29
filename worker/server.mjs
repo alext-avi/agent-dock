@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent } from './adapters/codex.mjs';
 import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
+import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -153,9 +154,13 @@ async function listWorkspace(root, maxEntries = 250) {
 export function createWorkerServer(options = {}) {
   const demoMode = options.demoMode ?? process.env.DEMO_MODE === '1';
   const adapterId = options.adapter ?? process.env.AGENT_ADAPTER ?? 'codex-cli';
-  if (!['codex-cli', 'claude-code'].includes(adapterId)) throw new Error(`Unsupported AGENT_ADAPTER: ${adapterId}`);
-  const adapterManifest = adapterId === 'claude-code' ? claudeAdapterManifest : codexAdapterManifest;
-  const normalizeProviderEvent = adapterId === 'claude-code' ? normalizeClaudeEvent : normalizeCodexEvent;
+  if (!['codex-cli', 'claude-code', 'opencode'].includes(adapterId)) throw new Error(`Unsupported AGENT_ADAPTER: ${adapterId}`);
+  const adapterManifest = adapterId === 'claude-code'
+    ? claudeAdapterManifest
+    : adapterId === 'opencode' ? opencodeAdapterManifest : codexAdapterManifest;
+  const normalizeProviderEvent = adapterId === 'claude-code'
+    ? normalizeClaudeEvent
+    : adapterId === 'opencode' ? normalizeOpenCodeEvent : normalizeCodexEvent;
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
     port: Number(options.port ?? process.env.PORT ?? 7777),
@@ -163,6 +168,8 @@ export function createWorkerServer(options = {}) {
     adapterId,
     codexHome: options.codexHome ?? process.env.CODEX_HOME ?? '/codex-home',
     claudeHome: options.claudeHome ?? process.env.CLAUDE_HOME ?? process.env.HOME ?? '/claude-home',
+    opencodeHome: options.opencodeHome ?? process.env.OPENCODE_HOME ?? process.env.HOME ?? '/opencode-home',
+    opencodeAuthProvider: options.opencodeAuthProvider ?? process.env.OPENCODE_AUTH_PROVIDER ?? 'github-copilot',
     workspace: options.workspace ?? process.env.WORKSPACE_PATH ?? '/workspace',
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
@@ -184,7 +191,15 @@ export function createWorkerServer(options = {}) {
 
   const providerEnv = config.adapterId === 'claude-code'
     ? { ...process.env, HOME: config.claudeHome, CLAUDE_CONFIG_DIR: path.join(config.claudeHome, '.claude'), BROWSER: process.env.BROWSER ?? 'echo' }
-    : { ...process.env, CODEX_HOME: config.codexHome };
+    : config.adapterId === 'opencode'
+      ? {
+          ...process.env,
+          HOME: config.opencodeHome,
+          XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? path.join(config.opencodeHome, '.local/share'),
+          XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? path.join(config.opencodeHome, '.config'),
+          BROWSER: process.env.BROWSER ?? 'echo'
+        }
+      : { ...process.env, CODEX_HOME: config.codexHome };
 
   async function loadUsage() {
     if (!config.dataPath) return;
@@ -278,16 +293,35 @@ export function createWorkerServer(options = {}) {
     return { authenticated, status, detail: authenticated ? `Authenticated with ${method}` : 'Not authenticated' };
   }
 
+  async function readOpenCodeAuthStatus() {
+    const result = await capture('opencode', ['auth', 'list'], { env: providerEnv, cwd: config.workspace, timeout: 15_000 });
+    const empty = /(?:0\s+credentials|no\s+(?:stored\s+)?credentials|not\s+authenticated)/i.test(result.output);
+    const providerLines = result.output
+      .split('\n')
+      .map((line) => line.replace(/^[\s│└├─●○◆◇▪•]+/, '').trim())
+      .filter((line) => line && !/credentials|authentication|auth\.json|\.local\/share/i.test(line));
+    const authenticated = result.code === 0 && !empty && providerLines.length > 0;
+    return {
+      authenticated,
+      providers: authenticated ? providerLines.slice(0, 8) : [],
+      detail: authenticated
+        ? `${providerLines.length} provider connection${providerLines.length === 1 ? '' : 's'} configured`
+        : 'No provider connections configured'
+    };
+  }
+
   async function authSessionMetadata() {
     if (config.demoMode) {
       return {
-        authMode: config.adapterId === 'claude-code' ? 'claude.ai' : 'chatgpt',
+        authMode: config.adapterId === 'claude-code' ? 'claude.ai' : config.adapterId === 'opencode' ? 'provider-connections' : 'chatgpt',
         storage: 'demo',
         credentialStored: true,
-        hasRefreshToken: config.adapterId === 'codex-cli',
+        hasRefreshToken: config.adapterId === 'codex-cli' ? true : null,
         canForceRefresh: adapterManifest.capabilities.authentication.refresh,
         lastRefreshAt: state.demoAuthLastRefreshAt,
-        accessTokenExpiresAt: new Date(Date.parse(state.demoAuthLastRefreshAt) + 10 * 24 * 60 * 60 * 1000).toISOString(),
+        accessTokenExpiresAt: config.adapterId === 'codex-cli'
+          ? new Date(Date.parse(state.demoAuthLastRefreshAt) + 10 * 24 * 60 * 60 * 1000).toISOString()
+          : null,
         error: null
       };
     }
@@ -296,6 +330,20 @@ export function createWorkerServer(options = {}) {
       const login = await readClaudeAuthStatus();
       return {
         authMode: login.status?.authMethod ?? login.status?.authMode ?? 'claude.ai',
+        storage: 'cli-managed',
+        credentialStored: login.authenticated,
+        hasRefreshToken: null,
+        canForceRefresh: false,
+        lastRefreshAt: null,
+        accessTokenExpiresAt: null,
+        error: null
+      };
+    }
+
+    if (config.adapterId === 'opencode') {
+      const login = await readOpenCodeAuthStatus();
+      return {
+        authMode: 'provider-connections',
         storage: 'cli-managed',
         credentialStored: login.authenticated,
         hasRefreshToken: null,
@@ -437,7 +485,7 @@ export function createWorkerServer(options = {}) {
     if (!force && lastPoll && Date.now() - lastPoll < config.usagePollIntervalMs) return publicUsage();
 
     state.usagePollPromise = (async () => {
-      if (config.adapterId === 'claude-code') {
+      if (config.adapterId !== 'codex-cli') {
         return publicUsage();
       }
       try {
@@ -522,10 +570,12 @@ export function createWorkerServer(options = {}) {
     if (config.demoMode) return { authenticated: true, detail: 'Demo mode' };
     const result = config.adapterId === 'claude-code'
       ? await readClaudeAuthStatus()
-      : await capture('codex', ['login', 'status'], { env: providerEnv, cwd: config.workspace });
-    const authenticated = config.adapterId === 'claude-code'
-      ? result.authenticated
-      : result.code === 0 && !/not logged in/i.test(result.output);
+      : config.adapterId === 'opencode'
+        ? await readOpenCodeAuthStatus()
+        : await capture('codex', ['login', 'status'], { env: providerEnv, cwd: config.workspace });
+    const authenticated = config.adapterId === 'codex-cli'
+      ? result.code === 0 && !/not logged in/i.test(result.output)
+      : result.authenticated;
     if (authenticated) state.auth.phase = 'authenticated';
     else if (!state.loginProcess && state.auth.phase !== 'failed') state.auth.phase = 'needs_auth';
     return { authenticated, detail: result.detail ?? result.output ?? 'No login status returned' };
@@ -536,7 +586,7 @@ export function createWorkerServer(options = {}) {
     return {
       authenticated,
       phase: state.auth.phase,
-      method: config.adapterId === 'claude-code' ? 'browser_oauth' : 'device_code',
+      method: config.adapterId === 'claude-code' ? 'browser_oauth' : config.adapterId === 'opencode' ? 'provider_device_code' : 'device_code',
       detail: login?.detail ?? null,
       refreshing: Boolean(state.authRefreshPromise),
       session,
@@ -553,17 +603,59 @@ export function createWorkerServer(options = {}) {
     if (config.demoMode) return publicAuthentication();
     if (state.loginProcess) return publicAuthentication();
     state.auth = { phase: 'waiting_for_user', transcript: '', verificationUrl: null, userCode: null };
-    const command = config.adapterId === 'claude-code' ? 'claude' : 'codex';
-    const args = config.adapterId === 'claude-code' ? ['auth', 'login'] : ['login', '--device-auth'];
+    const openCodeGitHub = config.adapterId === 'opencode' && config.opencodeAuthProvider === 'github-copilot';
+    const command = config.adapterId === 'claude-code'
+      ? 'claude'
+      : config.adapterId === 'opencode' ? (openCodeGitHub ? 'script' : 'opencode') : 'codex';
+    const args = config.adapterId === 'claude-code'
+      ? ['auth', 'login']
+      : config.adapterId === 'opencode'
+        ? openCodeGitHub
+          ? ['-qefc', 'opencode auth login --provider github-copilot', '/dev/null']
+          : ['auth', 'login', '--provider', config.opencodeAuthProvider]
+        : ['login', '--device-auth'];
     const child = spawn(command, args, {
       cwd: config.workspace,
       env: providerEnv,
-      stdio: [config.adapterId === 'claude-code' ? 'pipe' : 'ignore', 'pipe', 'pipe']
+      stdio: [['claude-code', 'opencode'].includes(config.adapterId) ? 'pipe' : 'ignore', 'pipe', 'pipe']
     });
     state.loginProcess = child;
+    let openCodePromptStarted = false;
+    let openCodeDeploymentSelected = false;
     const consume = (chunk) => {
-      state.auth.transcript = clean(`${state.auth.transcript}${chunk}`).slice(-12_000);
-      Object.assign(state.auth, parseLoginTranscript(state.auth.transcript));
+      const cleanedChunk = clean(chunk.toString('utf8'));
+      const repetitiveOpenCodeSpinner = config.adapterId === 'opencode'
+        && state.auth.verificationUrl
+        && /Waiting for authorization/i.test(cleanedChunk)
+        && !/https:\/\//i.test(cleanedChunk);
+      if (!repetitiveOpenCodeSpinner) {
+        state.auth.transcript = `${state.auth.transcript}${cleanedChunk}`.slice(-12_000);
+      }
+      const challenge = parseLoginTranscript(state.auth.transcript);
+      if (challenge.verificationUrl) state.auth.verificationUrl = challenge.verificationUrl;
+      if (challenge.userCode) state.auth.userCode = challenge.userCode;
+      if (
+        config.adapterId === 'opencode'
+        && config.opencodeAuthProvider === 'github-copilot'
+        && !openCodePromptStarted
+        && /Add credential/i.test(state.auth.transcript)
+      ) {
+        openCodePromptStarted = true;
+        setTimeout(() => {
+          if (!child.killed && child.stdin.writable) child.stdin.write('\r');
+        }, 300);
+      }
+      if (
+        config.adapterId === 'opencode'
+        && config.opencodeAuthProvider === 'github-copilot'
+        && !openCodeDeploymentSelected
+        && /GitHub Enterprise/i.test(state.auth.transcript)
+      ) {
+        openCodeDeploymentSelected = true;
+        setTimeout(() => {
+          if (!child.killed && child.stdin.writable) child.stdin.write('\r');
+        }, 700);
+      }
     };
     child.stdout.on('data', consume);
     child.stderr.on('data', consume);
@@ -722,6 +814,55 @@ export function createWorkerServer(options = {}) {
     job.exitCode = code;
   }
 
+  async function runOpenCode(res, job, prompt, instructions) {
+    const fullPrompt = instructions
+      ? `Agent profile instructions:\n${instructions}\n\nTask:\n${prompt}`
+      : prompt;
+    const args = ['run', '--format', 'json', '--dir', config.workspace];
+    if (config.allowUnsandboxed) args.push('--auto');
+    args.push(fullPrompt);
+
+    const child = spawn('opencode', args, {
+      cwd: config.workspace,
+      env: providerEnv,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    job.child = child;
+    emitCanonical(res, 'task.started', {
+      taskId: job.id,
+      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions' }
+    });
+
+    let stdoutBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk.toString('utf8');
+      const lines = stdoutBuffer.split('\n');
+      stdoutBuffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { emitProviderEvent(res, JSON.parse(line), job); }
+        catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } }); }
+      }
+    });
+    child.stderr.on('data', (chunk) => emitCanonical(res, 'log', {
+      taskId: job.id,
+      data: { level: 'warning', source: 'provider', message: clean(chunk.toString('utf8')) }
+    }));
+    const code = await new Promise((resolve) => {
+      child.once('error', (error) => {
+        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
+        resolve(-1);
+      });
+      child.once('close', (exitCode) => resolve(exitCode ?? -1));
+    });
+    if (stdoutBuffer.trim()) {
+      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
+      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
+    }
+    job.status = code === 0 ? 'succeeded' : job.cancelled ? 'cancelled' : 'failed';
+    job.exitCode = code;
+  }
+
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://worker.local');
@@ -741,7 +882,7 @@ export function createWorkerServer(options = {}) {
           authStatus(),
           config.demoMode
             ? Promise.resolve({ output: `${adapterManifest.id} demo` })
-            : capture(config.adapterId === 'claude-code' ? 'claude' : 'codex', ['--version'], { env: providerEnv })
+            : capture(config.adapterId === 'claude-code' ? 'claude' : config.adapterId === 'opencode' ? 'opencode' : 'codex', ['--version'], { env: providerEnv })
         ]);
         if (login.authenticated && !state.activeJob) await refreshAccountUsage();
         const session = await authSessionMetadata();
@@ -843,6 +984,7 @@ export function createWorkerServer(options = {}) {
         try {
           if (config.demoMode) await runDemo(res, job, prompt);
           else if (config.adapterId === 'claude-code') await runClaude(res, job, prompt, instructions);
+          else if (config.adapterId === 'opencode') await runOpenCode(res, job, prompt, instructions);
           else await runCodex(res, job, prompt, instructions);
           const usage = await finalizeJobUsage(job);
           emitCanonical(res, 'usage.updated', { taskId: job.id, data: { usage } });

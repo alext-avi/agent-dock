@@ -88,6 +88,11 @@ let authPolling = null;
 let refreshingAuth = false;
 let currentAgent = null;
 let currentHarnessName = 'Agent';
+let dashboardAgents = [];
+let dashboardFingerprint = '';
+let dashboardRefreshInFlight = false;
+let statusRefreshInFlight = false;
+let liveUpdateTimer = null;
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -112,6 +117,7 @@ function agentApi(operation = '') {
 function adapterLabel(adapter) {
   if (adapter === 'codex-cli') return 'Codex CLI';
   if (adapter === 'claude-code') return 'Claude Code';
+  if (adapter === 'opencode') return 'OpenCode';
   return adapter || 'Agent runtime';
 }
 
@@ -139,6 +145,45 @@ function timeUntil(iso) {
   if (days > 0) return `in ${days}d ${hours % 24}h`;
   if (hours > 0) return `in ${hours}h`;
   return `in ${Math.max(1, Math.floor(delta / 60_000))}m`;
+}
+
+function formatQuotaDuration(minutes) {
+  const value = Number(minutes);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  if (value >= 6.5 * 24 * 60) return `${Math.max(1, Math.round(value / (7 * 24 * 60)))}w`;
+  if (value >= 24 * 60) return `${Math.max(1, Math.round(value / (24 * 60)))}d`;
+  if (value >= 60) {
+    const hours = value / 60;
+    return `${Number.isInteger(hours) ? hours : hours.toFixed(1).replace(/\.0$/, '')}h`;
+  }
+  return `${Math.round(value)}m`;
+}
+
+function quotaWindowLabel(window, fallback = 'Quota window') {
+  const duration = formatQuotaDuration(window?.windowDurationMinutes);
+  return duration ? `${duration} limit` : fallback;
+}
+
+function quotaRefreshLabel(epochSeconds) {
+  const timestamp = Number(epochSeconds) * 1000;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+  const delta = timestamp - Date.now();
+  if (delta <= 0) return 'refreshing now';
+  const minutes = Math.max(1, Math.ceil(delta / 60_000));
+  if (minutes < 60) return `refreshes in ${minutes} min`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `refreshes in ${hours} hr`;
+  const days = Math.ceil(hours / 24);
+  if (days < 7) return `refreshes in ${days} day${days === 1 ? '' : 's'}`;
+  const weeks = Math.ceil(days / 7);
+  return `refreshes in ${weeks} week${weeks === 1 ? '' : 's'}`;
+}
+
+function startLiveUpdates(callback, intervalMs = 3000) {
+  if (liveUpdateTimer) clearInterval(liveUpdateTimer);
+  liveUpdateTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') callback();
+  }, intervalMs);
 }
 
 function formatDuration(milliseconds) {
@@ -178,8 +223,8 @@ function createAgentCard(agent) {
     </div>
     <p class="agent-card-description"></p>
     <div class="card-quota-windows" aria-label="Subscription quota windows">
-      <div class="card-quota-row card-quota-primary"><div><span class="card-quota-label">Primary quota</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
-      <div class="card-quota-row card-quota-secondary"><div><span class="card-quota-label">Secondary quota</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
+      <div class="card-quota-row card-quota-primary"><div><span class="card-quota-label">Quota window</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
+      <div class="card-quota-row card-quota-secondary"><div><span class="card-quota-label">Additional window</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
     </div>
     <dl class="card-metrics">
       <div><dt>AUTH</dt><dd class="card-auth">—</dd></div>
@@ -208,6 +253,15 @@ function createAgentCard(agent) {
   return card;
 }
 
+function renderAgentGrid(agents) {
+  dashboardAgents = agents;
+  dashboardFingerprint = JSON.stringify(agents.map((agent) => [agent.id, agent.updatedAt]));
+  ui.agentGrid.replaceChildren();
+  ui.agentCount.textContent = String(agents.length).padStart(2, '0');
+  ui.emptyFleet.classList.toggle('hidden', agents.length !== 0);
+  for (const agent of agents) ui.agentGrid.append(createAgentCard(agent));
+}
+
 function updateAgentCard(card, status) {
   const authenticated = Boolean(status.authentication?.authenticated);
   const active = Boolean(status.task?.active);
@@ -221,8 +275,9 @@ function updateAgentCard(card, status) {
   card.querySelector('.card-requests').textContent = formatTokens(status.usage?.totals?.requests ?? 0);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Primary quota');
-  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Secondary quota');
+  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Quota window');
+  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Additional window');
+  card.querySelector('.card-update').textContent = `live · ${relativeTime(new Date().toISOString())}`;
 }
 
 function quotaFillClass(used) {
@@ -233,7 +288,10 @@ function quotaFillClass(used) {
 
 function renderCardQuota(row, window, fallbackLabel) {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
-  row.querySelector('.card-quota-label').textContent = window?.label || fallbackLabel;
+  const refresh = quotaRefreshLabel(window?.resetsAt);
+  row.querySelector('.card-quota-label').textContent = window
+    ? `${quotaWindowLabel(window, fallbackLabel)}${refresh ? ` · ${refresh}` : ''}`
+    : fallbackLabel;
   row.querySelector('.card-quota-value').textContent = window ? `${used.toFixed(0)}%` : 'Unavailable';
   const fill = row.querySelector('.quota-bar span');
   fill.style.width = window ? `${used}%` : '0%';
@@ -255,12 +313,25 @@ async function loadDashboard() {
   try {
     const { agents } = await api(`${API_ROOT}/agents`);
     setConnection('online', 'Control plane online');
-    ui.agentGrid.replaceChildren();
-    ui.agentCount.textContent = String(agents.length).padStart(2, '0');
-    ui.emptyFleet.classList.toggle('hidden', agents.length !== 0);
-    for (const agent of agents) ui.agentGrid.append(createAgentCard(agent));
-    await Promise.allSettled(agents.map(async (agent) => {
+    renderAgentGrid(agents);
+    await refreshDashboardStatuses();
+    startLiveUpdates(refreshDashboardStatuses);
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.agentGrid.innerHTML = '<article class="panel"><p class="usage-error">Could not load the agent registry.</p></article>';
+  }
+}
+
+async function refreshDashboardStatuses() {
+  if (dashboardRefreshInFlight) return;
+  dashboardRefreshInFlight = true;
+  try {
+    const { agents } = await api(`${API_ROOT}/agents`);
+    const nextFingerprint = JSON.stringify(agents.map((agent) => [agent.id, agent.updatedAt]));
+    if (nextFingerprint !== dashboardFingerprint) renderAgentGrid(agents);
+    await Promise.allSettled(dashboardAgents.map(async (agent) => {
       const card = [...ui.agentGrid.children].find((candidate) => candidate.dataset.agentId === agent.id);
+      if (!card) return;
       try {
         const status = await api(`${API_ROOT}/agents/${encodeURIComponent(agent.id)}/status`, { signal: AbortSignal.timeout(3500) });
         updateAgentCard(card, status);
@@ -268,9 +339,11 @@ async function loadDashboard() {
         markAgentCardOffline(card, error.message);
       }
     }));
+    setConnection('online', 'Live fleet status');
   } catch (error) {
     setConnection('offline', error.message);
-    ui.agentGrid.innerHTML = '<article class="panel"><p class="usage-error">Could not load the agent registry.</p></article>';
+  } finally {
+    dashboardRefreshInFlight = false;
   }
 }
 
@@ -287,7 +360,7 @@ async function createAgent(event) {
   submit.disabled = true;
   try {
     const body = Object.fromEntries(new FormData(ui.createForm));
-    body.adapter = body.runtimeTemplate === 'claude-code' ? 'claude-code' : 'codex-cli';
+    body.adapter = ['codex-cli', 'claude-code', 'opencode'].includes(body.runtimeTemplate) ? body.runtimeTemplate : 'codex-cli';
     delete body.runtimeTemplate;
     const { agent } = await api(`${API_ROOT}/agents`, { method: 'POST', body: JSON.stringify(body) });
     window.location.assign(`/agents/${encodeURIComponent(agent.id)}#instructions`);
@@ -367,7 +440,9 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
   const expiry = session.accessTokenExpiresAt ? new Date(session.accessTokenExpiresAt) : null;
   const lastRefresh = session.lastRefreshAt ? new Date(session.lastRefreshAt) : null;
   ui.authExpiry.textContent = expiry && !Number.isNaN(expiry.valueOf()) ? expiry.toLocaleString() : 'Unavailable';
-  ui.authExpiryDetail.textContent = `${timeUntil(session.accessTokenExpiresAt)} · automatically renewable`;
+  ui.authExpiryDetail.textContent = expiry && !Number.isNaN(expiry.valueOf())
+    ? `${timeUntil(session.accessTokenExpiresAt)} · automatically renewable`
+    : 'Managed by the CLI; expiry metadata unavailable.';
   ui.authLastRefresh.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? relativeTime(session.lastRefreshAt) : 'Unavailable';
   ui.authLastRefreshDetail.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? lastRefresh.toLocaleString() : 'No refresh metadata available.';
   ui.runtimeDetailsHint.textContent = expiry && !Number.isNaN(expiry.valueOf())
@@ -404,8 +479,9 @@ function renderQuotaRow(label, window) {
   const reset = document.createElement('small');
   reset.className = 'quota-reset';
   const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
-  const duration = window?.windowDurationMinutes ? `${window.windowDurationMinutes}m window` : 'quota window';
-  reset.textContent = resetDate ? `${duration} · resets ${resetDate.toLocaleString()}` : duration;
+  const formattedDuration = formatQuotaDuration(window?.windowDurationMinutes);
+  const duration = formattedDuration ? `${formattedDuration} window` : 'quota window';
+  reset.textContent = resetDate ? quotaRefreshLabel(window.resetsAt) : duration;
   row.append(name, bar, value, reset);
   return row;
 }
@@ -416,14 +492,12 @@ function renderRuntimeQuota(scope, window, fallbackLabel) {
   const summary = ui[`${scope}QuotaSummary`];
   const bar = ui[`${scope}QuotaBar`];
   const reset = ui[`${scope}QuotaReset`];
-  label.textContent = window?.label || fallbackLabel;
+  label.textContent = quotaWindowLabel(window, fallbackLabel);
   summary.textContent = window ? `${used.toFixed(0)}% used` : 'Unavailable';
   bar.style.width = window ? `${used}%` : '0%';
   bar.className = quotaFillClass(used);
-  const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
-  const duration = window?.windowDurationMinutes ? `${window.windowDurationMinutes}m window` : 'quota window';
   reset.textContent = window
-    ? (resetDate ? `${duration} · resets ${resetDate.toLocaleString()}` : duration)
+    ? (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable')
     : `${currentHarnessName} does not currently expose this window`;
 }
 
@@ -442,8 +516,8 @@ function renderUsage(usage = {}) {
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderRuntimeQuota('primary', primary, 'Primary quota');
-  renderRuntimeQuota('secondary', secondary, 'Secondary quota');
+  renderRuntimeQuota('primary', primary, 'Quota window');
+  renderRuntimeQuota('secondary', secondary, 'Additional window');
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
@@ -452,7 +526,7 @@ function renderUsage(usage = {}) {
     ui.quotaWindows.append(empty);
     return;
   }
-  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(window.label || currentHarnessName, window));
+  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(quotaWindowLabel(window), window));
 }
 
 function renderStatus(status) {
@@ -477,7 +551,7 @@ function renderStatus(status) {
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   const browserOAuth = status.authentication?.method === 'browser_oauth';
   ui.authCopy.textContent = authenticated
-    ? `The worker holds a renewable ${currentHarnessName} login. Safe session dates are surfaced; credentials never leave the worker.`
+    ? `The worker holds a CLI-managed ${currentHarnessName} login. Safe session metadata is surfaced; credentials never leave the worker.`
     : browserOAuth
       ? `The worker starts ${currentHarnessName}'s browser OAuth flow. Agent Dock forwards only the provider's one-time completion code and never stores it.`
       : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
@@ -511,6 +585,8 @@ function renderRuntimeUnavailable(message) {
   ui.jobState.textContent = 'idle';
   ui.primaryQuotaSummary.textContent = '—';
   ui.secondaryQuotaSummary.textContent = '—';
+  ui.primaryQuotaLabel.textContent = 'Quota window';
+  ui.secondaryQuotaLabel.textContent = 'Additional window';
   ui.primaryQuotaBar.style.width = '0%';
   ui.secondaryQuotaBar.style.width = '0%';
   ui.primaryQuotaReset.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
@@ -529,7 +605,8 @@ function renderRuntimeUnavailable(message) {
 }
 
 async function refreshStatus() {
-  if (!currentAgent) return;
+  if (!currentAgent || statusRefreshInFlight) return;
+  statusRefreshInFlight = true;
   try {
     const status = await api(agentApi('status'));
     renderStatus(status);
@@ -539,6 +616,8 @@ async function refreshStatus() {
     }
   } catch (error) {
     renderRuntimeUnavailable(error.message);
+  } finally {
+    statusRefreshInFlight = false;
   }
 }
 
@@ -754,7 +833,7 @@ async function loadAgent(id) {
     document.title = `${currentAgent.name} — Agent Dock`;
     selectTab(location.hash.slice(1), { updateHash: false });
     await Promise.all([refreshStatus(), refreshWorkspace()]);
-    setInterval(() => { if (!running) refreshStatus(); }, 5000);
+    startLiveUpdates(refreshStatus);
   } catch (error) {
     setConnection('offline', error.message);
     ui.pageAgentName.textContent = 'Agent unavailable';

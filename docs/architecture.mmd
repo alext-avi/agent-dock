@@ -1,6 +1,6 @@
 flowchart TB
-  subgraph Client["Browser · HTML5 + CSS + vanilla JavaScript ES modules"]
-    UI["Fleet dashboard\nAgent config + test UI"]
+  subgraph Client["Current web client · HTML5 + CSS + vanilla JavaScript ES modules"]
+    UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware 3s live status polling"]
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
@@ -30,20 +30,40 @@ flowchart TB
       AW --- AV
       AW --- AWS
     end
+
+    subgraph OpenCodeWorker["OpenCode worker · Node.js 22 wrapper · non-root user"]
+      OW["agent-wrapper/v1"]
+      OA["OpenCode adapter"]
+      OC["Official opencode-ai CLI"]
+      OV["Named volumes\nProvider auth · binary cache · telemetry"]
+      OWS["Bind-mounted /workspace"]
+      OW --> OA --> OC
+      OW --- OV
+      OW --- OWS
+    end
   end
 
   OpenAI["OpenAI subscription service\nDevice authorization + Codex execution"]
   Anthropic["Anthropic subscription service\nBrowser OAuth + Claude execution"]
+  Providers["Supported OpenCode providers\nGitHub Copilot device authorization by default"]
   MCP["Future MCP/tool recipes"]
   Data["Future attached data volumes"]
+  React["Planned web client\nReact + TypeScript + Vite"]
+  Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
   API <--> Registry
   API -->|"Bearer-authenticated agent-wrapper/v1\nJSON status + NDJSON task events"| CW
   API -->|"Identical contract"| AW
+  API -->|"Identical contract"| OW
   CC <--> OpenAI
   AC <--> Anthropic
+  OC <--> Providers
+  UI -.->|"staged migration"| React
+  Registry -.->|"data migration"| Database
   MCP -.-> CW
   MCP -.-> AW
+  MCP -.-> OW
   Data -.-> CWS
   Data -.-> AWS
+  Data -.-> OWS

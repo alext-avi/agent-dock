@@ -1,6 +1,6 @@
 # Agent Dock: containerized subscription-agent POC
 
-This proof of concept registers independently configured agents in a small control plane and connects each one to a vendor-neutral worker API. The included Docker stack runs separate Codex CLI, Claude Code, and multi-provider OpenCode identities in isolated worker containers. Each container installs its CLI on first boot, keeps its own CLI-managed authentication volume, and translates provider output into the versioned Agent Wrapper event protocol.
+This proof of concept registers independently configured agents in a small control plane and connects each one to a vendor-neutral worker API. Every newly managed agent owns an exclusive Codex CLI, Claude Code, or multi-provider OpenCode worker container plus private CLI-binary, authentication, telemetry, and workspace volumes. Each container installs its CLI on first boot and translates provider output into the versioned Agent Wrapper event protocol.
 
 It is meant to validate the architecture—not to automate subscription creation, rotate accounts, resell access, or hide provider usage limits.
 
@@ -14,26 +14,27 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000). **Codex Worker 01** uses OpenAI's device flow. Create a Claude Code agent from the dashboard to pair it with the included Claude worker, then use **Start browser login**. Claude Code may return a one-time authorization code after browser sign-in; Agent Dock forwards that code to the waiting CLI process without logging or persisting it. Create an OpenCode agent to pair it with the third worker; this POC defaults OpenCode authentication to the officially supported GitHub Copilot device flow and automatically selects public GitHub.com before surfacing the provider URL/code. Nothing in this repository asks for or accepts a provider password, session cookie, API key, or stored OAuth token.
+Open [http://localhost:3000](http://localhost:3000). **Codex Worker 01** is the legacy bootstrap runtime and uses OpenAI's device flow. Creating another agent provisions a fresh isolated container. A Claude Code agent uses **Start browser login**; Claude Code may return a one-time authorization code after browser sign-in, which Agent Dock forwards to that agent's waiting CLI process without logging or persisting it. An OpenCode agent defaults to the officially supported GitHub Copilot device flow and automatically selects public GitHub.com before surfacing the provider URL/code. Nothing in this repository asks for or accepts a provider password, session cookie, API key, or stored OAuth token.
 
 When Ollama is listening on the host's default port, the OpenCode worker discovers its models through `host.docker.internal`, generates a private OpenCode provider config in the worker's data volume, and exposes safe model metadata in the agent configuration page. Choose a model under **Instructions → Model policy** and save it to pin that agent. Choose **OpenCode provider default** to keep using the CLI's current provider. The browser-facing API does not return the Ollama endpoint, and Agent Dock never silently falls back between a local model and a subscription provider. Linux Compose uses the `host-gateway` mapping; override `OLLAMA_BASE_URL` if the Ollama service lives elsewhere.
 
 If port 3000 is already occupied, set `CONTROL_PLANE_PORT` in `.env` before starting Compose—for example, `CONTROL_PLANE_PORT=3080` makes the UI available at `http://localhost:3080`.
 
-The first boot can take a minute because each worker installs its CLI at runtime. The `codex-bin`, `claude-bin`, and `opencode-bin` volumes cache those installations; their matching auth volumes retain independent CLI-managed logins across restarts. The `control-data` volume stores agent records and durable prompts. Set `CODEX_VERSION`, `CLAUDE_VERSION`, or `OPENCODE_VERSION` in `.env` to pin a release.
+The first boot of each agent can take a minute because its worker installs its own CLI at runtime. Managed runtimes deliberately do not share writable binary caches or auth homes: each receives four uniquely named volumes for its CLI installation, credentials/config, telemetry, and workspace. The `control-data` volume stores schema-v2 agent definitions and runtime bindings. Set `CODEX_VERSION`, `CLAUDE_VERSION`, or `OPENCODE_VERSION` in `.env` to pin a release.
 
 The worker image includes the operating-system CA certificate bundle required by the Codex CLI for TLS connections during device authentication.
 
-Codex artifacts appear in [`workspace/`](./workspace), Claude artifacts in [`claude-workspace/`](./claude-workspace), and OpenCode artifacts in [`opencode-workspace/`](./opencode-workspace).
+Artifacts created by the three legacy bootstrap workers appear in [`workspace/`](./workspace), [`claude-workspace/`](./claude-workspace), and [`opencode-workspace/`](./opencode-workspace). Newly provisioned agents use exclusive Docker workspace volumes and expose their artifact inventory through the wrapper API.
 
 ## What the POC proves
 
 ```mermaid
 flowchart LR
   B["Dashboard + agent config/test UI"] -->|"same-origin HTTP"| C["Control plane + agent registry"]
-  C -->|"Agent Wrapper v1"| W1["Codex worker"]
-  C -->|"same contract"| W2["Claude Code worker"]
-  C -->|"same contract"| W3["OpenCode worker"]
+  C -->|"Docker Engine API"| P["Exclusive runtime provisioner"]
+  P -->|"Agent Wrapper v1"| W1["Dedicated Codex worker"]
+  P -->|"same contract"| W2["Dedicated Claude Code worker"]
+  P -->|"same contract"| W3["Dedicated OpenCode worker"]
   W1 --> A1["Codex adapter"]
   W2 --> A2["Claude adapter"]
   W3 --> A3["OpenCode adapter"]
@@ -41,13 +42,15 @@ flowchart LR
   A2 -->|"browser OAuth"| O2["Anthropic authentication"]
   A3 -->|"provider auth"| O3["GitHub Copilot by default"]
   A3 -->|"credentialless local inference"| O4["Host Ollama"]
-  W1 --> V1["Codex auth + workspace volumes"]
-  W2 --> V2["Claude auth + workspace volumes"]
-  W3 --> V3["OpenCode auth + workspace volumes"]
+  W1 --> V1["Private binary + auth + telemetry + workspace volumes"]
+  W2 --> V2["Private binary + auth + telemetry + workspace volumes"]
+  W3 --> V3["Private binary + auth + telemetry + workspace volumes"]
 ```
 
-- The web tier never needs the Docker socket or provider credentials.
-- The fleet dashboard supports create, read, update, and delete for agent records, then reports each reachable runtime's auth, activity, usage, and request count.
+- The browser never receives the Docker socket, worker routing secrets, or provider credentials. In this local POC, the server-side control-plane container uses the Docker socket to provision runtimes; this is a privileged host boundary and must become a constrained provisioner service before multi-user deployment.
+- The fleet dashboard supports create, read, update, and lifecycle-aware delete for agent records, then reports each reachable runtime's auth, activity, usage, and request count.
+- Newly managed agents cannot share a runtime. The API rejects attaching a runtime that already has an owner.
+- Deleting a managed agent explicitly chooses between stopping and retaining all isolated state for later exclusive reattachment, or destroying the container and every private volume after exact-ID confirmation.
 - Fleet and agent runtime status refresh every three seconds while the browser tab is visible, with overlapping requests deduplicated.
 - Each agent has a durable prompt stored by the control plane and a separate, intentionally ephemeral test conversation.
 - The agent workspace puts live runtime, authentication, and usage data in its header, with separate Instructions, Tools & MCP, Data, and Test areas.
@@ -78,6 +81,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET` | `/api/v1/health` | Control-plane and worker reachability |
 | `GET`, `POST` | `/api/v1/agents` | List or create agent records |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/agents/:id` | Read, edit, or delete one agent record |
+| `GET` | `/api/v1/runtimes` | List safe runtime identities, lifecycle state, isolation mode, and attachment counts |
 | `GET` | `/api/v1/agents/:id/status` | Adapter, capability, auth, task, execution, and usage status |
 | `GET` | `/api/v1/agents/:id/providers` | Safe provider-connection health and discoverable model metadata; never credentials or private endpoint URLs |
 | `POST` | `/api/v1/agents/:id/auth/login` | Start the adapter's interactive login flow |
@@ -91,6 +95,18 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 
 The original unscoped runtime routes remain aliases for the default agent during the POC.
 
+Creation makes runtime ownership explicit:
+
+```json
+{
+  "name": "Claude Research",
+  "adapter": "claude-code",
+  "runtime": { "mode": "provision" }
+}
+```
+
+`runtime.mode: "attach"` requires the ID of an unbound retained runtime and fails with `409` if another agent owns it. Deleting an agent with a runtime requires `{ "runtimeAction": "retain" }` to stop and preserve it, or `{ "runtimeAction": "destroy", "confirmation": "agent-id" }` to permanently remove the container and all four isolated volumes.
+
 Example without the UI:
 
 ```bash
@@ -103,11 +119,11 @@ curl -N http://localhost:3000/api/v1/agents/worker-01/tasks \
 
 The worker invokes `codex exec --dangerously-bypass-approvals-and-sandbox` by default because the Docker container is the POC's non-interactive execution boundary. The agent can modify the bind-mounted `workspace/`, run processes inside the worker, and use the worker's network. Do not mount source, SSH keys, cloud credentials, the Docker socket, or sensitive host paths into it. Set `ALLOW_UNSANDBOXED=0` to use Codex's `workspace-write` sandbox instead, understanding that unattended tool execution may be more constrained.
 
-The included Compose file provisions one singleton Codex worker, one singleton Claude Code worker, and one singleton OpenCode worker. Creating a built-in runtime type pairs the agent record to that provider's existing worker template; it does not create an additional container or volume set. Consequently, two records mapped to the same template also map to the same CLI login. The UI labels these bindings as singleton runtimes rather than implying dedicated isolation. One-container-and-auth-volume-per-agent provisioning, one-time remote-worker pairing, MCP installation, and arbitrary data mounts remain distinct next capabilities. The Tools & MCP and Data tabs establish those future management surfaces without presenting nonfunctional credential or mount controls.
+The included Compose file retains one bootstrap worker for each adapter so schema-v1 installations can migrate without losing logins. Those bindings are labeled `shared-legacy`, and the control plane prevents newly created agents from attaching to an already-bound bootstrap runtime. All new managed agents provision an exclusive container and complete private volume set. One-time remote-worker pairing, MCP installation, and arbitrary data mounts remain distinct next capabilities. The Tools & MCP and Data tabs establish those future management surfaces without presenting nonfunctional credential or mount controls.
 
 This prototype deliberately omits multi-tenancy, scheduling, webhooks, queue durability, automatic model fallback, usage-limit routing, TLS, user authentication for the web UI, remote secret management, egress controls, and container resource limits. The control-plane registry is currently a single JSON file and the browser is vanilla JavaScript; SQLite/Postgres-ready persistence and a React/TypeScript frontend are tracked architectural follow-ons. Usage telemetry and agent configuration are durable; jobs, event streams, and test conversations are not.
 
-The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. The control plane's worker bearer token is transport authentication—not a provider credential—and is stored in the server-side registry for this POC. Give each independently authenticated worker its own auth volume and do not mount one `auth.json` into concurrent workers. For remote deployment, put the UI behind real authentication and TLS, replace stored bearer tokens with secret-manager references or pairing credentials, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
+The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. Each managed runtime has a unique random wrapper bearer token stored only in the server-side registry and its worker environment; it is transport authentication, not a provider credential. Mounting `/var/run/docker.sock` gives the local control plane host-level container authority. For remote deployment, isolate that authority behind a narrowly scoped provisioner, put the UI behind real authentication and TLS, replace stored bearer tokens with secret-manager references or pairing credentials, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
 
 Users and operators remain responsible for complying with applicable OpenAI terms and account rules. This project does not implement automatic account rollover or subscription provisioning.
 

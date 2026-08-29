@@ -1,5 +1,6 @@
 services:
   control-plane:
+    image: agent-dock-control-plane:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./control-plane
     environment:
@@ -11,10 +12,21 @@ services:
       OPENCODE_WORKER_URL: http://opencode-worker:7777
       OPENCODE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CONTROL_PLANE_DATA_PATH: /control-data/agents.json
+      RUNTIME_PROVISIONER: docker
+      DOCKER_SOCKET_PATH: /var/run/docker.sock
+      CODEX_WORKER_IMAGE: agent-dock-worker-codex:${AGENT_DOCK_IMAGE_TAG:-local}
+      CLAUDE_WORKER_IMAGE: agent-dock-worker-claude:${AGENT_DOCK_IMAGE_TAG:-local}
+      OPENCODE_WORKER_IMAGE: agent-dock-worker-opencode:${AGENT_DOCK_IMAGE_TAG:-local}
+      CODEX_VERSION: ${CODEX_VERSION:-latest}
+      CLAUDE_VERSION: ${CLAUDE_VERSION:-latest}
+      OPENCODE_VERSION: ${OPENCODE_VERSION:-latest}
+      ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
+      USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
     ports:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - control-data:/control-data
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       worker:
         condition: service_healthy
@@ -25,6 +37,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: agent-dock-worker-codex:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./worker
     environment:
@@ -52,6 +65,7 @@ services:
     restart: unless-stopped
 
   claude-worker:
+    image: agent-dock-worker-claude:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./worker
       dockerfile: Dockerfile.claude
@@ -86,6 +100,7 @@ services:
     restart: unless-stopped
 
   opencode-worker:
+    image: agent-dock-worker-opencode:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./worker
       dockerfile: Dockerfile.opencode

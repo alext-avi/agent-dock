@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,11 +16,85 @@ async function listen(server) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
+function createStatusWorker({ workerId, token, authenticated }) {
+  return createServer((req, res) => {
+    if (req.url === '/v1/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'unauthorized' }));
+    }
+    if (req.url === '/v1/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({
+        apiVersion: 'agent-wrapper/v1',
+        agent: { id: workerId, adapter: { id: 'claude-code', provider: 'anthropic', displayName: 'Claude Code' } },
+        authentication: { authenticated, phase: authenticated ? 'authenticated' : 'unauthenticated' },
+        task: { active: null },
+        usage: { totals: { requests: 0 }, quotaWindows: [] }
+      }));
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+}
+
+class FakeRuntimeManager {
+  constructor(definitions) {
+    this.definitions = [...definitions];
+    this.provisioned = [];
+    this.started = [];
+    this.stopped = [];
+    this.destroyed = [];
+  }
+
+  async provision({ agentId, adapter }) {
+    const definition = this.definitions.shift();
+    if (!definition) throw new Error('No fake runtime available');
+    const suffix = this.provisioned.length + 1;
+    const runtime = {
+      id: `runtime-${suffix}`,
+      adapter,
+      kind: 'managed-dedicated',
+      managed: true,
+      dedicated: true,
+      workerId: definition.workerId,
+      workerUrl: definition.workerUrl,
+      workerToken: definition.token,
+      containerId: `container-${suffix}`,
+      volumes: {
+        auth: `auth-${suffix}`,
+        binary: `binary-${suffix}`,
+        telemetry: `telemetry-${suffix}`,
+        workspace: `workspace-${suffix}`
+      },
+      state: 'running',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      agentId
+    };
+    this.provisioned.push(runtime);
+    return runtime;
+  }
+
+  async inspect(runtime) { return { state: runtime.state, health: 'healthy' }; }
+  async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
+  async stop(runtime) { runtime.state = 'stopped'; this.stopped.push(runtime.id); }
+  async destroy(runtime) { this.destroyed.push(runtime.id); }
+}
+
 test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) => {
   const token = 'test-worker-secret';
   const worker = createWorkerServer({ token, demoMode: true, workspace: process.cwd() });
   const workerUrl = await listen(worker);
-  const control = createControlPlane({ workerUrl, workerToken: token });
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    claudeWorkerUrl: workerUrl,
+    claudeWorkerToken: token
+  });
   const controlUrl = await listen(control);
   t.after(() => Promise.all([
     new Promise((resolve) => control.close(resolve)),
@@ -47,8 +121,11 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const initialAgents = (await agentsResponse.json()).agents;
   assert.equal(initialAgents.length, 1);
   assert.equal(initialAgents[0].id, 'worker-01');
-  assert.deepEqual(initialAgents[0].runtime, {
-    binding: 'included-singleton', dedicated: false, credentials: 'worker-local'
+  assert.equal(initialAgents[0].runtime.binding, 'shared-legacy');
+  assert.equal(initialAgents[0].runtime.dedicated, false);
+  assert.equal(initialAgents[0].runtime.credentials, 'shared-worker-local');
+  assert.deepEqual(initialAgents[0].runtime.storage, {
+    auth: 'shared', binary: 'shared', telemetry: 'shared', workspace: 'shared'
   });
   assert.deepEqual(initialAgents[0].modelPolicy, {
     mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false
@@ -123,8 +200,7 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
       description: 'Second registered runtime',
       adapter: 'claude-code',
       durablePrompt: 'Keep research concise.',
-      workerUrl,
-      workerToken: token
+      runtime: { mode: 'attach', id: 'legacy-claude-code' }
     })
   });
   assert.equal(createResponse.status, 201);
@@ -153,7 +229,11 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   assert.match(agentPage, /Tools &amp; MCP/);
   assert.match(agentPage, /Attach data or volume/);
 
-  const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, { method: 'DELETE' });
+  const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'retain' })
+  });
   assert.equal(deleteResponse.status, 204);
   assert.equal((await fetch(`${controlUrl}/api/v1/agents/${created.id}`)).status, 404);
 });
@@ -208,6 +288,160 @@ test('control plane injects the saved prompt and rejects a per-request override'
   });
 });
 
+test('two same-adapter agents receive exclusive runtimes and different authentication states', async (t) => {
+  const firstWorker = createStatusWorker({ workerId: 'claude-isolated-1', token: 'token-one', authenticated: true });
+  const secondWorker = createStatusWorker({ workerId: 'claude-isolated-2', token: 'token-two', authenticated: false });
+  const firstUrl = await listen(firstWorker);
+  const secondUrl = await listen(secondWorker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'claude-isolated-1', token: 'token-one', workerUrl: firstUrl },
+    { workerId: 'claude-isolated-2', token: 'token-two', workerUrl: secondUrl }
+  ]);
+  const control = createControlPlane({
+    workerUrl: firstUrl,
+    workerToken: 'legacy-token',
+    runtimeManager: manager,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => firstWorker.close(resolve)),
+    new Promise((resolve) => secondWorker.close(resolve))
+  ]));
+
+  const create = (name) => fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, adapter: 'claude-code', runtime: { mode: 'provision' } })
+  });
+  const firstResponse = await create('Claude Isolated One');
+  const secondResponse = await create('Claude Isolated Two');
+  assert.equal(firstResponse.status, 201);
+  assert.equal(secondResponse.status, 201);
+  const first = (await firstResponse.json()).agent;
+  const second = (await secondResponse.json()).agent;
+
+  assert.notEqual(first.runtime.id, second.runtime.id);
+  assert.notEqual(first.runtime.workerId, second.runtime.workerId);
+  assert.equal(first.runtime.binding, 'dedicated');
+  assert.equal(second.runtime.binding, 'dedicated');
+  assert.equal(first.runtime.credentials, 'isolated-worker-local');
+  assert.deepEqual(first.runtime.storage, {
+    auth: 'isolated', binary: 'isolated', telemetry: 'isolated', workspace: 'isolated'
+  });
+  assert.doesNotMatch(JSON.stringify([first, second]), /token-one|token-two|auth-1|auth-2|container-1|container-2|127\.0\.0\.1/);
+  for (const volumeType of ['auth', 'binary', 'telemetry', 'workspace']) {
+    assert.notEqual(manager.provisioned[0].volumes[volumeType], manager.provisioned[1].volumes[volumeType]);
+  }
+
+  const firstStatus = await (await fetch(`${controlUrl}/api/v1/agents/${first.id}/status`)).json();
+  const secondStatus = await (await fetch(`${controlUrl}/api/v1/agents/${second.id}/status`)).json();
+  assert.equal(firstStatus.agent.id, 'claude-isolated-1');
+  assert.equal(firstStatus.authentication.authenticated, true);
+  assert.equal(secondStatus.agent.id, 'claude-isolated-2');
+  assert.equal(secondStatus.authentication.authenticated, false);
+
+  const crossAttach = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Forbidden Shared Agent',
+      adapter: 'claude-code',
+      runtime: { mode: 'attach', id: first.runtime.id }
+    })
+  });
+  assert.equal(crossAttach.status, 409);
+  assert.match((await crossAttach.json()).error, /already bound/);
+
+  const ambiguousDelete = await fetch(`${controlUrl}/api/v1/agents/${first.id}`, { method: 'DELETE' });
+  assert.equal(ambiguousDelete.status, 400);
+  const unsafeDelete = await fetch(`${controlUrl}/api/v1/agents/${first.id}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'destroy', confirmation: 'wrong-agent' })
+  });
+  assert.equal(unsafeDelete.status, 400);
+
+  const retain = await fetch(`${controlUrl}/api/v1/agents/${first.id}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'retain' })
+  });
+  assert.equal(retain.status, 204);
+  assert.deepEqual(manager.stopped, [first.runtime.id]);
+  const retained = (await (await fetch(`${controlUrl}/api/v1/runtimes`)).json()).runtimes.find((runtime) => runtime.id === first.runtime.id);
+  assert.equal(retained.binding, 'retained');
+  assert.equal(retained.attachmentCount, 0);
+
+  const reattach = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Claude Reattached',
+      adapter: 'claude-code',
+      runtime: { mode: 'attach', id: first.runtime.id }
+    })
+  });
+  assert.equal(reattach.status, 201);
+  const reattached = (await reattach.json()).agent;
+  assert.equal(reattached.runtime.binding, 'attached');
+  assert.equal(reattached.runtime.dedicated, true);
+  assert.deepEqual(manager.started, [first.runtime.id]);
+
+  const destroy = await fetch(`${controlUrl}/api/v1/agents/${reattached.id}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'destroy', confirmation: reattached.id })
+  });
+  assert.equal(destroy.status, 204);
+  assert.deepEqual(manager.destroyed, [first.runtime.id]);
+});
+
+test('schema-v1 singleton records migrate to one explicitly shared legacy runtime', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-migration-'));
+  const dataPath = join(temporary, 'agents.json');
+  const now = new Date().toISOString();
+  await writeFile(dataPath, JSON.stringify({
+    schemaVersion: 1,
+    agents: [
+      {
+        id: 'claude-old-one', name: 'Claude Old One', adapter: 'claude-code', description: '', durablePrompt: '',
+        workerUrl: 'http://shared-claude:7777', workerToken: 'legacy-secret', createdAt: now, updatedAt: now
+      },
+      {
+        id: 'claude-old-two', name: 'Claude Old Two', adapter: 'claude-code', description: '', durablePrompt: '',
+        workerUrl: 'http://shared-claude:7777', workerToken: 'legacy-secret', createdAt: now, updatedAt: now
+      }
+    ]
+  }));
+  const control = createControlPlane({
+    workerUrl: 'http://unused:7777',
+    workerToken: 'control-token',
+    claudeWorkerUrl: 'http://shared-claude:7777',
+    claudeWorkerToken: 'legacy-secret',
+    dataPath
+  });
+  const controlUrl = await listen(control);
+  t.after(async () => {
+    await new Promise((resolve) => control.close(resolve));
+    await rm(temporary, { recursive: true, force: true });
+  });
+
+  const listed = (await (await fetch(`${controlUrl}/api/v1/agents`)).json()).agents;
+  const migrated = listed.filter((agent) => agent.adapter === 'claude-code');
+  assert.equal(migrated.length, 2);
+  assert.equal(migrated[0].runtime.id, migrated[1].runtime.id);
+  assert.equal(migrated[0].runtime.binding, 'shared-legacy');
+  assert.equal(migrated[0].runtime.attachmentCount, 2);
+  assert.doesNotMatch(JSON.stringify(migrated), /legacy-secret|shared-claude/);
+
+  const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
+  assert.equal(persisted.schemaVersion, 2);
+  assert.ok(Array.isArray(persisted.runtimes));
+  assert.equal(persisted.agents.filter((agent) => agent.adapter === 'claude-code').every((agent) => !('workerToken' in agent)), true);
+});
+
 test('worker rejects unauthenticated direct API calls', async (t) => {
   const worker = createWorkerServer({ token: 'correct', demoMode: true, workspace: process.cwd() });
   const workerUrl = await listen(worker);
@@ -237,7 +471,7 @@ test('Claude Code implements the same wrapper contract and normalizes stream usa
   const createdResponse = await fetch(`${controlUrl}/api/v1/agents`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'Claude Worker', adapter: 'claude-code' })
+    body: JSON.stringify({ name: 'Claude Worker', adapter: 'claude-code', runtime: { mode: 'attach', id: 'legacy-claude-code' } })
   });
   assert.equal(createdResponse.status, 201);
   const created = (await createdResponse.json()).agent;
@@ -303,7 +537,7 @@ test('OpenCode discovers Ollama and executes a durable pinned model policy', asy
   const createdResponse = await fetch(`${controlUrl}/api/v1/agents`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'OpenCode Worker', adapter: 'opencode' })
+    body: JSON.stringify({ name: 'OpenCode Worker', adapter: 'opencode', runtime: { mode: 'attach', id: 'legacy-opencode' } })
   });
   assert.equal(createdResponse.status, 201);
   const created = (await createdResponse.json()).agent;

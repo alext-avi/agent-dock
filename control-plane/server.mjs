@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createDockerRuntimeManager } from './docker-runtime.mjs';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const MIME = {
@@ -44,7 +45,44 @@ async function readJson(req) {
   }
 }
 
-function publicAgent(agent) {
+function publicRuntime(runtime, binding = null, attachmentCount = 0) {
+  if (!runtime) {
+    return {
+      id: null,
+      workerId: null,
+      binding: 'unprovisioned',
+      dedicated: false,
+      managed: false,
+      state: 'unprovisioned',
+      credentials: 'none',
+      storage: { auth: 'none', binary: 'none', telemetry: 'none', workspace: 'none' }
+    };
+  }
+  const resolvedBinding = binding
+    ?? (runtime.kind === 'legacy-shared' ? 'shared-legacy' : attachmentCount === 0 ? 'retained' : attachmentCount > 1 ? 'attached' : 'dedicated');
+  const isolated = runtime.kind === 'managed-dedicated';
+  return {
+    id: runtime.id,
+    workerId: runtime.workerId ?? null,
+    adapter: runtime.adapter,
+    binding: resolvedBinding,
+    dedicated: isolated,
+    managed: runtime.managed === true,
+    state: runtime.state ?? (runtime.managed ? 'unknown' : 'external'),
+    credentials: isolated ? 'isolated-worker-local' : 'shared-worker-local',
+    storage: {
+      auth: isolated ? 'isolated' : 'shared',
+      binary: isolated ? 'isolated' : 'shared',
+      telemetry: isolated ? 'isolated' : 'shared',
+      workspace: isolated ? 'isolated' : 'shared'
+    },
+    attachmentCount,
+    createdAt: runtime.createdAt ?? null,
+    updatedAt: runtime.updatedAt ?? null
+  };
+}
+
+function publicAgent(agent, runtime = null, attachmentCount = 0) {
   return {
     id: agent.id,
     name: agent.name,
@@ -52,11 +90,7 @@ function publicAgent(agent) {
     adapter: agent.adapter,
     durablePrompt: agent.durablePrompt,
     modelPolicy: agent.modelPolicy,
-    runtime: {
-      binding: agent.workerUrl ? 'included-singleton' : 'unprovisioned',
-      dedicated: false,
-      credentials: agent.workerUrl ? 'worker-local' : 'none'
-    },
+    runtime: publicRuntime(runtime, agent.runtimeBinding, attachmentCount),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt
   };
@@ -101,21 +135,6 @@ function stringField(value, name, { required = false, max = 500 } = {}) {
   return normalized;
 }
 
-function normalizeWorkerUrl(value, { required = false } = {}) {
-  const normalized = stringField(value, 'workerUrl', { required, max: 2048 });
-  if (normalized === undefined || normalized === '') return normalized;
-  let parsed;
-  try {
-    parsed = new URL(normalized);
-  } catch {
-    throw Object.assign(new Error('workerUrl must be a valid URL'), { status: 400 });
-  }
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    throw Object.assign(new Error('workerUrl must use http or https'), { status: 400 });
-  }
-  return normalized.replace(/\/$/, '');
-}
-
 function makeAgent(input, existingIds, defaults = {}) {
   const now = new Date().toISOString();
   const name = stringField(input.name ?? defaults.name, 'name', { required: true, max: 120 });
@@ -137,28 +156,53 @@ function makeAgent(input, existingIds, defaults = {}) {
     adapter,
     durablePrompt: stringField(input.durablePrompt ?? defaults.durablePrompt ?? '', 'durablePrompt', { max: 50_000 }) ?? '',
     modelPolicy: normalizeModelPolicy(input.modelPolicy ?? defaults.modelPolicy),
-    workerUrl: normalizeWorkerUrl(input.workerUrl ?? defaults.workerUrl ?? '', { required: false }) ?? '',
-    workerToken: stringField(input.workerToken ?? defaults.workerToken ?? '', 'workerToken', { max: 4096 }) ?? '',
+    runtimeId: input.runtimeId ?? defaults.runtimeId ?? null,
+    runtimeBinding: input.runtimeBinding ?? defaults.runtimeBinding ?? 'unprovisioned',
     createdAt: now,
     updatedAt: now
   };
 }
 
+function normalizeRuntimeRequest(value, defaultMode) {
+  if (value === undefined || value === null) return { mode: defaultMode };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw Object.assign(new Error('runtime must be an object'), { status: 400 });
+  }
+  const mode = value.mode ?? defaultMode;
+  if (!['provision', 'attach', 'unprovisioned'].includes(mode)) {
+    throw Object.assign(new Error('runtime.mode must be provision, attach, or unprovisioned'), { status: 400 });
+  }
+  const id = value.id === undefined ? undefined : stringField(value.id, 'runtime.id', { required: true, max: 120 });
+  if (mode === 'attach' && !id) throw Object.assign(new Error('runtime.id is required when attaching'), { status: 400 });
+  return { mode, id };
+}
+
 export function createControlPlane(options = {}) {
   const primaryWorkerToken = options.workerToken ?? process.env.WORKER_TOKEN ?? '';
+  const runtimeManager = options.runtimeManager !== undefined
+    ? options.runtimeManager
+    : process.env.RUNTIME_PROVISIONER === 'docker'
+      ? createDockerRuntimeManager()
+      : null;
   const config = {
     workerUrl: (options.workerUrl ?? process.env.WORKER_URL ?? 'http://127.0.0.1:7777').replace(/\/$/, ''),
     workerToken: primaryWorkerToken,
-    workerTemplates: {
+    legacyTemplates: {
       'codex-cli': {
+        runtimeId: 'legacy-codex-cli',
+        workerId: options.workerId ?? process.env.WORKER_ID ?? 'worker-01',
         workerUrl: (options.workerUrl ?? process.env.WORKER_URL ?? 'http://127.0.0.1:7777').replace(/\/$/, ''),
         workerToken: primaryWorkerToken
       },
       'claude-code': {
+        runtimeId: 'legacy-claude-code',
+        workerId: options.claudeWorkerId ?? process.env.CLAUDE_WORKER_ID ?? 'claude-worker-01',
         workerUrl: (options.claudeWorkerUrl ?? process.env.CLAUDE_WORKER_URL ?? '').replace(/\/$/, ''),
         workerToken: options.claudeWorkerToken ?? process.env.CLAUDE_WORKER_TOKEN ?? primaryWorkerToken
       },
       opencode: {
+        runtimeId: 'legacy-opencode',
+        workerId: options.opencodeWorkerId ?? process.env.OPENCODE_WORKER_ID ?? 'opencode-worker-01',
         workerUrl: (options.opencodeWorkerUrl ?? process.env.OPENCODE_WORKER_URL ?? '').replace(/\/$/, ''),
         workerToken: options.opencodeWorkerToken ?? process.env.OPENCODE_WORKER_TOKEN ?? primaryWorkerToken
       }
@@ -170,12 +214,15 @@ export function createControlPlane(options = {}) {
   if (!config.workerToken) throw new Error('WORKER_TOKEN is required');
 
   const agents = new Map();
+  const runtimes = new Map();
   let persistQueue = Promise.resolve();
   const defaultAgent = () => agents.get(config.defaultAgentId) ?? agents.values().next().value ?? null;
+  const attachmentCount = (runtimeId) => [...agents.values()].filter((agent) => agent.runtimeId === runtimeId).length;
+  const agentPublic = (agent) => publicAgent(agent, agent.runtimeId ? runtimes.get(agent.runtimeId) : null, attachmentCount(agent.runtimeId));
 
   async function persistAgents() {
     if (!config.dataPath) return;
-    const payload = { schemaVersion: 1, agents: [...agents.values()] };
+    const payload = { schemaVersion: 2, agents: [...agents.values()], runtimes: [...runtimes.values()] };
     persistQueue = persistQueue.then(async () => {
       await mkdir(dirname(config.dataPath), { recursive: true });
       const temporary = `${config.dataPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -185,29 +232,104 @@ export function createControlPlane(options = {}) {
     return persistQueue;
   }
 
+  function addLegacyRuntime(adapter, source = {}) {
+    if (!source.workerUrl || !source.workerToken) return null;
+    const existing = [...runtimes.values()].find((runtime) => (
+      runtime.kind === 'legacy-shared'
+      && runtime.adapter === adapter
+      && runtime.workerUrl === source.workerUrl
+      && runtime.workerToken === source.workerToken
+    ));
+    if (existing) return existing;
+    let id = source.runtimeId ?? `legacy-${adapter}`;
+    while (runtimes.has(id)) id = `${source.runtimeId ?? `legacy-${adapter}`}-${randomUUID().slice(0, 8)}`;
+    const now = new Date().toISOString();
+    const runtime = {
+      id,
+      adapter,
+      kind: 'legacy-shared',
+      managed: false,
+      dedicated: false,
+      workerId: source.workerId ?? null,
+      workerUrl: source.workerUrl,
+      workerToken: source.workerToken,
+      state: 'external',
+      createdAt: source.createdAt ?? now,
+      updatedAt: source.updatedAt ?? now
+    };
+    runtimes.set(runtime.id, runtime);
+    return runtime;
+  }
+
+  function normalizeStoredAgent(agent) {
+    const normalized = {
+      id: agent.id,
+      name: agent.name,
+      description: agent.description ?? '',
+      adapter: agent.adapter ?? 'codex-cli',
+      durablePrompt: agent.durablePrompt ?? '',
+      modelPolicy: normalizeModelPolicy(agent.modelPolicy),
+      runtimeId: agent.runtimeId ?? null,
+      runtimeBinding: agent.runtimeBinding ?? (agent.runtimeId ? 'attached' : 'unprovisioned'),
+      createdAt: agent.createdAt ?? new Date().toISOString(),
+      updatedAt: agent.updatedAt ?? new Date().toISOString()
+    };
+    return normalized;
+  }
+
   async function loadAgents() {
+    let migrated = false;
     if (config.dataPath) {
       try {
         const stored = JSON.parse(await readFile(config.dataPath, 'utf8'));
         if (!Array.isArray(stored.agents)) throw new Error('agents must be an array');
-        for (const agent of stored.agents) {
-          if (agent?.id && agent?.name) agents.set(agent.id, { ...agent, modelPolicy: normalizeModelPolicy(agent.modelPolicy) });
+        if (stored.schemaVersion >= 2 && Array.isArray(stored.runtimes)) {
+          for (const runtime of stored.runtimes) {
+            if (runtime?.id && runtime?.adapter) runtimes.set(runtime.id, runtime);
+          }
+          for (const agent of stored.agents) {
+            if (agent?.id && agent?.name) agents.set(agent.id, normalizeStoredAgent(agent));
+          }
+        } else {
+          migrated = true;
+          for (const storedAgent of stored.agents) {
+            if (!storedAgent?.id || !storedAgent?.name) continue;
+            const runtime = storedAgent.workerUrl && storedAgent.workerToken
+              ? addLegacyRuntime(storedAgent.adapter ?? 'codex-cli', {
+                  workerUrl: storedAgent.workerUrl,
+                  workerToken: storedAgent.workerToken,
+                  workerId: config.legacyTemplates[storedAgent.adapter ?? 'codex-cli']?.workerId,
+                  createdAt: storedAgent.createdAt,
+                  updatedAt: storedAgent.updatedAt
+                })
+              : null;
+            agents.set(storedAgent.id, normalizeStoredAgent({
+              ...storedAgent,
+              runtimeId: runtime?.id ?? null,
+              runtimeBinding: runtime ? 'shared-legacy' : 'unprovisioned'
+            }));
+          }
         }
-        return;
       } catch (error) {
         if (error.code !== 'ENOENT') throw new Error(`Could not load agent registry: ${error.message}`);
       }
     }
-    const seeded = makeAgent({ id: config.defaultAgentId }, new Set(), {
-      name: options.defaultAgentName ?? process.env.DEFAULT_AGENT_NAME ?? 'Codex Worker 01',
-      description: 'Default containerized agent',
-      adapter: 'codex-cli',
-      durablePrompt: '',
-      workerUrl: config.workerUrl,
-      workerToken: config.workerToken
-    });
-    agents.set(seeded.id, seeded);
-    await persistAgents();
+    for (const [adapter, template] of Object.entries(config.legacyTemplates)) addLegacyRuntime(adapter, template);
+    if (!agents.size) {
+      const runtime = runtimes.get(config.legacyTemplates['codex-cli'].runtimeId)
+        ?? [...runtimes.values()].find((candidate) => candidate.adapter === 'codex-cli');
+      const seeded = makeAgent({ id: config.defaultAgentId }, new Set(), {
+        name: options.defaultAgentName ?? process.env.DEFAULT_AGENT_NAME ?? 'Codex Worker 01',
+        description: 'Default containerized agent',
+        adapter: 'codex-cli',
+        durablePrompt: '',
+        runtimeId: runtime?.id ?? null,
+        runtimeBinding: runtime ? 'shared-legacy' : 'unprovisioned'
+      });
+      agents.set(seeded.id, seeded);
+      migrated = true;
+    }
+    if (migrated || config.dataPath) await persistAgents();
   }
 
   const registryReady = loadAgents();
@@ -218,30 +340,55 @@ export function createControlPlane(options = {}) {
     return agent;
   }
 
+  function requireRuntime(id) {
+    const runtime = runtimes.get(id);
+    if (!runtime) throw Object.assign(new Error('Runtime not found'), { status: 404 });
+    return runtime;
+  }
+
   function requireRunnableAgent(agent) {
-    if (!agent.workerUrl || !agent.workerToken) {
+    const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+    if (!runtime?.workerUrl || !runtime?.workerToken) {
       throw Object.assign(new Error('Agent runtime is not configured'), { status: 409 });
     }
-    return agent;
+    if (runtime.adapter !== agent.adapter) {
+      throw Object.assign(new Error('Agent and runtime adapters do not match'), { status: 409 });
+    }
+    return runtime;
   }
 
   async function workerFetch(agent, pathname, init = {}) {
-    requireRunnableAgent(agent);
-    return fetch(`${agent.workerUrl}${pathname}`, {
+    const runtime = requireRunnableAgent(agent);
+    const response = await fetch(`${runtime.workerUrl}${pathname}`, {
       ...init,
       headers: {
-        authorization: `Bearer ${agent.workerToken}`,
+        authorization: `Bearer ${runtime.workerToken}`,
         ...(init.body ? { 'content-type': 'application/json' } : {}),
         ...init.headers
       },
       signal: AbortSignal.timeout(init.timeout ?? 15_000)
     });
+    if (response.ok && runtime.managed && runtime.state !== 'running') {
+      runtime.state = 'running';
+      runtime.updatedAt = new Date().toISOString();
+    }
+    return { response, runtime };
   }
 
   async function proxyJson(req, res, agent, pathname, timeout = 15_000) {
     const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : null;
-    const upstream = await workerFetch(agent, pathname, { method: req.method, body: body?.length ? body : undefined, timeout });
+    const { response: upstream, runtime } = await workerFetch(agent, pathname, { method: req.method, body: body?.length ? body : undefined, timeout });
     const text = await upstream.text();
+    if (upstream.ok && runtime.managed && pathname === '/v1/status') {
+      try {
+        const status = JSON.parse(text);
+        if (status.agent?.id && status.agent.id !== runtime.workerId) {
+          throw Object.assign(new Error('Runtime worker identity does not match its control-plane binding'), { status: 502 });
+        }
+      } catch (error) {
+        if (error.status === 502) throw error;
+      }
+    }
     res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'cache-control': 'no-store' });
     res.end(text);
   }
@@ -251,7 +398,7 @@ export function createControlPlane(options = {}) {
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
     if (!prompt) return json(res, 400, { error: 'prompt is required' });
     const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt, modelPolicy: agent.modelPolicy });
-    const upstream = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
+    const { response: upstream } = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
     if (!upstream.ok || !upstream.body) {
       const message = await upstream.text();
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'cache-control': 'no-store' });
@@ -291,15 +438,67 @@ export function createControlPlane(options = {}) {
   }
 
   async function handleAgentCrud(req, res, url) {
+    if (url.pathname === '/api/v1/runtimes') {
+      if (req.method !== 'GET') return false;
+      if (runtimeManager) {
+        await Promise.all([...runtimes.values()].filter((runtime) => runtime.managed).map(async (runtime) => {
+          try {
+            const inspected = await runtimeManager.inspect(runtime);
+            runtime.state = inspected.state;
+            runtime.health = inspected.health;
+            runtime.updatedAt = new Date().toISOString();
+          } catch {
+            runtime.state = 'unknown';
+          }
+        }));
+      }
+      return json(res, 200, {
+        runtimes: [...runtimes.values()].map((runtime) => publicRuntime(runtime, null, attachmentCount(runtime.id)))
+      });
+    }
+
     if (url.pathname === '/api/v1/agents') {
-      if (req.method === 'GET') return json(res, 200, { agents: [...agents.values()].map(publicAgent) });
+      if (req.method === 'GET') return json(res, 200, { agents: [...agents.values()].map(agentPublic) });
       if (req.method === 'POST') {
         const body = await readJson(req);
-        const adapter = typeof body.adapter === 'string' ? body.adapter : 'codex-cli';
-        const agent = makeAgent(body, new Set(agents.keys()), config.workerTemplates[adapter] ?? {});
-        agents.set(agent.id, agent);
-        await persistAgents();
-        return json(res, 201, { agent: publicAgent(agent) });
+        const agent = makeAgent(body, new Set(agents.keys()));
+        const runtimeRequest = normalizeRuntimeRequest(body.runtime, runtimeManager ? 'provision' : 'unprovisioned');
+        let runtime = null;
+        try {
+          if (runtimeRequest.mode === 'provision') {
+            if (!runtimeManager) throw Object.assign(new Error('Dedicated runtime provisioning is unavailable'), { status: 503 });
+            runtime = await runtimeManager.provision({ agentId: agent.id, adapter: agent.adapter });
+            runtimes.set(runtime.id, runtime);
+            agent.runtimeId = runtime.id;
+            agent.runtimeBinding = 'dedicated';
+          } else if (runtimeRequest.mode === 'attach') {
+            runtime = requireRuntime(runtimeRequest.id);
+            if (runtime.adapter !== agent.adapter) {
+              throw Object.assign(new Error('The selected runtime uses a different adapter'), { status: 409 });
+            }
+            if (attachmentCount(runtime.id) !== 0) {
+              throw Object.assign(new Error('The selected runtime is already bound to another agent'), { status: 409 });
+            }
+            if (runtime.managed) {
+              if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
+              await runtimeManager.start(runtime);
+              runtime.state = 'starting';
+            }
+            runtime.updatedAt = new Date().toISOString();
+            agent.runtimeId = runtime.id;
+            agent.runtimeBinding = runtime.kind === 'legacy-shared' ? 'shared-legacy' : 'attached';
+          }
+          agents.set(agent.id, agent);
+          await persistAgents();
+          return json(res, 201, { agent: agentPublic(agent) });
+        } catch (error) {
+          agents.delete(agent.id);
+          if (runtimeRequest.mode === 'provision' && runtime) {
+            runtimes.delete(runtime.id);
+            await runtimeManager.destroy(runtime).catch(() => {});
+          }
+          throw error;
+        }
       }
       return false;
     }
@@ -308,27 +507,53 @@ export function createControlPlane(options = {}) {
     if (!match) return false;
     const id = decodeURIComponent(match[1]);
     const agent = requireAgent(id);
-    if (req.method === 'GET') return json(res, 200, { agent: publicAgent(agent) });
+    if (req.method === 'GET') return json(res, 200, { agent: agentPublic(agent) });
     if (req.method === 'PATCH') {
       const body = await readJson(req);
       const updated = { ...agent };
       if ('name' in body) updated.name = stringField(body.name, 'name', { required: true, max: 120 });
       if ('description' in body) updated.description = stringField(body.description, 'description', { max: 2000 });
       if ('adapter' in body) {
-        updated.adapter = stringField(body.adapter, 'adapter', { required: true, max: 80 });
+        const nextAdapter = stringField(body.adapter, 'adapter', { required: true, max: 80 });
+        if (agent.runtimeId && nextAdapter !== agent.adapter) {
+          throw Object.assign(new Error('Detach or replace the runtime before changing adapters'), { status: 409 });
+        }
+        updated.adapter = nextAdapter;
         if (!/^[a-z0-9][a-z0-9._-]*$/.test(updated.adapter)) throw Object.assign(new Error('adapter contains unsupported characters'), { status: 400 });
       }
       if ('durablePrompt' in body) updated.durablePrompt = stringField(body.durablePrompt, 'durablePrompt', { max: 50_000 });
       if ('modelPolicy' in body) updated.modelPolicy = normalizeModelPolicy(body.modelPolicy);
-      if ('workerUrl' in body) updated.workerUrl = normalizeWorkerUrl(body.workerUrl, { required: false });
-      if (typeof body.workerToken === 'string' && body.workerToken.trim()) updated.workerToken = stringField(body.workerToken, 'workerToken', { max: 4096 });
-      if (body.clearWorkerToken === true) updated.workerToken = '';
       updated.updatedAt = new Date().toISOString();
       agents.set(id, updated);
       await persistAgents();
-      return json(res, 200, { agent: publicAgent(updated) });
+      return json(res, 200, { agent: agentPublic(updated) });
     }
     if (req.method === 'DELETE') {
+      const body = await readJson(req);
+      const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+      const runtimeAction = body.runtimeAction ?? (runtime ? null : 'retain');
+      if (runtime && !['retain', 'destroy'].includes(runtimeAction)) {
+        throw Object.assign(new Error('runtimeAction must explicitly be retain or destroy'), { status: 400 });
+      }
+      if (runtimeAction === 'destroy') {
+        if (body.confirmation !== agent.id) {
+          throw Object.assign(new Error('confirmation must exactly match the agent id before destroying its runtime and credentials'), { status: 400 });
+        }
+        if (!runtime?.managed) {
+          throw Object.assign(new Error('Legacy or external runtimes cannot be destroyed by Agent Dock'), { status: 409 });
+        }
+        if (attachmentCount(runtime.id) > 1) {
+          throw Object.assign(new Error('Runtime is still attached to another agent'), { status: 409 });
+        }
+        if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
+        await runtimeManager.destroy(runtime);
+        runtimes.delete(runtime.id);
+      } else if (runtime?.managed) {
+        if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
+        await runtimeManager.stop(runtime);
+        runtime.state = 'stopped';
+        runtime.updatedAt = new Date().toISOString();
+      }
       agents.delete(id);
       await persistAgents();
       res.writeHead(204, { 'cache-control': 'no-store' });
@@ -366,9 +591,10 @@ export function createControlPlane(options = {}) {
 
       const agent = defaultAgent();
       if (req.method === 'GET' && ['/api/v1/health', '/api/health'].includes(url.pathname)) {
-        if (!agent?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured' });
+        const runtime = agent?.runtimeId ? runtimes.get(agent.runtimeId) : null;
+        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured' });
         try {
-          const upstream = await fetch(`${agent.workerUrl}/v1/health`, { signal: AbortSignal.timeout(2000) });
+          const upstream = await fetch(`${runtime.workerUrl}/v1/health`, { signal: AbortSignal.timeout(2000) });
           return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy' });
         } catch {
           return json(res, 200, { ok: true, worker: 'offline' });

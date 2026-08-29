@@ -14,6 +14,11 @@ const ui = {
   createDialog: $('#create-agent-dialog'),
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
+  createAdapter: $('#create-adapter'),
+  attachRuntimeOption: $('#attach-runtime-option'),
+  attachRuntimeRadio: $('#attach-runtime-radio'),
+  attachRuntimeField: $('#attach-runtime-field'),
+  attachRuntimeSelect: $('#attach-runtime-select'),
   configForm: $('#agent-config-form'),
   configName: $('#config-name'),
   configDescription: $('#config-description'),
@@ -99,6 +104,7 @@ let dashboardFingerprint = '';
 let dashboardRefreshInFlight = false;
 let statusRefreshInFlight = false;
 let liveUpdateTimer = null;
+let retainedRuntimes = [];
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -125,6 +131,14 @@ function adapterLabel(adapter) {
   if (adapter === 'claude-code') return 'Claude Code';
   if (adapter === 'opencode') return 'OpenCode';
   return adapter || 'Agent runtime';
+}
+
+function runtimeLabel(runtime = {}) {
+  if (runtime.binding === 'dedicated') return 'isolated runtime';
+  if (runtime.binding === 'attached') return 'reattached isolated runtime';
+  if (runtime.binding === 'shared-legacy') return 'legacy shared runtime';
+  if (runtime.binding === 'retained') return 'retained runtime';
+  return 'unprovisioned';
 }
 
 function formatTokens(value) {
@@ -238,17 +252,15 @@ function createAgentCard(agent) {
       <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
     </dl>
     <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Open agent</a><button class="text-button card-delete">Delete</button></div></div>`;
-  const runtimeLabel = agent.runtime?.binding === 'included-singleton' ? 'singleton runtime' : 'unprovisioned';
-  card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${runtimeLabel} · ${agent.id}`;
+  card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${runtimeLabel(agent.runtime)} · ${agent.id}`;
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
   const configure = card.querySelector('.configure-link');
   configure.href = `/agents/${encodeURIComponent(agent.id)}`;
   card.querySelector('.card-delete').addEventListener('click', async () => {
-    if (!window.confirm(`Delete ${agent.name}? The worker container and its volumes will not be removed.`)) return;
     try {
-      await api(`${API_ROOT}/agents/${encodeURIComponent(agent.id)}`, { method: 'DELETE' });
+      if (!await deleteAgentRecord(agent)) return;
       card.remove();
       const count = ui.agentGrid.children.length;
       ui.agentCount.textContent = String(count).padStart(2, '0');
@@ -354,10 +366,34 @@ async function refreshDashboardStatuses() {
   }
 }
 
-function openCreateDialog() {
+function syncCreateRuntimeOptions() {
+  const adapter = ui.createAdapter.value;
+  const available = retainedRuntimes.filter((runtime) => runtime.managed && runtime.binding === 'retained' && runtime.adapter === adapter && runtime.attachmentCount === 0);
+  ui.attachRuntimeSelect.replaceChildren();
+  for (const runtime of available) {
+    const option = document.createElement('option');
+    option.value = runtime.id;
+    option.textContent = `${runtime.workerId || runtime.id} · ${runtime.state}`;
+    ui.attachRuntimeSelect.append(option);
+  }
+  const canAttach = available.length > 0;
+  ui.attachRuntimeRadio.disabled = !canAttach;
+  ui.attachRuntimeOption.classList.toggle('disabled', !canAttach);
+  if (!canAttach && ui.attachRuntimeRadio.checked) ui.createForm.querySelector('[name="runtimeMode"][value="provision"]').checked = true;
+  const attaching = ui.attachRuntimeRadio.checked && canAttach;
+  ui.attachRuntimeField.classList.toggle('hidden', !attaching);
+  for (const option of $$('.runtime-option')) option.classList.toggle('selected', option.querySelector('input')?.checked === true);
+}
+
+async function openCreateDialog() {
   ui.createForm.reset();
   ui.createMessage.classList.add('hidden');
   ui.createMessage.textContent = '';
+  retainedRuntimes = [];
+  try {
+    retainedRuntimes = (await api(`${API_ROOT}/runtimes`)).runtimes ?? [];
+  } catch {}
+  syncCreateRuntimeOptions();
   ui.createDialog.showModal();
 }
 
@@ -367,14 +403,20 @@ async function createAgent(event) {
   submit.disabled = true;
   try {
     const body = Object.fromEntries(new FormData(ui.createForm));
-    body.adapter = ['codex-cli', 'claude-code', 'opencode'].includes(body.runtimeTemplate) ? body.runtimeTemplate : 'codex-cli';
-    delete body.runtimeTemplate;
+    const runtimeMode = body.runtimeMode === 'attach' ? 'attach' : 'provision';
+    body.runtime = runtimeMode === 'attach'
+      ? { mode: 'attach', id: body.runtimeId }
+      : { mode: 'provision' };
+    delete body.runtimeMode;
+    delete body.runtimeId;
+    submit.textContent = runtimeMode === 'attach' ? 'Attaching…' : 'Provisioning…';
     const { agent } = await api(`${API_ROOT}/agents`, { method: 'POST', body: JSON.stringify(body) });
     window.location.assign(`/agents/${encodeURIComponent(agent.id)}#instructions`);
   } catch (error) {
     ui.createMessage.textContent = error.message;
     ui.createMessage.classList.remove('hidden');
     submit.disabled = false;
+    submit.textContent = 'Create isolated agent';
   }
 }
 
@@ -391,6 +433,7 @@ function populateAgentConfig(agent) {
   const plannedHarness = adapterLabel(agent.adapter);
   ui.agentName.textContent = plannedHarness;
   ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
+  ui.runtimeLocation.textContent = `${runtimeLabel(agent.runtime)} · ${agent.runtime?.workerId || 'no worker identity'}`;
 }
 
 function renderProviderConnections(result = {}) {
@@ -475,10 +518,33 @@ async function saveAgent(event) {
   }
 }
 
+async function deleteAgentRecord(agent) {
+  const runtime = agent.runtime ?? {};
+  const hasManagedRuntime = runtime.managed === true;
+  const baseMessage = hasManagedRuntime
+    ? `Delete ${agent.name}? You will next choose whether to retain or destroy its isolated runtime.`
+    : `Delete ${agent.name}? Its ${runtimeLabel(runtime)} will be left intact.`;
+  if (!window.confirm(baseMessage)) return false;
+  let runtimeAction = 'retain';
+  let confirmation;
+  if (hasManagedRuntime && window.confirm('Permanently destroy this agent’s container, CLI installation, credentials, telemetry, and workspace? Select Cancel to retain the stopped runtime for later reattachment.')) {
+    confirmation = window.prompt(`This cannot be undone. Type ${agent.id} to destroy all isolated runtime volumes.`) ?? '';
+    if (confirmation !== agent.id) {
+      window.alert('Runtime destruction cancelled because the confirmation did not match. The agent was not deleted.');
+      return false;
+    }
+    runtimeAction = 'destroy';
+  }
+  await api(`${API_ROOT}/agents/${encodeURIComponent(agent.id)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ runtimeAction, confirmation })
+  });
+  return true;
+}
+
 async function deleteCurrentAgent() {
-  if (!window.confirm(`Delete ${currentAgent.name}? The worker container and its volumes will not be removed.`)) return;
   try {
-    await api(agentApi(), { method: 'DELETE' });
+    if (!await deleteAgentRecord(currentAgent)) return;
     window.location.assign('/');
   } catch (error) {
     ui.agentMenu.open = false;
@@ -616,7 +682,7 @@ function renderStatus(status) {
   ui.jobState.textContent = active ? 'running' : 'idle';
   const inContainer = status.execution?.boundary === 'container';
   ui.runtimeLocation.textContent = inContainer
-    ? (currentAgent.runtime?.binding === 'included-singleton' ? 'Included singleton worker · isolated container' : 'Managed worker · isolated container')
+    ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}`
     : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !readyToRun || active;
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
@@ -918,6 +984,8 @@ async function loadAgent(id) {
 }
 
 ui.createForm.addEventListener('submit', createAgent);
+ui.createAdapter.addEventListener('change', syncCreateRuntimeOptions);
+for (const radio of $$('[name="runtimeMode"]')) radio.addEventListener('change', syncCreateRuntimeOptions);
 $('#new-agent').addEventListener('click', openCreateDialog);
 $('#empty-new-agent').addEventListener('click', openCreateDialog);
 $('#close-agent-dialog').addEventListener('click', () => ui.createDialog.close());

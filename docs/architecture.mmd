@@ -1,69 +1,49 @@
 flowchart TB
-  subgraph Client["Current web client · HTML5 + CSS + vanilla JavaScript ES modules"]
-    UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware 3s live status polling"]
+  subgraph Client["Web client · HTML5 + CSS + vanilla JavaScript ES modules"]
+    UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware live polling"]
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
-    API["REST/JSON + NDJSON proxy\nAgent CRUD and runtime operations"]
-    Registry["JSON agent registry\nDurable prompts + private worker routing"]
+    API["REST/JSON + NDJSON proxy\nAgent CRUD + lifecycle operations"]
+    Registry["Schema-v2 JSON registry\nAgent definitions separate from runtimes"]
+    Provisioner["Docker runtime manager\nExclusive ownership enforcement"]
   end
 
-  subgraph Docker["Docker Compose · isolated service network"]
-    subgraph CodexWorker["Codex worker · Node.js 22 wrapper"]
-      CW["agent-wrapper/v1"]
-      CA["Codex adapter"]
-      CC["Official @openai/codex CLI"]
-      CV["Named volumes\nCLI auth · binary cache · telemetry"]
-      CWS["Bind-mounted /workspace"]
-      CW --> CA --> CC
-      CW --- CV
-      CW --- CWS
-    end
+  Engine["Docker Engine API\nLocal Unix socket"]
 
-    subgraph ClaudeWorker["Claude worker · Node.js 22 wrapper · non-root user"]
-      AW["agent-wrapper/v1"]
-      AA["Claude adapter"]
-      AC["Official @anthropic-ai/claude-code CLI"]
-      AV["Named volumes\nCLI auth · binary cache · telemetry"]
-      AWS["Bind-mounted /workspace"]
-      AW --> AA --> AC
-      AW --- AV
-      AW --- AWS
+  subgraph Docker["Docker private network"]
+    subgraph RuntimeA["Managed runtime A · exclusive container"]
+      WA["Node.js agent-wrapper/v1\nOfficial provider CLI + adapter"]
+      VA["Private named volumes\nCLI binary · auth/config · telemetry · workspace"]
+      WA --- VA
     end
-
-    subgraph OpenCodeWorker["OpenCode worker · Node.js 22 wrapper · non-root user"]
-      OW["agent-wrapper/v1"]
-      OA["OpenCode adapter"]
-      OC["Official opencode-ai CLI"]
-      OV["Named volumes\nProvider auth · binary cache · telemetry"]
-      OWS["Bind-mounted /workspace"]
-      OW --> OA --> OC
-      OW --- OV
-      OW --- OWS
+    subgraph RuntimeB["Managed runtime B · exclusive container"]
+      WB["Node.js agent-wrapper/v1\nOfficial provider CLI + adapter"]
+      VB["Private named volumes\nCLI binary · auth/config · telemetry · workspace"]
+      WB --- VB
     end
+    Legacy["Legacy bootstrap runtimes\nExplicitly labeled shared-legacy"]
   end
 
-  OpenAI["OpenAI subscription service\nDevice authorization + Codex execution"]
-  Anthropic["Anthropic subscription service\nBrowser OAuth + Claude execution"]
-  Providers["Supported OpenCode providers\nGitHub Copilot device authorization by default"]
-  MCP["Future MCP/tool recipes"]
-  Data["Future attached data volumes"]
+  Providers["OpenAI · Anthropic · OpenCode providers · host Ollama"]
+  MCP["Future per-agent MCP/tool recipes"]
+  Data["Future scoped data attachments"]
   React["Planned web client\nReact + TypeScript + Vite"]
   Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
   API <--> Registry
-  API -->|"Bearer-authenticated agent-wrapper/v1\nJSON status + NDJSON task events"| CW
-  API -->|"Identical contract"| AW
-  API -->|"Identical contract"| OW
-  CC <--> OpenAI
-  AC <--> Anthropic
-  OC <--> Providers
+  API --> Provisioner --> Engine
+  Engine --> RuntimeA
+  Engine --> RuntimeB
+  API -->|"Unique URL + bearer token"| WA
+  API -->|"Unique URL + bearer token"| WB
+  WA <--> Providers
+  WB <--> Providers
+  API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  MCP -.-> CW
-  MCP -.-> AW
-  MCP -.-> OW
-  Data -.-> CWS
-  Data -.-> AWS
-  Data -.-> OWS
+  MCP -.-> RuntimeA
+  MCP -.-> RuntimeB
+  Data -.-> VA
+  Data -.-> VB

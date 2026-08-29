@@ -1,5 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
+const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -15,9 +17,6 @@ const ui = {
   configForm: $('#agent-config-form'),
   configName: $('#config-name'),
   configDescription: $('#config-description'),
-  configAdapter: $('#config-adapter'),
-  configWorkerUrl: $('#config-worker-url'),
-  configWorkerToken: $('#config-worker-token'),
   durablePrompt: $('#durable-prompt'),
   saveAgent: $('#save-agent'),
   saveMessage: $('#save-message'),
@@ -26,6 +25,8 @@ const ui = {
   agentIdLabel: $('#agent-id-label'),
   workerState: $('#worker-state'),
   agentName: $('#agent-name'),
+  runtimeIcon: $('#runtime-icon'),
+  runtimeLocation: $('#runtime-location'),
   cliVersion: $('#cli-version'),
   authState: $('#auth-state'),
   jobState: $('#job-state'),
@@ -60,7 +61,12 @@ const ui = {
   runMessage: $('#run-message'),
   conversation: $('#conversation'),
   rawOutput: $('#raw-output'),
-  fileList: $('#file-list')
+  fileList: $('#file-list'),
+  testAgentButton: $('#test-agent-button'),
+  agentMenu: $('.agent-menu'),
+  tabList: $('.tab-list'),
+  tabButtons: $$('.tab-button'),
+  tabPanels: $$('.tab-panel')
 };
 
 let running = false;
@@ -87,6 +93,12 @@ async function api(path, options = {}) {
 
 function agentApi(operation = '') {
   return `${API_ROOT}/agents/${encodeURIComponent(currentAgent.id)}${operation ? `/${operation}` : ''}`;
+}
+
+function adapterLabel(adapter) {
+  if (adapter === 'codex-cli') return 'Codex CLI';
+  if (adapter === 'claude-code') return 'Claude Code';
+  return adapter || 'Agent runtime';
 }
 
 function formatTokens(value) {
@@ -128,6 +140,19 @@ function formatBytes(value) {
   return `${(value / 1024 ** 2).toFixed(1)} MB`;
 }
 
+function selectTab(name, { updateHash = true, focus = false } = {}) {
+  const selected = VALID_TABS.has(name) ? name : 'instructions';
+  for (const button of ui.tabButtons) {
+    const active = button.dataset.tab === selected;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of ui.tabPanels) panel.classList.toggle('hidden', panel.dataset.panel !== selected);
+  if (updateHash) history.replaceState(null, '', `#${selected}`);
+  if (focus && selected === 'test') setTimeout(() => ui.prompt.focus(), 100);
+}
+
 function createAgentCard(agent) {
   const card = document.createElement('article');
   card.className = 'agent-card';
@@ -143,10 +168,10 @@ function createAgentCard(agent) {
       <div><dt>USAGE</dt><dd class="card-usage">—</dd></div>
       <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
     </dl>
-    <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Configure</a><button class="text-button card-delete">Delete</button></div></div>`;
-  card.querySelector('.kicker').textContent = `${agent.adapter} · ${agent.id}`;
+    <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Open agent</a><button class="text-button card-delete">Delete</button></div></div>`;
+  card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${agent.id}`;
   card.querySelector('h2').textContent = agent.name;
-  card.querySelector('.agent-card-description').textContent = agent.description || 'No description yet.';
+  card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
   const configure = card.querySelector('.configure-link');
   configure.href = `/agents/${encodeURIComponent(agent.id)}`;
@@ -180,8 +205,8 @@ function updateAgentCard(card, status) {
 
 function markAgentCardOffline(card, message) {
   const pill = card.querySelector('.status-pill');
-  pill.textContent = message.includes('not configured') ? 'unconfigured' : 'offline';
-  pill.className = 'pill status-pill error';
+  pill.textContent = message.includes('not configured') ? 'definition only' : 'offline';
+  pill.className = `pill status-pill ${message.includes('not configured') ? 'neutral' : 'error'}`;
   card.querySelector('.card-auth').textContent = '—';
 }
 
@@ -212,6 +237,7 @@ async function loadDashboard() {
 }
 
 function openCreateDialog() {
+  ui.createForm.reset();
   ui.createMessage.classList.add('hidden');
   ui.createMessage.textContent = '';
   ui.createDialog.showModal();
@@ -223,8 +249,10 @@ async function createAgent(event) {
   submit.disabled = true;
   try {
     const body = Object.fromEntries(new FormData(ui.createForm));
+    body.adapter = body.runtimeTemplate === 'claude-code' ? 'claude-code' : 'codex-cli';
+    delete body.runtimeTemplate;
     const { agent } = await api(`${API_ROOT}/agents`, { method: 'POST', body: JSON.stringify(body) });
-    window.location.assign(`/agents/${encodeURIComponent(agent.id)}`);
+    window.location.assign(`/agents/${encodeURIComponent(agent.id)}#instructions`);
   } catch (error) {
     ui.createMessage.textContent = error.message;
     ui.createMessage.classList.remove('hidden');
@@ -234,15 +262,14 @@ async function createAgent(event) {
 
 function populateAgentConfig(agent) {
   ui.pageAgentName.textContent = agent.name;
-  ui.pageAgentDescription.textContent = agent.description || 'Configure the durable identity, then send disposable test tasks to its runtime.';
+  ui.pageAgentDescription.textContent = agent.description || 'Configure durable instructions, then send disposable test tasks to the runtime.';
   ui.agentIdLabel.textContent = agent.id.toUpperCase();
   ui.configName.value = agent.name;
   ui.configDescription.value = agent.description;
-  ui.configAdapter.value = agent.adapter;
-  ui.configWorkerUrl.value = agent.workerUrl;
-  ui.configWorkerToken.value = '';
-  ui.configWorkerToken.placeholder = agent.hasWorkerToken ? 'Secret configured · blank keeps it' : 'No secret configured';
   ui.durablePrompt.value = agent.durablePrompt;
+  const plannedHarness = adapterLabel(agent.adapter);
+  ui.agentName.textContent = plannedHarness;
+  ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
 }
 
 async function saveAgent(event) {
@@ -252,11 +279,8 @@ async function saveAgent(event) {
   const body = {
     name: ui.configName.value,
     description: ui.configDescription.value,
-    adapter: ui.configAdapter.value,
-    workerUrl: ui.configWorkerUrl.value,
     durablePrompt: ui.durablePrompt.value
   };
-  if (ui.configWorkerToken.value.trim()) body.workerToken = ui.configWorkerToken.value;
   try {
     const result = await api(agentApi(), { method: 'PATCH', body: JSON.stringify(body) });
     currentAgent = result.agent;
@@ -276,7 +300,8 @@ async function deleteCurrentAgent() {
     await api(agentApi(), { method: 'DELETE' });
     window.location.assign('/');
   } catch (error) {
-    ui.saveMessage.textContent = error.message;
+    ui.agentMenu.open = false;
+    setConnection('offline', error.message);
   }
 }
 
@@ -369,26 +394,54 @@ function renderUsage(usage = {}) {
 function renderStatus(status) {
   const authenticated = status.authentication?.authenticated;
   const active = Boolean(status.task?.active) || running;
-  currentHarnessName = status.agent?.adapter?.displayName || currentAgent.adapter;
+  currentHarnessName = status.agent?.adapter?.displayName || adapterLabel(currentAgent.adapter);
   setConnection('online', 'Control plane + worker online');
   ui.workerState.textContent = active ? 'busy' : authenticated ? 'ready' : 'needs auth';
   ui.workerState.className = `pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
   ui.agentName.textContent = currentHarnessName;
+  ui.runtimeIcon.textContent = currentHarnessName.slice(0, 1).toUpperCase();
   ui.cliVersion.textContent = status.agent?.version || '—';
   ui.authState.textContent = authenticated ? 'connected' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
   ui.jobState.textContent = active ? 'running' : 'idle';
-  ui.boundary.textContent = status.execution?.boundary === 'container' ? 'Worker container' : 'Provider workspace sandbox';
+  const inContainer = status.execution?.boundary === 'container';
+  ui.boundary.textContent = inContainer ? 'container' : 'sandbox';
+  ui.runtimeLocation.textContent = inContainer ? 'Managed worker · isolated container' : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !authenticated || active;
+  ui.refreshUsage.disabled = false;
   ui.authBox.classList.toggle('authenticated', authenticated);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   ui.authCopy.textContent = authenticated
     ? `The worker holds a renewable ${currentHarnessName} login. Safe session dates are surfaced; credentials never leave the worker.`
-    : `The worker starts ${currentHarnessName}'s device flow. This UI only displays the URL and one-time code.`;
+    : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
   ui.authButton.textContent = authenticated ? 'Connected' : 'Start device login';
   ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
   renderAuth(status.authentication);
   renderAuthSession(status.authentication?.session, { authenticated, active, workerRefreshing: status.authentication?.refreshing });
   renderUsage(status.usage);
+}
+
+function renderRuntimeUnavailable(message) {
+  const definitionOnly = message.includes('not configured');
+  const harness = adapterLabel(currentAgent.adapter);
+  setConnection(definitionOnly ? 'online' : 'offline', definitionOnly ? 'Control plane online · runtime not provisioned' : message);
+  ui.workerState.textContent = definitionOnly ? 'definition only' : 'offline';
+  ui.workerState.className = `pill ${definitionOnly ? 'neutral' : 'error'}`;
+  ui.agentName.textContent = harness;
+  ui.runtimeIcon.textContent = harness.slice(0, 1).toUpperCase();
+  ui.runtimeLocation.textContent = definitionOnly ? 'Runtime not yet provisioned' : 'Worker unreachable';
+  ui.cliVersion.textContent = definitionOnly ? 'not provisioned' : 'unavailable';
+  ui.authState.textContent = '—';
+  ui.jobState.textContent = 'idle';
+  ui.boundary.textContent = '—';
+  ui.runButton.disabled = true;
+  ui.refreshUsage.disabled = true;
+  ui.authButton.disabled = true;
+  ui.authTitle.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
+  ui.authCopy.textContent = definitionOnly
+    ? 'This agent definition is ready. A dedicated worker will be attached by the future provisioning flow.'
+    : 'The control plane cannot currently reach this agent worker.';
+  ui.authSession.classList.add('hidden');
+  ui.deviceFlow.classList.add('hidden');
 }
 
 async function refreshStatus() {
@@ -401,10 +454,7 @@ async function refreshStatus() {
       authPolling = null;
     }
   } catch (error) {
-    setConnection('offline', error.message);
-    ui.workerState.textContent = error.message.includes('not configured') ? 'unconfigured' : 'offline';
-    ui.workerState.className = 'pill error';
-    ui.runButton.disabled = true;
+    renderRuntimeUnavailable(error.message);
   }
 }
 
@@ -415,7 +465,8 @@ async function startAuth() {
     renderAuth(result.authentication);
     if (!authPolling) authPolling = setInterval(refreshStatus, 1800);
   } catch (error) {
-    ui.runMessage.textContent = error.message;
+    ui.authRefreshMessage.textContent = error.message;
+    ui.authRefreshMessage.classList.add('error');
     ui.authButton.disabled = false;
   }
 }
@@ -485,7 +536,7 @@ async function refreshWorkspace() {
       ui.fileList.append(row);
     }
   } catch {
-    ui.fileList.innerHTML = '<p class="empty">Workspace unavailable.</p>';
+    ui.fileList.innerHTML = '<p class="empty">Workspace unavailable until a runtime is attached.</p>';
   }
 }
 
@@ -597,6 +648,7 @@ async function loadAgent(id) {
     currentAgent = result.agent;
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;
+    selectTab(location.hash.slice(1), { updateHash: false });
     await Promise.all([refreshStatus(), refreshWorkspace()]);
     setInterval(() => { if (!running) refreshStatus(); }, 5000);
   } catch (error) {
@@ -626,6 +678,12 @@ $('#clear-output').addEventListener('click', () => {
 ui.prompt.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') runTask();
 });
+for (const button of ui.tabButtons) button.addEventListener('click', () => selectTab(button.dataset.tab));
+ui.testAgentButton.addEventListener('click', () => {
+  selectTab('test', { focus: true });
+  ui.tabList.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));

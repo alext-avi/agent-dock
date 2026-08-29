@@ -131,7 +131,8 @@ async function listWorkspace(root, maxEntries = 250) {
     }
     children.sort((a, b) => a.name.localeCompare(b.name));
     for (const child of children) {
-      if (entries.length >= maxEntries || child.name === '.git') break;
+      if (entries.length >= maxEntries) break;
+      if (child.name === '.git') continue;
       const childRelative = path.posix.join(relative, child.name);
       const full = path.join(directory, child.name);
       if (child.isDirectory()) {

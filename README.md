@@ -40,6 +40,8 @@ flowchart LR
 - The web tier never needs the Docker socket or provider credentials.
 - The fleet dashboard supports create, read, update, and delete for agent records, then reports each reachable runtime's auth, activity, usage, and request count.
 - Each agent has a durable prompt stored by the control plane and a separate, intentionally ephemeral test conversation.
+- The agent workspace puts live runtime, authentication, and usage data in its header, with separate Instructions, Tools & MCP, Data, and Test areas.
+- Worker endpoints and bearer tokens are server-side connection details and are never returned in agent API responses or rendered in the browser.
 - The browser cannot override durable instructions per request; the control plane injects the saved prompt when it dispatches a task.
 - A worker can be local or remote as long as the control plane can reach its HTTP endpoint.
 - Device authentication is initiated by the unmodified Codex CLI and surfaced as a URL/code.
@@ -85,11 +87,11 @@ curl -N http://localhost:3000/api/v1/agents/worker-01/tasks \
 
 The worker invokes `codex exec --dangerously-bypass-approvals-and-sandbox` by default because the Docker container is the POC's non-interactive execution boundary. The agent can modify the bind-mounted `workspace/`, run processes inside the worker, and use the worker's network. Do not mount source, SSH keys, cloud credentials, the Docker socket, or sensitive host paths into it. Set `ALLOW_UNSANDBOXED=0` to use Codex's `workspace-write` sandbox instead, understanding that unattended tool execution may be more constrained.
 
-The registry can describe multiple agents, but the included Compose file provisions one worker. Creating a record does not yet create a container, volume set, or network route; the operator supplies that agent's worker URL and bearer token. Automated worker provisioning is the next distinct control-plane capability.
+The registry can describe multiple agents, but the included Compose file provisions one worker. Creating a record does not yet create a container, volume set, network route, MCP server, or data mount. Worker connection details remain internal control-plane configuration; automated provisioning and one-time remote-worker pairing are the next distinct capabilities. The Tools & MCP and Data tabs establish those future management surfaces without presenting nonfunctional credential or mount controls.
 
 This prototype deliberately omits multi-tenancy, scheduling, webhooks, queue durability, usage-limit routing, TLS, user authentication for the web UI, remote secret management, egress controls, and container resource limits. Usage telemetry and agent configuration are durable; jobs, event streams, and test conversations are not. Those are control-plane refinements after the core login/run/stream boundary is proven.
 
-The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. Give each independently authenticated worker its own auth volume and do not mount one `auth.json` into concurrent workers. For remote deployment, put the UI behind real authentication and TLS, use a secret manager for `WORKER_TOKEN`, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
+The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. The control plane's worker bearer token is transport authentication—not a provider credential—and is stored in the server-side registry for this POC. Give each independently authenticated worker its own auth volume and do not mount one `auth.json` into concurrent workers. For remote deployment, put the UI behind real authentication and TLS, replace stored bearer tokens with secret-manager references or pairing credentials, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
 
 Users and operators remain responsible for complying with applicable OpenAI terms and account rules. This project does not implement automatic account rollover or subscription provisioning.
 

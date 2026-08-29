@@ -51,8 +51,6 @@ function publicAgent(agent) {
     description: agent.description,
     adapter: agent.adapter,
     durablePrompt: agent.durablePrompt,
-    workerUrl: agent.workerUrl,
-    hasWorkerToken: Boolean(agent.workerToken),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt
   };
@@ -235,7 +233,7 @@ export function createControlPlane(options = {}) {
     res.writeHead(200, {
       'content-type': MIME[extname(file)] ?? 'application/octet-stream',
       'content-length': metadata.size,
-      'cache-control': extname(file) === '.html' ? 'no-store' : 'public, max-age=300'
+      'cache-control': 'no-store'
     });
     createReadStream(file).pipe(res);
   }

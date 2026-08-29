@@ -42,7 +42,8 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const initialAgents = (await agentsResponse.json()).agents;
   assert.equal(initialAgents.length, 1);
   assert.equal(initialAgents[0].id, 'worker-01');
-  assert.equal(initialAgents[0].hasWorkerToken, true);
+  assert.equal('workerUrl' in initialAgents[0], false);
+  assert.equal('hasWorkerToken' in initialAgents[0], false);
   assert.equal('workerToken' in initialAgents[0], false);
 
   const scopedStatusResponse = await fetch(`${controlUrl}/api/v1/agents/worker-01/status`);
@@ -119,7 +120,8 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const created = (await createResponse.json()).agent;
   assert.equal(created.adapter, 'claude-code');
   assert.equal(created.durablePrompt, 'Keep research concise.');
-  assert.equal(created.hasWorkerToken, true);
+  assert.equal('workerUrl' in created, false);
+  assert.equal('hasWorkerToken' in created, false);
   assert.equal('workerToken' in created, false);
 
   const patchResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
@@ -131,7 +133,14 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const patched = (await patchResponse.json()).agent;
   assert.equal(patched.name, 'Claude Researcher');
   assert.equal(patched.durablePrompt, 'Write concise, cited research.');
+  assert.equal('workerUrl' in patched, false);
+  assert.equal('hasWorkerToken' in patched, false);
   assert.equal('workerToken' in patched, false);
+
+  const agentPage = await (await fetch(`${controlUrl}/agents/${created.id}`)).text();
+  assert.doesNotMatch(agentPage, /Worker URL|Worker token/);
+  assert.match(agentPage, /Tools &amp; MCP/);
+  assert.match(agentPage, /Attach data or volume/);
 
   const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, { method: 'DELETE' });
   assert.equal(deleteResponse.status, 204);

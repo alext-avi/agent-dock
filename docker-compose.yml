@@ -1,0 +1,50 @@
+services:
+  control-plane:
+    build:
+      context: ./control-plane
+    environment:
+      PORT: "3000"
+      WORKER_URL: http://worker:7777
+      WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      CONTROL_PLANE_DATA_PATH: /control-data/agents.json
+    ports:
+      - "${CONTROL_PLANE_PORT:-3000}:3000"
+    volumes:
+      - control-data:/control-data
+    depends_on:
+      worker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+    environment:
+      PORT: "7777"
+      WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      CODEX_HOME: /codex-home
+      CODEX_VERSION: ${CODEX_VERSION:-latest}
+      ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
+      AGENT_DATA_PATH: /agent-data/usage.json
+      USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
+    volumes:
+      - codex-auth:/codex-home
+      - codex-bin:/opt/codex
+      - agent-data:/agent-data
+      - ./workspace:/workspace
+    expose:
+      - "7777"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7777/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    init: true
+    restart: unless-stopped
+
+volumes:
+  codex-auth:
+  codex-bin:
+  agent-data:
+  control-data:

@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Agent Dock</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Agent Dock dashboard">
+        <span class="brand-mark">A/</span>
+        <div><strong>Agent Dock</strong><small>container agent POC</small></div>
+      </a>
+      <div class="topbar-right">
+        <a class="nav-link" href="/">Fleet</a>
+        <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
+      </div>
+    </header>
+
+    <main>
+      <div id="dashboard-view" class="view hidden">
+        <section class="hero fleet-hero">
+          <div>
+            <p class="eyebrow">CONTROL PLANE · AGENT FLEET</p>
+            <h1>Your agents,<br><em>at a glance.</em></h1>
+            <p class="hero-copy">Each record maps a durable identity and prompt to one independently authenticated worker runtime.</p>
+          </div>
+          <div class="boundary-card">
+            <span>Registered agents</span>
+            <strong id="agent-count">—</strong>
+            <small>Creation registers a runtime; container provisioning comes next.</small>
+          </div>
+        </section>
+
+        <section class="fleet-heading">
+          <div><p class="kicker">FLEET</p><h2>Agent runtimes</h2></div>
+          <button id="new-agent" class="button primary">New agent <span>＋</span></button>
+        </section>
+        <section id="agent-grid" class="agent-grid" aria-live="polite"></section>
+        <section id="empty-fleet" class="panel empty-fleet hidden">
+          <p class="eyebrow">NO AGENTS</p>
+          <h2>Register your first worker.</h2>
+          <p>An agent record holds its durable prompt and connection to an independently authenticated runtime.</p>
+          <button id="empty-new-agent" class="button primary">Create agent</button>
+        </section>
+      </div>
+
+      <div id="agent-view" class="view hidden">
+        <a class="breadcrumb" href="/">← Fleet dashboard</a>
+        <section class="agent-hero">
+          <div>
+            <p class="eyebrow">AGENT CONFIGURATION · TEST SURFACE</p>
+            <h1 id="page-agent-name">Agent</h1>
+            <p id="page-agent-description" class="hero-copy">Configure the durable identity, then send disposable test tasks to its runtime.</p>
+          </div>
+          <div class="boundary-card">
+            <span>Execution boundary</span>
+            <strong id="boundary">Container</strong>
+            <small>Provider credentials remain in the worker volume.</small>
+          </div>
+        </section>
+
+        <section class="panel config-panel">
+          <div class="panel-heading">
+            <div><p class="kicker">DURABLE</p><h2>Agent configuration</h2></div>
+            <span class="hint">saved by the control plane</span>
+          </div>
+          <form id="agent-config-form">
+            <div class="form-grid">
+              <label class="field">Name<input id="config-name" name="name" required maxlength="120"></label>
+              <label class="field">Adapter<input id="config-adapter" name="adapter" list="adapter-options" required maxlength="80"></label>
+              <label class="field full">Description<input id="config-description" name="description" maxlength="2000" placeholder="What this agent owns or is good at"></label>
+              <label class="field full">Worker URL<input id="config-worker-url" name="workerUrl" type="url" placeholder="http://worker:7777"></label>
+              <label class="field full">Worker token <span>leave blank to keep the current secret</span><input id="config-worker-token" name="workerToken" type="password" autocomplete="new-password" placeholder="••••••••••••"></label>
+              <label class="field full">Durable agent prompt <span>automatically prepended to every task</span><textarea id="durable-prompt" name="durablePrompt" rows="6" maxlength="50000" placeholder="You are a research analyst. Save useful artifacts in /workspace…"></textarea></label>
+            </div>
+            <div class="actions split-actions">
+              <div><button id="save-agent" class="button primary" type="submit">Save configuration</button><span id="save-message" class="run-message"></span></div>
+              <button id="delete-agent" class="button danger" type="button">Delete agent</button>
+            </div>
+          </form>
+          <datalist id="adapter-options"><option value="codex-cli"><option value="claude-code"></datalist>
+        </section>
+
+        <section class="grid">
+          <article class="panel status-panel">
+            <div class="panel-heading">
+              <div><p id="agent-id-label" class="kicker">AGENT</p><h2 id="agent-name">Runtime</h2></div>
+              <span id="worker-state" class="pill neutral">checking</span>
+            </div>
+            <dl class="metrics">
+              <div><dt>HARNESS</dt><dd id="cli-version">—</dd></div>
+              <div><dt>AUTH</dt><dd id="auth-state">—</dd></div>
+              <div><dt>JOB</dt><dd id="job-state">idle</dd></div>
+            </dl>
+            <section class="usage-box" aria-labelledby="usage-heading">
+              <div class="usage-heading">
+                <div><p class="kicker">SUBSCRIPTION + REQUESTS</p><h3 id="usage-heading">Usage</h3></div>
+                <button id="refresh-usage" class="text-button">Refresh</button>
+              </div>
+              <div id="quota-windows" class="quota-windows"><p class="empty">Available after authentication.</p></div>
+              <dl class="usage-metrics">
+                <div><dt>LAST REQUEST</dt><dd id="last-request-tokens">—</dd><small id="last-request-time">No requests yet</small></div>
+                <div><dt>AGENT TOTAL</dt><dd id="agent-total-tokens">0</dd><small id="agent-request-count">0 requests</small></div>
+                <div><dt>ACCOUNT LIFETIME</dt><dd id="lifetime-tokens">—</dd><small id="usage-polled-at">Not polled</small></div>
+              </dl>
+              <p id="usage-error" class="usage-error hidden"></p>
+            </section>
+            <div id="auth-box" class="auth-box">
+              <div>
+                <strong id="auth-title">Connect this agent</strong>
+                <p id="auth-copy">The worker starts the provider's device flow. This UI only displays the URL and one-time code.</p>
+              </div>
+              <button id="auth-button" class="button secondary">Start device login</button>
+              <div id="auth-session" class="auth-session hidden">
+                <dl class="auth-session-metrics">
+                  <div><dt>ACCESS TOKEN EXPIRES</dt><dd id="auth-expiry">—</dd><small id="auth-expiry-detail">The provider refreshes managed sessions automatically.</small></div>
+                  <div><dt>LAST REFRESHED</dt><dd id="auth-last-refresh">—</dd><small id="auth-last-refresh-detail">No refresh metadata available.</small></div>
+                </dl>
+                <div class="auth-session-actions">
+                  <button id="refresh-auth" class="button secondary">Force session refresh</button>
+                  <span id="auth-refresh-message" class="auth-refresh-message" role="status"></span>
+                </div>
+              </div>
+              <div id="device-flow" class="device-flow hidden">
+                <a id="auth-link" href="#" target="_blank" rel="noopener">Open provider sign-in ↗</a>
+                <code id="auth-code"></code>
+                <pre id="auth-transcript"></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel workspace-panel">
+            <div class="panel-heading">
+              <div><p class="kicker">MOUNT</p><h2>/workspace</h2></div>
+              <button id="refresh-files" class="icon-button" title="Refresh workspace">↻</button>
+            </div>
+            <div id="file-list" class="file-list"><p class="empty">No artifacts yet.</p></div>
+          </article>
+        </section>
+
+        <section class="panel task-panel">
+          <div class="panel-heading">
+            <div><p class="kicker">EPHEMERAL TEST</p><h2>Send a task</h2></div>
+            <span class="hint">not saved · streaming JSONL</span>
+          </div>
+          <label for="prompt">Message <span>⌘/Ctrl + Enter to run</span></label>
+          <textarea id="prompt" rows="5" placeholder="Research the subject, write a concise brief, and save it as /workspace/brief.md."></textarea>
+          <div class="actions">
+            <button id="run-button" class="button primary">Run in container <span>→</span></button>
+            <button id="cancel-button" class="button danger hidden">Cancel run</button>
+            <span id="run-message" class="run-message"></span>
+          </div>
+        </section>
+
+        <section class="panel output-panel">
+          <div class="panel-heading">
+            <div><p class="kicker">EPHEMERAL SESSION</p><h2>Test conversation</h2></div>
+            <button id="clear-output" class="text-button">Clear</button>
+          </div>
+          <div id="conversation" class="conversation"><div class="welcome-line"><span>system</span> Waiting for a test task. This transcript is not persisted.</div></div>
+          <details><summary>Raw event stream</summary><pre id="raw-output" class="terminal"></pre></details>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="create-agent-dialog">
+      <form id="create-agent-form" method="dialog">
+        <div class="dialog-heading"><div><p class="kicker">REGISTER RUNTIME</p><h2>New agent</h2></div><button id="close-agent-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
+        <p class="dialog-copy">This creates a durable agent record. Point it at a worker you have provisioned; automated container creation is a later control-plane capability.</p>
+        <label class="field">Name<input name="name" required maxlength="120" placeholder="Research Agent"></label>
+        <label class="field">Adapter<input name="adapter" list="adapter-options" value="codex-cli" required maxlength="80"></label>
+        <label class="field">Worker URL <span>optional until provisioned</span><input name="workerUrl" type="url" placeholder="http://worker:7777"></label>
+        <label class="field">Worker token <span>stored server-side, never returned</span><input name="workerToken" type="password" autocomplete="new-password"></label>
+        <p id="create-message" class="usage-error hidden"></p>
+        <div class="actions dialog-actions"><button id="cancel-create" class="button secondary" type="button">Cancel</button><button class="button primary" type="submit">Create agent</button></div>
+      </form>
+    </dialog>
+
+    <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

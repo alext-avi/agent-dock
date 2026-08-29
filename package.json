@@ -1,0 +1,17 @@
+{
+  "name": "agent-dock-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendor-neutral control plane and web UI for subscription-authenticated agent harness containers",
+  "scripts": {
+    "dev": "node control-plane/server.mjs",
+    "demo": "node demo.mjs",
+    "test": "node --test",
+    "compose:up": "docker compose up --build",
+    "compose:down": "docker compose down"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,632 @@
+const $ = (selector) => document.querySelector(selector);
+const API_ROOT = '/api/v1';
+
+const ui = {
+  dashboardView: $('#dashboard-view'),
+  agentView: $('#agent-view'),
+  connectionDot: $('#connection-dot'),
+  connectionLabel: $('#connection-label'),
+  agentGrid: $('#agent-grid'),
+  emptyFleet: $('#empty-fleet'),
+  agentCount: $('#agent-count'),
+  createDialog: $('#create-agent-dialog'),
+  createForm: $('#create-agent-form'),
+  createMessage: $('#create-message'),
+  configForm: $('#agent-config-form'),
+  configName: $('#config-name'),
+  configDescription: $('#config-description'),
+  configAdapter: $('#config-adapter'),
+  configWorkerUrl: $('#config-worker-url'),
+  configWorkerToken: $('#config-worker-token'),
+  durablePrompt: $('#durable-prompt'),
+  saveAgent: $('#save-agent'),
+  saveMessage: $('#save-message'),
+  pageAgentName: $('#page-agent-name'),
+  pageAgentDescription: $('#page-agent-description'),
+  agentIdLabel: $('#agent-id-label'),
+  workerState: $('#worker-state'),
+  agentName: $('#agent-name'),
+  cliVersion: $('#cli-version'),
+  authState: $('#auth-state'),
+  jobState: $('#job-state'),
+  boundary: $('#boundary'),
+  authBox: $('#auth-box'),
+  authButton: $('#auth-button'),
+  deviceFlow: $('#device-flow'),
+  authLink: $('#auth-link'),
+  authCode: $('#auth-code'),
+  authTranscript: $('#auth-transcript'),
+  authTitle: $('#auth-title'),
+  authCopy: $('#auth-copy'),
+  authSession: $('#auth-session'),
+  authExpiry: $('#auth-expiry'),
+  authExpiryDetail: $('#auth-expiry-detail'),
+  authLastRefresh: $('#auth-last-refresh'),
+  authLastRefreshDetail: $('#auth-last-refresh-detail'),
+  refreshAuth: $('#refresh-auth'),
+  authRefreshMessage: $('#auth-refresh-message'),
+  quotaWindows: $('#quota-windows'),
+  lastRequestTokens: $('#last-request-tokens'),
+  lastRequestTime: $('#last-request-time'),
+  agentTotalTokens: $('#agent-total-tokens'),
+  agentRequestCount: $('#agent-request-count'),
+  lifetimeTokens: $('#lifetime-tokens'),
+  usagePolledAt: $('#usage-polled-at'),
+  usageError: $('#usage-error'),
+  refreshUsage: $('#refresh-usage'),
+  prompt: $('#prompt'),
+  runButton: $('#run-button'),
+  cancelButton: $('#cancel-button'),
+  runMessage: $('#run-message'),
+  conversation: $('#conversation'),
+  rawOutput: $('#raw-output'),
+  fileList: $('#file-list')
+};
+
+let running = false;
+let authPolling = null;
+let refreshingAuth = false;
+let currentAgent = null;
+let currentHarnessName = 'Agent';
+
+function setConnection(state, label) {
+  ui.connectionDot.className = `dot ${state}`;
+  ui.connectionLabel.textContent = label;
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: options.body ? { 'content-type': 'application/json', ...options.headers } : options.headers
+  });
+  if (response.status === 204) return null;
+  const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+  if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+  return data;
+}
+
+function agentApi(operation = '') {
+  return `${API_ROOT}/agents/${encodeURIComponent(currentAgent.id)}${operation ? `/${operation}` : ''}`;
+}
+
+function formatTokens(value) {
+  if (!Number.isFinite(Number(value))) return '—';
+  return new Intl.NumberFormat('en-US', { notation: Number(value) >= 10_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(Number(value));
+}
+
+function relativeTime(iso) {
+  if (!iso) return 'Not polled';
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86_400)}d ago`;
+}
+
+function timeUntil(iso) {
+  const timestamp = Date.parse(iso);
+  if (!Number.isFinite(timestamp)) return 'Expiry unavailable';
+  const delta = timestamp - Date.now();
+  if (delta <= 0) return 'Expired; refresh required';
+  const hours = Math.floor(delta / 3_600_000);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `in ${days}d ${hours % 24}h`;
+  if (hours > 0) return `in ${hours}h`;
+  return `in ${Math.max(1, Math.floor(delta / 60_000))}m`;
+}
+
+function formatDuration(milliseconds) {
+  if (!Number.isFinite(Number(milliseconds))) return '—';
+  const seconds = Number(milliseconds) / 1000;
+  return seconds < 60 ? `${seconds.toFixed(1)}s` : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+function formatBytes(value) {
+  if (value === null || value === undefined) return '';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function createAgentCard(agent) {
+  const card = document.createElement('article');
+  card.className = 'agent-card';
+  card.dataset.agentId = agent.id;
+  card.innerHTML = `
+    <div class="agent-card-heading">
+      <div><p class="kicker"></p><h2></h2></div>
+      <span class="pill neutral status-pill">checking</span>
+    </div>
+    <p class="agent-card-description"></p>
+    <dl class="card-metrics">
+      <div><dt>AUTH</dt><dd class="card-auth">—</dd></div>
+      <div><dt>USAGE</dt><dd class="card-usage">—</dd></div>
+      <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
+    </dl>
+    <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Configure</a><button class="text-button card-delete">Delete</button></div></div>`;
+  card.querySelector('.kicker').textContent = `${agent.adapter} · ${agent.id}`;
+  card.querySelector('h2').textContent = agent.name;
+  card.querySelector('.agent-card-description').textContent = agent.description || 'No description yet.';
+  card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
+  const configure = card.querySelector('.configure-link');
+  configure.href = `/agents/${encodeURIComponent(agent.id)}`;
+  card.querySelector('.card-delete').addEventListener('click', async () => {
+    if (!window.confirm(`Delete ${agent.name}? The worker container and its volumes will not be removed.`)) return;
+    try {
+      await api(`${API_ROOT}/agents/${encodeURIComponent(agent.id)}`, { method: 'DELETE' });
+      card.remove();
+      const count = ui.agentGrid.children.length;
+      ui.agentCount.textContent = String(count).padStart(2, '0');
+      ui.emptyFleet.classList.toggle('hidden', count !== 0);
+    } catch (error) {
+      setConnection('offline', error.message);
+    }
+  });
+  return card;
+}
+
+function updateAgentCard(card, status) {
+  const authenticated = Boolean(status.authentication?.authenticated);
+  const active = Boolean(status.task?.active);
+  const pill = card.querySelector('.status-pill');
+  pill.textContent = active ? 'busy' : authenticated ? 'ready' : 'needs auth';
+  pill.className = `pill status-pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
+  card.querySelector('.card-auth').textContent = authenticated ? 'connected' : 'required';
+  const windows = status.usage?.quotaWindows ?? [];
+  const highest = windows.length ? Math.max(...windows.map((window) => Number(window.usedPercent) || 0)) : null;
+  card.querySelector('.card-usage').textContent = highest === null ? '—' : `${highest.toFixed(0)}% used`;
+  card.querySelector('.card-requests').textContent = formatTokens(status.usage?.totals?.requests ?? 0);
+}
+
+function markAgentCardOffline(card, message) {
+  const pill = card.querySelector('.status-pill');
+  pill.textContent = message.includes('not configured') ? 'unconfigured' : 'offline';
+  pill.className = 'pill status-pill error';
+  card.querySelector('.card-auth').textContent = '—';
+}
+
+async function loadDashboard() {
+  ui.dashboardView.classList.remove('hidden');
+  ui.agentView.classList.add('hidden');
+  document.title = 'Agent Dock — Fleet';
+  try {
+    const { agents } = await api(`${API_ROOT}/agents`);
+    setConnection('online', 'Control plane online');
+    ui.agentGrid.replaceChildren();
+    ui.agentCount.textContent = String(agents.length).padStart(2, '0');
+    ui.emptyFleet.classList.toggle('hidden', agents.length !== 0);
+    for (const agent of agents) ui.agentGrid.append(createAgentCard(agent));
+    await Promise.allSettled(agents.map(async (agent) => {
+      const card = [...ui.agentGrid.children].find((candidate) => candidate.dataset.agentId === agent.id);
+      try {
+        const status = await api(`${API_ROOT}/agents/${encodeURIComponent(agent.id)}/status`, { signal: AbortSignal.timeout(3500) });
+        updateAgentCard(card, status);
+      } catch (error) {
+        markAgentCardOffline(card, error.message);
+      }
+    }));
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.agentGrid.innerHTML = '<article class="panel"><p class="usage-error">Could not load the agent registry.</p></article>';
+  }
+}
+
+function openCreateDialog() {
+  ui.createMessage.classList.add('hidden');
+  ui.createMessage.textContent = '';
+  ui.createDialog.showModal();
+}
+
+async function createAgent(event) {
+  event.preventDefault();
+  const submit = ui.createForm.querySelector('[type="submit"]');
+  submit.disabled = true;
+  try {
+    const body = Object.fromEntries(new FormData(ui.createForm));
+    const { agent } = await api(`${API_ROOT}/agents`, { method: 'POST', body: JSON.stringify(body) });
+    window.location.assign(`/agents/${encodeURIComponent(agent.id)}`);
+  } catch (error) {
+    ui.createMessage.textContent = error.message;
+    ui.createMessage.classList.remove('hidden');
+    submit.disabled = false;
+  }
+}
+
+function populateAgentConfig(agent) {
+  ui.pageAgentName.textContent = agent.name;
+  ui.pageAgentDescription.textContent = agent.description || 'Configure the durable identity, then send disposable test tasks to its runtime.';
+  ui.agentIdLabel.textContent = agent.id.toUpperCase();
+  ui.configName.value = agent.name;
+  ui.configDescription.value = agent.description;
+  ui.configAdapter.value = agent.adapter;
+  ui.configWorkerUrl.value = agent.workerUrl;
+  ui.configWorkerToken.value = '';
+  ui.configWorkerToken.placeholder = agent.hasWorkerToken ? 'Secret configured · blank keeps it' : 'No secret configured';
+  ui.durablePrompt.value = agent.durablePrompt;
+}
+
+async function saveAgent(event) {
+  event.preventDefault();
+  ui.saveAgent.disabled = true;
+  ui.saveMessage.textContent = 'Saving…';
+  const body = {
+    name: ui.configName.value,
+    description: ui.configDescription.value,
+    adapter: ui.configAdapter.value,
+    workerUrl: ui.configWorkerUrl.value,
+    durablePrompt: ui.durablePrompt.value
+  };
+  if (ui.configWorkerToken.value.trim()) body.workerToken = ui.configWorkerToken.value;
+  try {
+    const result = await api(agentApi(), { method: 'PATCH', body: JSON.stringify(body) });
+    currentAgent = result.agent;
+    populateAgentConfig(currentAgent);
+    ui.saveMessage.textContent = 'Saved';
+    document.title = `${currentAgent.name} — Agent Dock`;
+  } catch (error) {
+    ui.saveMessage.textContent = error.message;
+  } finally {
+    ui.saveAgent.disabled = false;
+  }
+}
+
+async function deleteCurrentAgent() {
+  if (!window.confirm(`Delete ${currentAgent.name}? The worker container and its volumes will not be removed.`)) return;
+  try {
+    await api(agentApi(), { method: 'DELETE' });
+    window.location.assign('/');
+  } catch (error) {
+    ui.saveMessage.textContent = error.message;
+  }
+}
+
+function renderAuth(auth = {}) {
+  const visible = auth.phase === 'waiting_for_user' || auth.phase === 'failed';
+  ui.deviceFlow.classList.toggle('hidden', !visible);
+  if (auth.challenge?.verificationUri) {
+    ui.authLink.href = auth.challenge.verificationUri;
+    ui.authLink.classList.remove('hidden');
+  } else {
+    ui.authLink.classList.add('hidden');
+  }
+  ui.authCode.textContent = auth.challenge?.userCode || '';
+  ui.authTranscript.textContent = auth.challenge?.instructions || 'Waiting for the device login instructions…';
+}
+
+function renderAuthSession(session = {}, { authenticated = false, active = false, workerRefreshing = false } = {}) {
+  ui.authSession.classList.toggle('hidden', !authenticated);
+  if (!authenticated) {
+    ui.authRefreshMessage.textContent = '';
+    return;
+  }
+  const expiry = session.accessTokenExpiresAt ? new Date(session.accessTokenExpiresAt) : null;
+  const lastRefresh = session.lastRefreshAt ? new Date(session.lastRefreshAt) : null;
+  ui.authExpiry.textContent = expiry && !Number.isNaN(expiry.valueOf()) ? expiry.toLocaleString() : 'Unavailable';
+  ui.authExpiryDetail.textContent = `${timeUntil(session.accessTokenExpiresAt)} · automatically renewable`;
+  ui.authLastRefresh.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? relativeTime(session.lastRefreshAt) : 'Unavailable';
+  ui.authLastRefreshDetail.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? lastRefresh.toLocaleString() : 'No refresh metadata available.';
+  const refreshing = refreshingAuth || workerRefreshing;
+  ui.refreshAuth.textContent = refreshing ? 'Refreshing session…' : 'Force session refresh';
+  ui.refreshAuth.disabled = refreshing || active || !session.canForceRefresh;
+  if (workerRefreshing) {
+    ui.authRefreshMessage.textContent = `${currentHarnessName} is renewing the managed session…`;
+    ui.authRefreshMessage.classList.remove('error');
+  } else if (session.error && !refreshingAuth) {
+    ui.authRefreshMessage.textContent = session.error;
+    ui.authRefreshMessage.classList.add('error');
+  }
+}
+
+function renderQuotaRow(label, window) {
+  const used = Math.max(0, Math.min(100, Number(window?.usedPercent ?? 0)));
+  const row = document.createElement('div');
+  row.className = 'quota-row';
+  const name = document.createElement('span');
+  name.className = 'quota-label';
+  name.textContent = label;
+  const bar = document.createElement('span');
+  bar.className = 'quota-bar';
+  const fill = document.createElement('span');
+  fill.style.width = `${used}%`;
+  if (used >= 90) fill.className = 'danger';
+  else if (used >= 70) fill.className = 'warning';
+  bar.append(fill);
+  const value = document.createElement('span');
+  value.className = 'quota-value';
+  value.textContent = `${used.toFixed(0)}%`;
+  const reset = document.createElement('small');
+  reset.className = 'quota-reset';
+  const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
+  const duration = window?.windowDurationMinutes ? `${window.windowDurationMinutes}m window` : 'quota window';
+  reset.textContent = resetDate ? `${duration} · resets ${resetDate.toLocaleString()}` : duration;
+  row.append(name, bar, value, reset);
+  return row;
+}
+
+function renderUsage(usage = {}) {
+  const last = usage.lastRequest;
+  const totals = usage.totals ?? {};
+  ui.lastRequestTokens.textContent = last ? formatTokens(last.totalTokens) : '—';
+  ui.lastRequestTime.textContent = last ? `${formatTokens(last.inputTokens)} in · ${formatTokens(last.outputTokens)} out · ${formatDuration(last.durationMs)}` : 'No requests yet';
+  ui.agentTotalTokens.textContent = formatTokens(totals.totalTokens ?? 0);
+  ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
+  ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
+  ui.usagePolledAt.textContent = usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  ui.usageError.textContent = usage.pollError || '';
+  ui.usageError.classList.toggle('hidden', !usage.pollError);
+  const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
+  ui.quotaWindows.replaceChildren();
+  if (!windows.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = 'Quota windows have not been polled yet.';
+    ui.quotaWindows.append(empty);
+    return;
+  }
+  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(window.label || currentHarnessName, window));
+}
+
+function renderStatus(status) {
+  const authenticated = status.authentication?.authenticated;
+  const active = Boolean(status.task?.active) || running;
+  currentHarnessName = status.agent?.adapter?.displayName || currentAgent.adapter;
+  setConnection('online', 'Control plane + worker online');
+  ui.workerState.textContent = active ? 'busy' : authenticated ? 'ready' : 'needs auth';
+  ui.workerState.className = `pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
+  ui.agentName.textContent = currentHarnessName;
+  ui.cliVersion.textContent = status.agent?.version || '—';
+  ui.authState.textContent = authenticated ? 'connected' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
+  ui.jobState.textContent = active ? 'running' : 'idle';
+  ui.boundary.textContent = status.execution?.boundary === 'container' ? 'Worker container' : 'Provider workspace sandbox';
+  ui.runButton.disabled = !authenticated || active;
+  ui.authBox.classList.toggle('authenticated', authenticated);
+  ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
+  ui.authCopy.textContent = authenticated
+    ? `The worker holds a renewable ${currentHarnessName} login. Safe session dates are surfaced; credentials never leave the worker.`
+    : `The worker starts ${currentHarnessName}'s device flow. This UI only displays the URL and one-time code.`;
+  ui.authButton.textContent = authenticated ? 'Connected' : 'Start device login';
+  ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
+  renderAuth(status.authentication);
+  renderAuthSession(status.authentication?.session, { authenticated, active, workerRefreshing: status.authentication?.refreshing });
+  renderUsage(status.usage);
+}
+
+async function refreshStatus() {
+  if (!currentAgent) return;
+  try {
+    const status = await api(agentApi('status'));
+    renderStatus(status);
+    if (status.authentication?.authenticated && authPolling) {
+      clearInterval(authPolling);
+      authPolling = null;
+    }
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.workerState.textContent = error.message.includes('not configured') ? 'unconfigured' : 'offline';
+    ui.workerState.className = 'pill error';
+    ui.runButton.disabled = true;
+  }
+}
+
+async function startAuth() {
+  ui.authButton.disabled = true;
+  try {
+    const result = await api(agentApi('auth/login'), { method: 'POST', body: '{}' });
+    renderAuth(result.authentication);
+    if (!authPolling) authPolling = setInterval(refreshStatus, 1800);
+  } catch (error) {
+    ui.runMessage.textContent = error.message;
+    ui.authButton.disabled = false;
+  }
+}
+
+async function refreshUsage() {
+  ui.refreshUsage.disabled = true;
+  try {
+    const result = await api(agentApi('usage/refresh'), { method: 'POST', body: '{}' });
+    renderUsage(result.usage);
+  } catch (error) {
+    ui.usageError.textContent = error.message;
+    ui.usageError.classList.remove('hidden');
+  } finally {
+    ui.refreshUsage.disabled = false;
+  }
+}
+
+async function refreshAuthentication() {
+  if (refreshingAuth || running) return;
+  refreshingAuth = true;
+  ui.refreshAuth.disabled = true;
+  ui.refreshAuth.textContent = 'Refreshing session…';
+  ui.authRefreshMessage.textContent = `Asking ${currentHarnessName} to rotate the managed token bundle…`;
+  ui.authRefreshMessage.classList.remove('error');
+  let message = '';
+  let failed = false;
+  try {
+    const result = await api(agentApi('auth/refresh'), { method: 'POST', body: '{}' });
+    renderUsage(result.usage);
+    message = result.authentication?.refreshed ? 'Session refreshed successfully.' : 'Session validated; token metadata is unchanged.';
+  } catch (error) {
+    failed = true;
+    message = error.message;
+  } finally {
+    refreshingAuth = false;
+    await refreshStatus();
+    ui.authRefreshMessage.textContent = message;
+    ui.authRefreshMessage.classList.toggle('error', failed);
+  }
+}
+
+async function refreshWorkspace() {
+  if (!currentAgent) return;
+  try {
+    const { workspace } = await api(agentApi('workspace'));
+    const entries = workspace?.entries ?? [];
+    ui.fileList.replaceChildren();
+    if (!entries.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'No artifacts yet.';
+      ui.fileList.append(empty);
+      return;
+    }
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      row.className = 'file';
+      const kind = document.createElement('span');
+      kind.className = 'kind';
+      kind.textContent = entry.type === 'directory' ? '▸' : '·';
+      const name = document.createElement('span');
+      name.textContent = entry.path;
+      const size = document.createElement('span');
+      size.className = 'size';
+      size.textContent = entry.type === 'file' ? formatBytes(entry.size) : '';
+      row.append(kind, name, size);
+      ui.fileList.append(row);
+    }
+  } catch {
+    ui.fileList.innerHTML = '<p class="empty">Workspace unavailable.</p>';
+  }
+}
+
+function eventText(event) {
+  const data = event.data ?? {};
+  if (event.type === 'message.completed') return { kind: 'agent', text: data.text };
+  if (event.type === 'activity.started' || event.type === 'activity.completed') {
+    const detail = data.command || data.name || data.text || event.type.replace('.', ' ');
+    return { kind: 'tool', text: `${data.kind || 'activity'}: ${detail}` };
+  }
+  if (event.type === 'log') return { kind: data.level === 'error' ? 'error' : 'tool', text: data.message };
+  if (event.type === 'error') return { kind: 'error', text: data.message };
+  if (event.type === 'task.started') return { kind: 'tool', text: `Task ${event.taskId.slice(0, 8)} started (${data.executionMode}).` };
+  if (event.type === 'task.completed') return { kind: data.status === 'succeeded' ? 'tool' : 'error', text: `Task ${data.status} with exit code ${data.exitCode}.` };
+  if (event.type === 'usage.observed') {
+    const request = data.request;
+    const usage = request ? ` · ${request.inputTokens ?? '?'} in / ${request.outputTokens ?? '?'} out` : '';
+    return { kind: 'tool', text: `Usage observed${usage}.` };
+  }
+  if (event.type === 'usage.updated') return { kind: 'tool', text: 'Usage and subscription limits refreshed.' };
+  return null;
+}
+
+function appendLine(kind, text) {
+  const row = document.createElement('div');
+  row.className = `event-line ${kind}`;
+  const type = document.createElement('span');
+  type.className = 'event-type';
+  type.textContent = kind;
+  row.append(type, document.createTextNode(text));
+  ui.conversation.append(row);
+  ui.conversation.scrollTop = ui.conversation.scrollHeight;
+}
+
+function appendEvent(event) {
+  ui.rawOutput.textContent += `${JSON.stringify(event)}\n`;
+  ui.rawOutput.scrollTop = ui.rawOutput.scrollHeight;
+  if (event.type === 'usage.updated') renderUsage(event.data?.usage);
+  const display = eventText(event);
+  if (display) appendLine(display.kind, display.text);
+}
+
+async function runTask() {
+  const prompt = ui.prompt.value.trim();
+  if (!prompt || running) return;
+  appendLine('user', prompt);
+  ui.prompt.value = '';
+  running = true;
+  ui.runButton.disabled = true;
+  ui.cancelButton.classList.remove('hidden');
+  ui.jobState.textContent = 'running';
+  ui.workerState.textContent = 'busy';
+  ui.workerState.className = 'pill busy';
+  ui.runMessage.textContent = 'Opening event stream…';
+  try {
+    const response = await fetch(agentApi('tasks'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    });
+    if (!response.ok || !response.body) {
+      const error = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(error.error ?? `HTTP ${response.status}`);
+    }
+    ui.runMessage.textContent = 'Running';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { appendEvent(JSON.parse(line)); }
+        catch { appendEvent({ type: 'log', data: { level: 'info', message: line } }); }
+      }
+      if (done) break;
+    }
+    ui.runMessage.textContent = 'Run complete';
+  } catch (error) {
+    appendEvent({ type: 'error', data: { source: 'control-plane', message: error.message } });
+    ui.runMessage.textContent = error.message;
+  } finally {
+    running = false;
+    ui.cancelButton.classList.add('hidden');
+    await Promise.all([refreshStatus(), refreshWorkspace()]);
+  }
+}
+
+async function cancelRun() {
+  ui.cancelButton.disabled = true;
+  try {
+    await api(agentApi('tasks/cancel'), { method: 'POST', body: '{}' });
+    ui.runMessage.textContent = 'Cancelling…';
+  } catch (error) {
+    ui.runMessage.textContent = error.message;
+  } finally {
+    ui.cancelButton.disabled = false;
+  }
+}
+
+async function loadAgent(id) {
+  ui.agentView.classList.remove('hidden');
+  ui.dashboardView.classList.add('hidden');
+  try {
+    const result = await api(`${API_ROOT}/agents/${encodeURIComponent(id)}`);
+    currentAgent = result.agent;
+    populateAgentConfig(currentAgent);
+    document.title = `${currentAgent.name} — Agent Dock`;
+    await Promise.all([refreshStatus(), refreshWorkspace()]);
+    setInterval(() => { if (!running) refreshStatus(); }, 5000);
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.pageAgentName.textContent = 'Agent unavailable';
+    ui.pageAgentDescription.textContent = error.message;
+  }
+}
+
+ui.createForm.addEventListener('submit', createAgent);
+$('#new-agent').addEventListener('click', openCreateDialog);
+$('#empty-new-agent').addEventListener('click', openCreateDialog);
+$('#close-agent-dialog').addEventListener('click', () => ui.createDialog.close());
+$('#cancel-create').addEventListener('click', () => ui.createDialog.close());
+ui.configForm.addEventListener('submit', saveAgent);
+$('#delete-agent').addEventListener('click', deleteCurrentAgent);
+ui.authButton.addEventListener('click', startAuth);
+ui.runButton.addEventListener('click', runTask);
+ui.cancelButton.addEventListener('click', cancelRun);
+ui.refreshUsage.addEventListener('click', refreshUsage);
+ui.refreshAuth.addEventListener('click', refreshAuthentication);
+$('#refresh-files').addEventListener('click', refreshWorkspace);
+$('#clear-output').addEventListener('click', () => {
+  ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';
+  ui.rawOutput.textContent = '';
+});
+ui.prompt.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') runTask();
+});
+
+const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
+if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
+else loadDashboard();

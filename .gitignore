@@ -1,0 +1,6 @@
+.env
+.DS_Store
+node_modules/
+npm-debug.log*
+workspace/*
+!workspace/.gitkeep

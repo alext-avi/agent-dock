@@ -30,7 +30,11 @@ const ui = {
   cliVersion: $('#cli-version'),
   authState: $('#auth-state'),
   jobState: $('#job-state'),
-  boundary: $('#boundary'),
+  primaryQuotaSummary: $('#primary-quota-summary'),
+  secondaryQuotaSummary: $('#secondary-quota-summary'),
+  agentTotalSummary: $('#agent-total-summary'),
+  runtimeDetails: $('#runtime-details'),
+  runtimeDetailsHint: $('#runtime-details-hint'),
   authBox: $('#auth-box'),
   authButton: $('#auth-button'),
   deviceFlow: $('#device-flow'),
@@ -330,6 +334,9 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
   ui.authExpiryDetail.textContent = `${timeUntil(session.accessTokenExpiresAt)} · automatically renewable`;
   ui.authLastRefresh.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? relativeTime(session.lastRefreshAt) : 'Unavailable';
   ui.authLastRefreshDetail.textContent = lastRefresh && !Number.isNaN(lastRefresh.valueOf()) ? lastRefresh.toLocaleString() : 'No refresh metadata available.';
+  ui.runtimeDetailsHint.textContent = expiry && !Number.isNaN(expiry.valueOf())
+    ? `Session expires ${timeUntil(session.accessTokenExpiresAt)}`
+    : 'Session connected · expand for controls';
   const refreshing = refreshingAuth || workerRefreshing;
   ui.refreshAuth.textContent = refreshing ? 'Refreshing session…' : 'Force session refresh';
   ui.refreshAuth.disabled = refreshing || active || !session.canForceRefresh;
@@ -374,12 +381,17 @@ function renderUsage(usage = {}) {
   ui.lastRequestTokens.textContent = last ? formatTokens(last.totalTokens) : '—';
   ui.lastRequestTime.textContent = last ? `${formatTokens(last.inputTokens)} in · ${formatTokens(last.outputTokens)} out · ${formatDuration(last.durationMs)}` : 'No requests yet';
   ui.agentTotalTokens.textContent = formatTokens(totals.totalTokens ?? 0);
+  ui.agentTotalSummary.textContent = formatTokens(totals.totalTokens ?? 0);
   ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
   ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
   ui.usagePolledAt.textContent = usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
+  const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
+  const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
+  ui.primaryQuotaSummary.textContent = primary ? `${Number(primary.usedPercent ?? 0).toFixed(0)}% used` : '—';
+  ui.secondaryQuotaSummary.textContent = secondary ? `${Number(secondary.usedPercent ?? 0).toFixed(0)}% used` : '—';
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
@@ -404,7 +416,6 @@ function renderStatus(status) {
   ui.authState.textContent = authenticated ? 'connected' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
   ui.jobState.textContent = active ? 'running' : 'idle';
   const inContainer = status.execution?.boundary === 'container';
-  ui.boundary.textContent = inContainer ? 'container' : 'sandbox';
   ui.runtimeLocation.textContent = inContainer ? 'Managed worker · isolated container' : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !authenticated || active;
   ui.refreshUsage.disabled = false;
@@ -415,6 +426,13 @@ function renderStatus(status) {
     : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
   ui.authButton.textContent = authenticated ? 'Connected' : 'Start device login';
   ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
+  if (!authenticated) {
+    ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user' ? 'Waiting for device authentication' : 'Authentication required';
+    if (ui.runtimeDetails.dataset.autoOpened !== 'true') {
+      ui.runtimeDetails.open = true;
+      ui.runtimeDetails.dataset.autoOpened = 'true';
+    }
+  }
   renderAuth(status.authentication);
   renderAuthSession(status.authentication?.session, { authenticated, active, workerRefreshing: status.authentication?.refreshing });
   renderUsage(status.usage);
@@ -432,7 +450,10 @@ function renderRuntimeUnavailable(message) {
   ui.cliVersion.textContent = definitionOnly ? 'not provisioned' : 'unavailable';
   ui.authState.textContent = '—';
   ui.jobState.textContent = 'idle';
-  ui.boundary.textContent = '—';
+  ui.primaryQuotaSummary.textContent = '—';
+  ui.secondaryQuotaSummary.textContent = '—';
+  ui.agentTotalSummary.textContent = '0';
+  ui.runtimeDetailsHint.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
   ui.runButton.disabled = true;
   ui.refreshUsage.disabled = true;
   ui.authButton.disabled = true;
@@ -460,6 +481,7 @@ async function refreshStatus() {
 
 async function startAuth() {
   ui.authButton.disabled = true;
+  ui.runtimeDetails.open = true;
   try {
     const result = await api(agentApi('auth/login'), { method: 'POST', body: '{}' });
     renderAuth(result.authentication);

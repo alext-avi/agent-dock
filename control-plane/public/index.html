@@ -76,47 +76,54 @@
               </div>
               <span id="worker-state" class="pill neutral">checking</span>
             </div>
-            <dl class="metrics runtime-metrics">
+            <dl class="runtime-summary-metrics">
               <div><dt>HARNESS</dt><dd id="cli-version">—</dd></div>
               <div><dt>AUTH</dt><dd id="auth-state">—</dd></div>
               <div><dt>TASK</dt><dd id="job-state">idle</dd></div>
-              <div><dt>BOUNDARY</dt><dd id="boundary">container</dd></div>
+              <div><dt>PRIMARY LIMIT</dt><dd id="primary-quota-summary">—</dd></div>
+              <div><dt>SECONDARY</dt><dd id="secondary-quota-summary">—</dd></div>
+              <div><dt>AGENT TOTAL</dt><dd id="agent-total-summary">0</dd></div>
             </dl>
-            <section class="usage-box runtime-usage" aria-labelledby="usage-heading">
-              <div class="usage-heading">
-                <div><p class="kicker">SUBSCRIPTION + REQUESTS</p><h3 id="usage-heading">Usage</h3></div>
-                <button id="refresh-usage" class="text-button">Refresh</button>
-              </div>
-              <div id="quota-windows" class="quota-windows"><p class="empty">Available after authentication.</p></div>
-              <dl class="usage-metrics">
-                <div><dt>LAST REQUEST</dt><dd id="last-request-tokens">—</dd><small id="last-request-time">No requests yet</small></div>
-                <div><dt>AGENT TOTAL</dt><dd id="agent-total-tokens">0</dd><small id="agent-request-count">0 requests</small></div>
-                <div><dt>ACCOUNT LIFETIME</dt><dd id="lifetime-tokens">—</dd><small id="usage-polled-at">Not polled</small></div>
-              </dl>
-              <p id="usage-error" class="usage-error hidden"></p>
-            </section>
-            <div id="auth-box" class="auth-box runtime-auth">
-              <div>
-                <strong id="auth-title">Connect this agent</strong>
-                <p id="auth-copy">The worker starts the provider's device flow. This UI displays only the sign-in URL and one-time code.</p>
-              </div>
-              <button id="auth-button" class="button secondary">Start device login</button>
-              <div id="auth-session" class="auth-session hidden">
-                <dl class="auth-session-metrics">
-                  <div><dt>ACCESS TOKEN EXPIRES</dt><dd id="auth-expiry">—</dd><small id="auth-expiry-detail">The provider refreshes managed sessions automatically.</small></div>
-                  <div><dt>LAST REFRESHED</dt><dd id="auth-last-refresh">—</dd><small id="auth-last-refresh-detail">No refresh metadata available.</small></div>
-                </dl>
-                <div class="auth-session-actions">
-                  <button id="refresh-auth" class="button secondary">Force session refresh</button>
-                  <span id="auth-refresh-message" class="auth-refresh-message" role="status"></span>
+            <details id="runtime-details" class="runtime-details">
+              <summary><span>Usage &amp; session details</span><small id="runtime-details-hint">Expand for quota windows and authentication controls</small><span class="details-chevron">⌄</span></summary>
+              <div class="runtime-detail-grid">
+                <section class="usage-box runtime-usage" aria-labelledby="usage-heading">
+                  <div class="usage-heading">
+                    <div><p class="kicker">SUBSCRIPTION + REQUESTS</p><h3 id="usage-heading">Usage</h3></div>
+                    <button id="refresh-usage" class="text-button">Refresh</button>
+                  </div>
+                  <div id="quota-windows" class="quota-windows"><p class="empty">Available after authentication.</p></div>
+                  <dl class="usage-metrics">
+                    <div><dt>LAST REQUEST</dt><dd id="last-request-tokens">—</dd><small id="last-request-time">No requests yet</small></div>
+                    <div><dt>AGENT TOTAL</dt><dd id="agent-total-tokens">0</dd><small id="agent-request-count">0 requests</small></div>
+                    <div><dt>ACCOUNT LIFETIME</dt><dd id="lifetime-tokens">—</dd><small id="usage-polled-at">Not polled</small></div>
+                  </dl>
+                  <p id="usage-error" class="usage-error hidden"></p>
+                </section>
+                <div id="auth-box" class="auth-box runtime-auth">
+                  <div>
+                    <strong id="auth-title">Connect this agent</strong>
+                    <p id="auth-copy">The worker starts the provider's device flow. This UI displays only the sign-in URL and one-time code.</p>
+                  </div>
+                  <button id="auth-button" class="button secondary">Start device login</button>
+                  <div id="auth-session" class="auth-session hidden">
+                    <dl class="auth-session-metrics">
+                      <div><dt>ACCESS TOKEN EXPIRES</dt><dd id="auth-expiry">—</dd><small id="auth-expiry-detail">The provider refreshes managed sessions automatically.</small></div>
+                      <div><dt>LAST REFRESHED</dt><dd id="auth-last-refresh">—</dd><small id="auth-last-refresh-detail">No refresh metadata available.</small></div>
+                    </dl>
+                    <div class="auth-session-actions">
+                      <button id="refresh-auth" class="button secondary">Force session refresh</button>
+                      <span id="auth-refresh-message" class="auth-refresh-message" role="status"></span>
+                    </div>
+                  </div>
+                  <div id="device-flow" class="device-flow hidden">
+                    <a id="auth-link" href="#" target="_blank" rel="noopener">Open provider sign-in ↗</a>
+                    <code id="auth-code"></code>
+                    <pre id="auth-transcript"></pre>
+                  </div>
                 </div>
               </div>
-              <div id="device-flow" class="device-flow hidden">
-                <a id="auth-link" href="#" target="_blank" rel="noopener">Open provider sign-in ↗</a>
-                <code id="auth-code"></code>
-                <pre id="auth-transcript"></pre>
-              </div>
-            </div>
+            </details>
           </article>
         </section>
 

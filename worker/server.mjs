@@ -88,6 +88,7 @@ function jwtExpiresAt(token) {
 const LEGACY_ROUTES = new Map([
   ['/health', '/v1/health'],
   ['/status', '/v1/status'],
+  ['/providers', '/v1/providers'],
   ['/auth/start', '/v1/auth/login'],
   ['/auth/complete', '/v1/auth/complete'],
   ['/auth/refresh', '/v1/auth/refresh'],
@@ -170,6 +171,10 @@ export function createWorkerServer(options = {}) {
     claudeHome: options.claudeHome ?? process.env.CLAUDE_HOME ?? process.env.HOME ?? '/claude-home',
     opencodeHome: options.opencodeHome ?? process.env.OPENCODE_HOME ?? process.env.HOME ?? '/opencode-home',
     opencodeAuthProvider: options.opencodeAuthProvider ?? process.env.OPENCODE_AUTH_PROVIDER ?? 'github-copilot',
+    opencodeConfigPath: options.opencodeConfigPath === null ? null : (options.opencodeConfigPath ?? process.env.OPENCODE_CONFIG ?? '/agent-data/opencode-provider.json'),
+    ollamaBaseUrl: (options.ollamaBaseUrl ?? process.env.OLLAMA_BASE_URL ?? 'http://host.docker.internal:11434').replace(/\/$/, ''),
+    ollamaConnectionId: options.ollamaConnectionId ?? process.env.OLLAMA_CONNECTION_ID ?? 'ollama-local',
+    ollamaDisplayName: options.ollamaDisplayName ?? process.env.OLLAMA_DISPLAY_NAME ?? 'Local Ollama',
     workspace: options.workspace ?? process.env.WORKSPACE_PATH ?? '/workspace',
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
@@ -186,7 +191,8 @@ export function createWorkerServer(options = {}) {
     usage: initialUsage(),
     usagePollPromise: null,
     authRefreshPromise: null,
-    demoAuthLastRefreshAt: new Date().toISOString()
+    demoAuthLastRefreshAt: new Date().toISOString(),
+    providerLastCheckedAt: null
   };
 
   const providerEnv = config.adapterId === 'claude-code'
@@ -197,6 +203,7 @@ export function createWorkerServer(options = {}) {
           HOME: config.opencodeHome,
           XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? path.join(config.opencodeHome, '.local/share'),
           XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? path.join(config.opencodeHome, '.config'),
+          ...(config.opencodeConfigPath ? { OPENCODE_CONFIG: config.opencodeConfigPath } : {}),
           BROWSER: process.env.BROWSER ?? 'echo'
         }
       : { ...process.env, CODEX_HOME: config.codexHome };
@@ -226,6 +233,164 @@ export function createWorkerServer(options = {}) {
   }
 
   const usageReady = loadUsage();
+
+  function modelPolicy(value = {}) {
+    if (value === null || value === undefined) value = {};
+    if (typeof value !== 'object' || Array.isArray(value)) {
+      throw Object.assign(new Error('modelPolicy must be an object'), { status: 400 });
+    }
+    const mode = value.mode ?? 'provider-default';
+    if (!['provider-default', 'pinned'].includes(mode)) {
+      throw Object.assign(new Error('modelPolicy.mode must be provider-default or pinned'), { status: 400 });
+    }
+    const primary = typeof value.primary === 'string' ? value.primary.trim() : null;
+    if (mode === 'pinned' && (!primary || primary.length > 240)) {
+      throw Object.assign(new Error('A valid modelPolicy.primary is required for pinned mode'), { status: 400 });
+    }
+    const fallbacks = Array.isArray(value.fallbacks) ? value.fallbacks.filter(Boolean) : [];
+    if (fallbacks.length || value.externalFallback === true) {
+      throw Object.assign(new Error('Automatic model fallback is not enabled; select one model explicitly'), { status: 409 });
+    }
+    return { mode, primary: mode === 'pinned' ? primary : null, fallbacks: [], externalFallback: false };
+  }
+
+  function contextLength(modelInfo = {}) {
+    for (const [key, value] of Object.entries(modelInfo)) {
+      if (key.endsWith('.context_length') && Number.isFinite(Number(value))) return Number(value);
+    }
+    return null;
+  }
+
+  function normalizeOllamaModel(model, details = {}) {
+    const name = typeof model === 'string' ? model : model?.name ?? model?.model;
+    if (!name) return null;
+    const source = typeof model === 'object' ? model : {};
+    const modelDetails = details.details ?? source.details ?? {};
+    const capabilities = details.capabilities ?? source.capabilities ?? [];
+    return {
+      id: `ollama/${name}`,
+      name,
+      displayName: name,
+      providerId: 'ollama',
+      connectionId: config.ollamaConnectionId,
+      contextLength: Number(source.contextLength ?? contextLength(details.model_info)) || null,
+      capabilities: Array.isArray(capabilities) ? capabilities : [],
+      family: modelDetails.family ?? null,
+      parameterSize: modelDetails.parameter_size ?? null,
+      quantization: modelDetails.quantization_level ?? null,
+      modifiedAt: source.modified_at ?? null,
+      size: Number(source.size) || null
+    };
+  }
+
+  async function writeOpenCodeProviderConfig(models) {
+    if (!config.opencodeConfigPath || config.adapterId !== 'opencode') return;
+    const modelConfig = Object.fromEntries(models.map((model) => [model.name, {
+      name: model.displayName,
+      ...(model.contextLength ? {
+        limit: {
+          context: model.contextLength,
+          output: Math.min(32_768, Math.max(4_096, Math.floor(model.contextLength / 4)))
+        }
+      } : {})
+    }]));
+    const contents = {
+      $schema: 'https://opencode.ai/config.json',
+      provider: {
+        ollama: {
+          npm: '@ai-sdk/openai-compatible',
+          name: config.ollamaDisplayName,
+          options: { baseURL: `${config.ollamaBaseUrl}/v1` },
+          models: modelConfig
+        }
+      }
+    };
+    await mkdir(path.dirname(config.opencodeConfigPath), { recursive: true });
+    const temporary = `${config.opencodeConfigPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(contents, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporary, config.opencodeConfigPath);
+  }
+
+  async function providerConnections() {
+    state.providerLastCheckedAt = new Date().toISOString();
+    if (config.adapterId !== 'opencode') {
+      return {
+        modelSelection: { supported: false, fallbackPolicy: 'explicit-only' },
+        connections: [],
+        lastCheckedAt: state.providerLastCheckedAt
+      };
+    }
+    try {
+      let models;
+      if (config.demoMode && Array.isArray(options.ollamaModels)) {
+        models = options.ollamaModels.map((model) => normalizeOllamaModel(model)).filter(Boolean);
+      } else {
+        const tagsResponse = await fetch(`${config.ollamaBaseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+        if (!tagsResponse.ok) throw new Error(`Ollama returned HTTP ${tagsResponse.status}`);
+        const tags = await tagsResponse.json();
+        models = await Promise.all((tags.models ?? []).slice(0, 100).map(async (model) => {
+          let details = {};
+          try {
+            const response = await fetch(`${config.ollamaBaseUrl}/api/show`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ model: model.name ?? model.model }),
+              signal: AbortSignal.timeout(5000)
+            });
+            if (response.ok) details = await response.json();
+          } catch { /* Tags still provide a useful model list. */ }
+          return normalizeOllamaModel(model, details);
+        }));
+        models = models.filter(Boolean);
+      }
+      await writeOpenCodeProviderConfig(models);
+      return {
+        modelSelection: { supported: true, defaultLabel: 'OpenCode provider default', fallbackPolicy: 'explicit-only' },
+        connections: [{
+          id: config.ollamaConnectionId,
+          type: 'ollama',
+          displayName: config.ollamaDisplayName,
+          location: 'local-host',
+          credentialMode: 'none',
+          status: 'ready',
+          models,
+          lastCheckedAt: state.providerLastCheckedAt,
+          error: null
+        }],
+        lastCheckedAt: state.providerLastCheckedAt
+      };
+    } catch (error) {
+      return {
+        modelSelection: { supported: true, defaultLabel: 'OpenCode provider default', fallbackPolicy: 'explicit-only' },
+        connections: [{
+          id: config.ollamaConnectionId,
+          type: 'ollama',
+          displayName: config.ollamaDisplayName,
+          location: 'local-host',
+          credentialMode: 'none',
+          status: 'unavailable',
+          models: [],
+          lastCheckedAt: state.providerLastCheckedAt,
+          error: clean(error.message).slice(-500)
+        }],
+        lastCheckedAt: state.providerLastCheckedAt
+      };
+    }
+  }
+
+  async function resolveTaskModel(value) {
+    const policy = modelPolicy(value);
+    if (policy.mode === 'provider-default') return { policy, model: null };
+    if (config.adapterId !== 'opencode') {
+      throw Object.assign(new Error(`${adapterManifest.displayName} does not support wrapper-managed model selection yet`), { status: 409 });
+    }
+    const providers = await providerConnections();
+    const available = providers.connections.flatMap((connection) => connection.models ?? []);
+    if (!available.some((model) => model.id === policy.primary)) {
+      throw Object.assign(new Error(`Pinned model ${policy.primary} is not available`), { status: 409 });
+    }
+    return { policy, model: policy.primary };
+  }
 
   function normalizedQuotaWindows(envelope) {
     const bucketMap = envelope?.rateLimitsByLimitId;
@@ -547,6 +712,7 @@ export function createWorkerServer(options = {}) {
     const tokens = job.tokenUsage ?? normalizeTokenUsage();
     const record = {
       id: job.id,
+      model: job.model ?? null,
       startedAt: job.startedAt,
       finishedAt,
       durationMs,
@@ -702,7 +868,7 @@ export function createWorkerServer(options = {}) {
   }
 
   async function runDemo(res, job, prompt) {
-    emitCanonical(res, 'task.started', { taskId: job.id, data: { executionMode: 'demo' } });
+    emitCanonical(res, 'task.started', { taskId: job.id, data: { executionMode: 'demo', model: job.model ?? 'provider-default' } });
     await new Promise((resolve) => setTimeout(resolve, 120));
     emitCanonical(res, 'message.completed', { taskId: job.id, data: { role: 'assistant', text: `Demo worker received: ${prompt}` } });
     await new Promise((resolve) => setTimeout(resolve, 120));
@@ -819,6 +985,7 @@ export function createWorkerServer(options = {}) {
       ? `Agent profile instructions:\n${instructions}\n\nTask:\n${prompt}`
       : prompt;
     const args = ['run', '--format', 'json', '--dir', config.workspace];
+    if (job.model) args.push('--model', job.model);
     if (config.allowUnsandboxed) args.push('--auto');
     args.push(fullPrompt);
 
@@ -830,7 +997,7 @@ export function createWorkerServer(options = {}) {
     job.child = child;
     emitCanonical(res, 'task.started', {
       taskId: job.id,
-      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions' }
+      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions', model: job.model ?? 'provider-default' }
     });
 
     let stdoutBuffer = '';
@@ -876,6 +1043,10 @@ export function createWorkerServer(options = {}) {
       }
       if (!authorized(req, config.token)) return json(res, 401, wrapperResponse({ error: 'Unauthorized' }));
 
+      if (req.method === 'GET' && route === '/v1/providers') {
+        return json(res, 200, wrapperResponse(await providerConnections()));
+      }
+
       if (req.method === 'GET' && route === '/v1/status') {
         await usageReady;
         const [login, version] = await Promise.all([
@@ -902,7 +1073,7 @@ export function createWorkerServer(options = {}) {
           authentication: publicAuthentication({ login, session }),
           task: {
             active: state.activeJob
-              ? { id: state.activeJob.id, status: state.activeJob.status, startedAt: state.activeJob.startedAt }
+              ? { id: state.activeJob.id, status: state.activeJob.status, startedAt: state.activeJob.startedAt, model: state.activeJob.model ?? null }
               : null
           },
           execution: {
@@ -968,13 +1139,15 @@ export function createWorkerServer(options = {}) {
         const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : '';
         if (!prompt) return json(res, 400, wrapperResponse({ error: 'prompt is required' }));
         if (prompt.length > 100_000 || instructions.length > 50_000) return json(res, 413, wrapperResponse({ error: 'Prompt or instructions are too large' }));
+        const resolvedModel = await resolveTaskModel(body.modelPolicy);
         const login = await authStatus();
-        if (!login.authenticated) return json(res, 409, wrapperResponse({
+        const localCredentiallessModel = resolvedModel.model?.startsWith('ollama/');
+        if (!login.authenticated && !localCredentiallessModel) return json(res, 409, wrapperResponse({
           error: 'Authenticate this agent before running a task',
           authentication: publicAuthentication({ login })
         }));
 
-        const job = { id: randomUUID(), status: 'running', startedAt: new Date().toISOString(), child: null, cancelled: false, tokenUsage: null, exitCode: null };
+        const job = { id: randomUUID(), status: 'running', startedAt: new Date().toISOString(), child: null, cancelled: false, tokenUsage: null, exitCode: null, model: resolvedModel.model };
         state.activeJob = job;
         res.writeHead(200, {
           'content-type': 'application/x-ndjson; charset=utf-8',

@@ -7,6 +7,8 @@ export const opencodeAdapterManifest = Object.freeze({
   capabilities: {
     authentication: { methods: ['provider_device_code'], refresh: false },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    providers: { list: true, discovery: true, localConnections: true },
+    models: { discovery: true, selection: true, orderedFallback: false },
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
     workspace: { list: true }
   }

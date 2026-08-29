@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
@@ -44,6 +47,12 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const initialAgents = (await agentsResponse.json()).agents;
   assert.equal(initialAgents.length, 1);
   assert.equal(initialAgents[0].id, 'worker-01');
+  assert.deepEqual(initialAgents[0].runtime, {
+    binding: 'included-singleton', dedicated: false, credentials: 'worker-local'
+  });
+  assert.deepEqual(initialAgents[0].modelPolicy, {
+    mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false
+  });
   assert.equal('workerUrl' in initialAgents[0], false);
   assert.equal('hasWorkerToken' in initialAgents[0], false);
   assert.equal('workerToken' in initialAgents[0], false);
@@ -174,19 +183,29 @@ test('control plane injects the saved prompt and rejects a per-request override'
   const patch = await fetch(`${controlUrl}/api/v1/agents/worker-01`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ durablePrompt: 'This durable profile comes from the registry.' })
+    body: JSON.stringify({
+      durablePrompt: 'This durable profile comes from the registry.',
+      modelPolicy: { mode: 'pinned', primary: 'ollama/qwen3-coder:30b', fallbacks: [], externalFallback: false }
+    })
   });
   assert.equal(patch.status, 200);
 
   const run = await fetch(`${controlUrl}/api/v1/agents/worker-01/tasks`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ prompt: 'This message is ephemeral.', instructions: 'Do not accept this override.' })
+    body: JSON.stringify({
+      prompt: 'This message is ephemeral.',
+      instructions: 'Do not accept this override.',
+      modelPolicy: { mode: 'provider-default' }
+    })
   });
   assert.equal(run.status, 200);
   await run.text();
   assert.equal(receivedTask.prompt, 'This message is ephemeral.');
   assert.equal(receivedTask.instructions, 'This durable profile comes from the registry.');
+  assert.deepEqual(receivedTask.modelPolicy, {
+    mode: 'pinned', primary: 'ollama/qwen3-coder:30b', fallbacks: [], externalFallback: false
+  });
 });
 
 test('worker rejects unauthenticated direct API calls', async (t) => {
@@ -254,9 +273,19 @@ test('Claude Code implements the same wrapper contract and normalizes stream usa
   });
 });
 
-test('OpenCode implements the same wrapper contract and normalizes multi-provider stream usage', async (t) => {
+test('OpenCode discovers Ollama and executes a durable pinned model policy', async (t) => {
   const token = 'opencode-worker-secret';
-  const worker = createWorkerServer({ token, adapter: 'opencode', demoMode: true, workspace: process.cwd() });
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-opencode-'));
+  const opencodeConfigPath = join(temporary, 'opencode-provider.json');
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const worker = createWorkerServer({
+    token,
+    adapter: 'opencode',
+    demoMode: true,
+    workspace: process.cwd(),
+    opencodeConfigPath,
+    ollamaModels: [{ name: 'qwen3-coder:30b', contextLength: 32768, capabilities: ['completion', 'tools'] }]
+  });
   const workerUrl = await listen(worker);
   const control = createControlPlane({
     workerUrl,
@@ -283,6 +312,43 @@ test('OpenCode implements the same wrapper contract and normalizes multi-provide
   assert.equal(status.agent.adapter.provider, 'multi-provider');
   assert.equal(status.authentication.method, 'provider_device_code');
   assert.equal(status.capabilities.usage.accountActivity, false);
+  assert.equal(status.capabilities.models.selection, true);
+
+  const providersResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}/providers`);
+  assert.equal(providersResponse.status, 200);
+  const providers = await providersResponse.json();
+  assert.equal(providers.modelSelection.fallbackPolicy, 'explicit-only');
+  assert.equal(providers.connections[0].type, 'ollama');
+  assert.equal(providers.connections[0].status, 'ready');
+  assert.equal(providers.connections[0].models[0].id, 'ollama/qwen3-coder:30b');
+  assert.equal(providers.connections[0].models[0].contextLength, 32768);
+  assert.equal('baseUrl' in providers.connections[0], false);
+  assert.doesNotMatch(JSON.stringify(providers), /host\.docker\.internal|11434/);
+  const generatedConfig = JSON.parse(await readFile(opencodeConfigPath, 'utf8'));
+  assert.equal(generatedConfig.provider.ollama.options.baseURL, 'http://host.docker.internal:11434/v1');
+  assert.deepEqual(generatedConfig.provider.ollama.models['qwen3-coder:30b'].limit, { context: 32768, output: 8192 });
+
+  const policyResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      modelPolicy: { mode: 'pinned', primary: 'ollama/qwen3-coder:30b', fallbacks: [], externalFallback: false }
+    })
+  });
+  assert.equal(policyResponse.status, 200);
+  assert.equal((await policyResponse.json()).agent.modelPolicy.primary, 'ollama/qwen3-coder:30b');
+
+  const runResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'use the local model' })
+  });
+  assert.equal(runResponse.status, 200);
+  const events = (await runResponse.text()).trim().split('\n').map(JSON.parse);
+  assert.equal(events[0].type, 'task.started');
+  assert.equal(events[0].data.model, 'ollama/qwen3-coder:30b');
+  const usage = await (await fetch(`${controlUrl}/api/v1/agents/${created.id}/usage`)).json();
+  assert.equal(usage.usage.lastRequest.model, 'ollama/qwen3-coder:30b');
 
   const normalized = normalizeOpenCodeEvent({
     type: 'step_finish',

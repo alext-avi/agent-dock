@@ -18,6 +18,11 @@ const ui = {
   configName: $('#config-name'),
   configDescription: $('#config-description'),
   durablePrompt: $('#durable-prompt'),
+  modelPolicySection: $('#model-policy-section'),
+  modelSelect: $('#model-select'),
+  modelPolicyCopy: $('#model-policy-copy'),
+  providerStatus: $('#provider-status'),
+  providerModels: $('#provider-models'),
   saveAgent: $('#save-agent'),
   saveMessage: $('#save-message'),
   pageAgentName: $('#page-agent-name'),
@@ -28,6 +33,7 @@ const ui = {
   runtimeIcon: $('#runtime-icon'),
   runtimeLocation: $('#runtime-location'),
   cliVersion: $('#cli-version'),
+  runtimeModel: $('#runtime-model'),
   authState: $('#auth-state'),
   jobState: $('#job-state'),
   primaryQuotaSummary: $('#primary-quota-summary'),
@@ -232,7 +238,8 @@ function createAgentCard(agent) {
       <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
     </dl>
     <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Open agent</a><button class="text-button card-delete">Delete</button></div></div>`;
-  card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${agent.id}`;
+  const runtimeLabel = agent.runtime?.binding === 'included-singleton' ? 'singleton runtime' : 'unprovisioned';
+  card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${runtimeLabel} · ${agent.id}`;
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
@@ -378,9 +385,69 @@ function populateAgentConfig(agent) {
   ui.configName.value = agent.name;
   ui.configDescription.value = agent.description;
   ui.durablePrompt.value = agent.durablePrompt;
+  const selectedModel = agent.modelPolicy?.mode === 'pinned' ? agent.modelPolicy.primary : '';
+  ui.modelSelect.value = selectedModel || '';
+  ui.runtimeModel.textContent = selectedModel || 'provider default';
   const plannedHarness = adapterLabel(agent.adapter);
   ui.agentName.textContent = plannedHarness;
   ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
+}
+
+function renderProviderConnections(result = {}) {
+  const supported = Boolean(result.modelSelection?.supported) && currentAgent.adapter === 'opencode';
+  const connections = Array.isArray(result.connections) ? result.connections : [];
+  const models = connections.flatMap((connection) => connection.models ?? []);
+  const ready = connections.filter((connection) => connection.status === 'ready');
+  const pinned = currentAgent.modelPolicy?.mode === 'pinned' ? currentAgent.modelPolicy.primary : '';
+
+  ui.modelSelect.replaceChildren();
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = result.modelSelection?.defaultLabel || `${adapterLabel(currentAgent.adapter)} provider default`;
+  ui.modelSelect.append(defaultOption);
+  for (const connection of connections) {
+    if (!connection.models?.length) continue;
+    const group = document.createElement('optgroup');
+    group.label = `${connection.displayName} · ${connection.status}`;
+    for (const model of connection.models) {
+      const option = document.createElement('option');
+      option.value = model.id;
+      const context = model.contextLength ? ` · ${formatTokens(model.contextLength)} ctx` : '';
+      const tools = model.capabilities?.includes('tools') ? ' · tools' : '';
+      option.textContent = `${model.displayName || model.name}${context}${tools}`;
+      group.append(option);
+    }
+    ui.modelSelect.append(group);
+  }
+  if (pinned && !models.some((model) => model.id === pinned)) {
+    const unavailable = document.createElement('option');
+    unavailable.value = pinned;
+    unavailable.textContent = `${pinned} · currently unavailable`;
+    ui.modelSelect.append(unavailable);
+  }
+  ui.modelSelect.value = pinned || '';
+  ui.modelSelect.disabled = !supported;
+  ui.providerStatus.textContent = !supported ? 'not available' : ready.length ? 'connected' : 'unavailable';
+  ui.providerStatus.className = `pill ${!supported ? 'neutral' : ready.length ? 'ready' : 'error'}`;
+  ui.providerModels.textContent = !supported
+    ? 'Wrapper-managed model selection is not implemented for this harness yet.'
+    : ready.length
+      ? `${models.length} local model${models.length === 1 ? '' : 's'} discovered across ${ready.length} connection${ready.length === 1 ? '' : 's'}.`
+      : connections[0]?.error || 'No local provider connection is available.';
+  ui.modelPolicyCopy.textContent = supported
+    ? 'Use OpenCode’s current provider default, or pin one discovered local model.'
+    : `${adapterLabel(currentAgent.adapter)} currently uses its provider-managed default.`;
+}
+
+async function refreshProviders() {
+  try {
+    renderProviderConnections(await api(agentApi('providers')));
+  } catch (error) {
+    renderProviderConnections({
+      modelSelection: { supported: currentAgent.adapter === 'opencode' },
+      connections: [{ status: 'unavailable', displayName: 'Provider discovery', models: [], error: error.message }]
+    });
+  }
 }
 
 async function saveAgent(event) {
@@ -390,7 +457,10 @@ async function saveAgent(event) {
   const body = {
     name: ui.configName.value,
     description: ui.configDescription.value,
-    durablePrompt: ui.durablePrompt.value
+    durablePrompt: ui.durablePrompt.value,
+    modelPolicy: ui.modelSelect.value
+      ? { mode: 'pinned', primary: ui.modelSelect.value, fallbacks: [], externalFallback: false }
+      : { mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false }
   };
   try {
     const result = await api(agentApi(), { method: 'PATCH', body: JSON.stringify(body) });
@@ -531,19 +601,24 @@ function renderUsage(usage = {}) {
 
 function renderStatus(status) {
   const authenticated = status.authentication?.authenticated;
+  const localCredentiallessModel = currentAgent.modelPolicy?.mode === 'pinned' && currentAgent.modelPolicy.primary?.startsWith('ollama/');
+  const readyToRun = authenticated || localCredentiallessModel;
   const active = Boolean(status.task?.active) || running;
   currentHarnessName = status.agent?.adapter?.displayName || adapterLabel(currentAgent.adapter);
   setConnection('online', 'Control plane + worker online');
-  ui.workerState.textContent = active ? 'busy' : authenticated ? 'ready' : 'needs auth';
-  ui.workerState.className = `pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
+  ui.workerState.textContent = active ? 'busy' : readyToRun ? 'ready' : 'needs auth';
+  ui.workerState.className = `pill ${active ? 'busy' : readyToRun ? 'ready' : 'neutral'}`;
   ui.agentName.textContent = currentHarnessName;
   ui.runtimeIcon.textContent = currentHarnessName.slice(0, 1).toUpperCase();
   ui.cliVersion.textContent = status.agent?.version || '—';
-  ui.authState.textContent = authenticated ? 'connected' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
+  ui.runtimeModel.textContent = status.task?.active?.model || (currentAgent.modelPolicy?.mode === 'pinned' ? currentAgent.modelPolicy.primary : 'provider default');
+  ui.authState.textContent = authenticated ? 'connected' : localCredentiallessModel ? 'not required' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
   ui.jobState.textContent = active ? 'running' : 'idle';
   const inContainer = status.execution?.boundary === 'container';
-  ui.runtimeLocation.textContent = inContainer ? 'Managed worker · isolated container' : 'Worker-managed provider sandbox';
-  ui.runButton.disabled = !authenticated || active;
+  ui.runtimeLocation.textContent = inContainer
+    ? (currentAgent.runtime?.binding === 'included-singleton' ? 'Included singleton worker · isolated container' : 'Managed worker · isolated container')
+    : 'Worker-managed provider sandbox';
+  ui.runButton.disabled = !readyToRun || active;
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
   ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
   ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
@@ -581,6 +656,7 @@ function renderRuntimeUnavailable(message) {
   ui.runtimeIcon.textContent = harness.slice(0, 1).toUpperCase();
   ui.runtimeLocation.textContent = definitionOnly ? 'Runtime not yet provisioned' : 'Worker unreachable';
   ui.cliVersion.textContent = definitionOnly ? 'not provisioned' : 'unavailable';
+  ui.runtimeModel.textContent = currentAgent.modelPolicy?.mode === 'pinned' ? currentAgent.modelPolicy.primary : 'provider default';
   ui.authState.textContent = '—';
   ui.jobState.textContent = 'idle';
   ui.primaryQuotaSummary.textContent = '—';
@@ -732,7 +808,7 @@ function eventText(event) {
   }
   if (event.type === 'log') return { kind: data.level === 'error' ? 'error' : 'tool', text: data.message };
   if (event.type === 'error') return { kind: 'error', text: data.message };
-  if (event.type === 'task.started') return { kind: 'tool', text: `Task ${event.taskId.slice(0, 8)} started (${data.executionMode}).` };
+  if (event.type === 'task.started') return { kind: 'tool', text: `Task ${event.taskId.slice(0, 8)} started (${data.executionMode}) · ${data.model || 'provider default'}.` };
   if (event.type === 'task.completed') return { kind: data.status === 'succeeded' ? 'tool' : 'error', text: `Task ${data.status} with exit code ${data.exitCode}.` };
   if (event.type === 'usage.observed') {
     const request = data.request;
@@ -807,7 +883,7 @@ async function runTask() {
   } finally {
     running = false;
     ui.cancelButton.classList.add('hidden');
-    await Promise.all([refreshStatus(), refreshWorkspace()]);
+    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders()]);
   }
 }
 
@@ -832,7 +908,7 @@ async function loadAgent(id) {
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;
     selectTab(location.hash.slice(1), { updateHash: false });
-    await Promise.all([refreshStatus(), refreshWorkspace()]);
+    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders()]);
     startLiveUpdates(refreshStatus);
   } catch (error) {
     setConnection('offline', error.message);
@@ -847,6 +923,9 @@ $('#empty-new-agent').addEventListener('click', openCreateDialog);
 $('#close-agent-dialog').addEventListener('click', () => ui.createDialog.close());
 $('#cancel-create').addEventListener('click', () => ui.createDialog.close());
 ui.configForm.addEventListener('submit', saveAgent);
+ui.modelSelect.addEventListener('change', () => {
+  ui.saveMessage.textContent = 'Unsaved model policy';
+});
 $('#delete-agent').addEventListener('click', deleteCurrentAgent);
 ui.authButton.addEventListener('click', startAuth);
 ui.authCompleteForm.addEventListener('submit', completeAuthentication);

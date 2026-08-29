@@ -51,8 +51,44 @@ function publicAgent(agent) {
     description: agent.description,
     adapter: agent.adapter,
     durablePrompt: agent.durablePrompt,
+    modelPolicy: agent.modelPolicy,
+    runtime: {
+      binding: agent.workerUrl ? 'included-singleton' : 'unprovisioned',
+      dedicated: false,
+      credentials: agent.workerUrl ? 'worker-local' : 'none'
+    },
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt
+  };
+}
+
+function normalizeModelPolicy(value = {}) {
+  if (value === null || value === undefined) value = {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw Object.assign(new Error('modelPolicy must be an object'), { status: 400 });
+  }
+  const mode = value.mode ?? 'provider-default';
+  if (!['provider-default', 'pinned'].includes(mode)) {
+    throw Object.assign(new Error('modelPolicy.mode must be provider-default or pinned'), { status: 400 });
+  }
+  const primary = value.primary === null || value.primary === undefined
+    ? null
+    : stringField(value.primary, 'modelPolicy.primary', { required: true, max: 240 });
+  if (mode === 'pinned' && !primary) {
+    throw Object.assign(new Error('modelPolicy.primary is required when a model is pinned'), { status: 400 });
+  }
+  if (value.fallbacks !== undefined && !Array.isArray(value.fallbacks)) {
+    throw Object.assign(new Error('modelPolicy.fallbacks must be an array'), { status: 400 });
+  }
+  const fallbacks = (value.fallbacks ?? []).map((model, index) => (
+    stringField(model, `modelPolicy.fallbacks[${index}]`, { required: true, max: 240 })
+  ));
+  if (fallbacks.length > 8) throw Object.assign(new Error('modelPolicy supports at most 8 fallbacks'), { status: 400 });
+  return {
+    mode,
+    primary: mode === 'pinned' ? primary : null,
+    fallbacks: [...new Set(fallbacks.filter((model) => model !== primary))],
+    externalFallback: value.externalFallback === true
   };
 }
 
@@ -100,6 +136,7 @@ function makeAgent(input, existingIds, defaults = {}) {
     description: stringField(input.description ?? defaults.description ?? '', 'description', { max: 2000 }) ?? '',
     adapter,
     durablePrompt: stringField(input.durablePrompt ?? defaults.durablePrompt ?? '', 'durablePrompt', { max: 50_000 }) ?? '',
+    modelPolicy: normalizeModelPolicy(input.modelPolicy ?? defaults.modelPolicy),
     workerUrl: normalizeWorkerUrl(input.workerUrl ?? defaults.workerUrl ?? '', { required: false }) ?? '',
     workerToken: stringField(input.workerToken ?? defaults.workerToken ?? '', 'workerToken', { max: 4096 }) ?? '',
     createdAt: now,
@@ -154,7 +191,7 @@ export function createControlPlane(options = {}) {
         const stored = JSON.parse(await readFile(config.dataPath, 'utf8'));
         if (!Array.isArray(stored.agents)) throw new Error('agents must be an array');
         for (const agent of stored.agents) {
-          if (agent?.id && agent?.name) agents.set(agent.id, agent);
+          if (agent?.id && agent?.name) agents.set(agent.id, { ...agent, modelPolicy: normalizeModelPolicy(agent.modelPolicy) });
         }
         return;
       } catch (error) {
@@ -213,7 +250,7 @@ export function createControlPlane(options = {}) {
     const request = await readJson(req);
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
     if (!prompt) return json(res, 400, { error: 'prompt is required' });
-    const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt });
+    const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt, modelPolicy: agent.modelPolicy });
     const upstream = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
     if (!upstream.ok || !upstream.body) {
       const message = await upstream.text();
@@ -282,6 +319,7 @@ export function createControlPlane(options = {}) {
         if (!/^[a-z0-9][a-z0-9._-]*$/.test(updated.adapter)) throw Object.assign(new Error('adapter contains unsupported characters'), { status: 400 });
       }
       if ('durablePrompt' in body) updated.durablePrompt = stringField(body.durablePrompt, 'durablePrompt', { max: 50_000 });
+      if ('modelPolicy' in body) updated.modelPolicy = normalizeModelPolicy(body.modelPolicy);
       if ('workerUrl' in body) updated.workerUrl = normalizeWorkerUrl(body.workerUrl, { required: false });
       if (typeof body.workerToken === 'string' && body.workerToken.trim()) updated.workerToken = stringField(body.workerToken, 'workerToken', { max: 4096 });
       if (body.clearWorkerToken === true) updated.workerToken = '';
@@ -300,11 +338,12 @@ export function createControlPlane(options = {}) {
   }
 
   async function handleAgentOperation(req, res, url) {
-    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
+    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
     const operation = match[2];
     if (req.method === 'GET' && operation === 'status') return proxyJson(req, res, agent, '/v1/status');
+    if (req.method === 'GET' && operation === 'providers') return proxyJson(req, res, agent, '/v1/providers', 30_000);
     if (req.method === 'POST' && operation === 'auth/login') return proxyJson(req, res, agent, '/v1/auth/login');
     if (req.method === 'POST' && operation === 'auth/complete') return proxyJson(req, res, agent, '/v1/auth/complete');
     if (req.method === 'POST' && operation === 'auth/refresh') return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);
@@ -337,6 +376,7 @@ export function createControlPlane(options = {}) {
       }
       if (!agent && url.pathname.startsWith('/api/')) return json(res, 404, { error: 'No agents configured' });
       if (req.method === 'GET' && ['/api/v1/status', '/api/status'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/status');
+      if (req.method === 'GET' && ['/api/v1/providers', '/api/providers'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/providers', 30_000);
       if (req.method === 'POST' && ['/api/v1/auth/login', '/api/auth/start'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/login');
       if (req.method === 'POST' && ['/api/v1/auth/complete', '/api/auth/complete'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/complete');
       if (req.method === 'POST' && ['/api/v1/auth/refresh', '/api/auth/refresh'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);

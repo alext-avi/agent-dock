@@ -99,6 +99,10 @@ services:
       XDG_CONFIG_HOME: /opencode-home/.config
       OPENCODE_VERSION: ${OPENCODE_VERSION:-latest}
       OPENCODE_AUTH_PROVIDER: ${OPENCODE_AUTH_PROVIDER:-github-copilot}
+      OPENCODE_CONFIG: /agent-data/opencode-provider.json
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_CONNECTION_ID: ${OLLAMA_CONNECTION_ID:-ollama-local}
+      OLLAMA_DISPLAY_NAME: ${OLLAMA_DISPLAY_NAME:-Local Ollama}
       ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
       AGENT_DATA_PATH: /agent-data/usage.json
     volumes:
@@ -108,6 +112,8 @@ services:
       - ./opencode-workspace:/workspace
     expose:
       - "7777"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7777/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 3s

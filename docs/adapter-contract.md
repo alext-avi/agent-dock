@@ -10,16 +10,21 @@ Current protocol version: `agent-wrapper/v1`.
 |---|---|---|
 | `GET` | `/v1/health` | Unauthenticated liveness and adapter identity |
 | `GET` | `/v1/status` | Agent, capability, authentication, task, execution, and cached usage state |
+| `GET` | `/v1/providers` | Safe provider-connection health and model discovery metadata |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
 | `POST` | `/v1/auth/complete` | Submit a provider-issued one-time browser authorization code when the adapter requires it |
 | `POST` | `/v1/auth/refresh` | Ask the adapter to refresh or validate its managed session |
 | `GET` | `/v1/workspace` | List durable workspace artifacts |
 | `GET` | `/v1/usage` | Read cached request and account usage |
 | `POST` | `/v1/usage/refresh` | Ask the adapter to refresh available usage sources |
-| `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "..." }` and stream canonical NDJSON events |
+| `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "...", "modelPolicy": {...} }` and stream canonical NDJSON events |
 | `POST` | `/v1/tasks/cancel` | Cancel the active task on this single-agent worker |
 
 Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. Errors use the same envelope with an `error` string.
+
+`modelPolicy` is provider-neutral: `mode` is `provider-default` or `pinned`, and a pinned policy includes a canonical `primary` model ID such as `ollama/gpt-oss:20b`. `fallbacks` and `externalFallback` are reserved policy fields, but the current wrapper rejects automatic fallback rather than silently changing providers. The control plane injects the saved policy and ignores task-level overrides from browser clients.
+
+`GET /v1/providers` returns `connections[]` with a stable ID, type, display name, coarse location, credential mode, health, last-check time, and discoverable `models[]`. It must not return credentials or private connection URLs. For Ollama, the model data may include context length, capabilities, family, parameter size, and quantization.
 
 ## Status model
 
@@ -52,7 +57,7 @@ Stable event types:
 
 | Type | Required data |
 |---|---|
-| `task.started` | `executionMode` |
+| `task.started` | `executionMode`, effective `model` (`provider-default` when the harness chooses) |
 | `message.completed` | `role`, `text` |
 | `activity.started` / `activity.completed` | generic `kind` plus optional `name`, `command`, or `text` |
 | `usage.observed` | normalized `request` token counts when the provider supplies them |
@@ -74,9 +79,10 @@ A new adapter must implement the following behaviors behind the wrapper:
 4. Start its supported login flow and normalize any user-facing challenge.
 5. Refresh authentication when supported, or advertise `refresh: false`.
 6. Run one task, accept optional profile instructions, stream provider output, and translate it into canonical events.
-7. Cancel the active provider process.
-8. Normalize request usage, quota windows, and account activity only where the provider exposes them.
-9. Keep provider credential files, raw auth responses, and raw tokens inside the worker boundary.
+7. Discover safe provider/model metadata and translate a supported model policy into harness arguments.
+8. Cancel the active provider process.
+9. Normalize request usage, quota windows, and account activity only where the provider exposes them.
+10. Keep provider credential files, raw auth responses, raw tokens, and private connection URLs inside the worker boundary.
 
 The Codex and Claude Code translators live in `worker/adapters/codex.mjs` and `worker/adapters/claude.mjs`. Both satisfy this contract; the control plane does not branch on provider-specific event or credential formats.
 

@@ -470,7 +470,9 @@ function renderStatus(status) {
   const inContainer = status.execution?.boundary === 'container';
   ui.runtimeLocation.textContent = inContainer ? 'Managed worker · isolated container' : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !authenticated || active;
-  ui.refreshUsage.disabled = false;
+  const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
+  ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
+  ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
   ui.authBox.classList.toggle('authenticated', authenticated);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   const browserOAuth = status.authentication?.method === 'browser_oauth';

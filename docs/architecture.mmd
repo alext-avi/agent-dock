@@ -1,8 +1,3 @@
-# Agent Dock architecture
-
-Open the rendered [SVG architecture diagram](./architecture.svg), or edit the standalone [Mermaid source](./architecture.mmd).
-
-```mermaid
 flowchart TB
   subgraph Client["Browser · HTML5 + CSS + vanilla JavaScript ES modules"]
     UI["Fleet dashboard\nAgent config + test UI"]
@@ -52,18 +47,3 @@ flowchart TB
   MCP -.-> AW
   Data -.-> CWS
   Data -.-> AWS
-```
-
-| Layer | Current stack |
-|---|---|
-| Browser | Semantic HTML5, hand-written CSS, vanilla JavaScript ES modules, Fetch API |
-| Control plane | Node.js 22, built-in `http`, filesystem-backed JSON registry, streaming Fetch proxy |
-| Worker wrapper | Node.js 22, built-in `http`, `child_process`, filesystem persistence |
-| Provider harnesses | Official `@openai/codex` and `@anthropic-ai/claude-code` CLI distributions |
-| Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
-| Runtime/isolation | Dockerfiles + Docker Compose private network; one process boundary per provider identity |
-| Persistence | Docker named volumes for CLI auth, installed binaries, request telemetry, and registry; host bind mounts for workspaces |
-| Authentication | Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff |
-| Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |
-
-The control plane never parses provider credential files. Provider-specific commands, auth behavior, event formats, and supported usage telemetry stop at the adapter boundary.

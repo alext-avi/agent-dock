@@ -255,9 +255,10 @@ export function createWorkerServer(options = {}) {
   function publicUsage({ includeDaily = false, includeHistory = false } = {}) {
     const allHistory = state.usage.history.slice().reverse();
     const history = includeHistory ? allHistory : allHistory.slice(0, 10);
+    const supportsAccountUsage = adapterManifest.capabilities.usage.accountActivity || adapterManifest.capabilities.usage.quotaWindows;
     return {
       updatedAt: state.usage.updatedAt,
-      lastPollAt: state.usage.lastPollAt,
+      lastPollAt: supportsAccountUsage ? state.usage.lastPollAt : null,
       pollError: state.usage.pollError,
       quotaWindows: normalizedQuotaWindows(state.usage.rateLimits),
       account: normalizedAccountUsage(state.usage.accountUsage, { includeDaily }),
@@ -273,7 +274,8 @@ export function createWorkerServer(options = {}) {
     try { status = JSON.parse(result.output); }
     catch { /* Older releases may return text despite the documented JSON default. */ }
     const authenticated = result.code === 0 && (status ? Boolean(status.loggedIn ?? status.authenticated ?? status.isAuthenticated) : !/not logged in|logged out|authentication required/i.test(result.output));
-    return { authenticated, status, detail: result.output || 'No authentication status returned' };
+    const method = status?.authMethod && status.authMethod !== 'none' ? status.authMethod : 'Claude Code';
+    return { authenticated, status, detail: authenticated ? `Authenticated with ${method}` : 'Not authenticated' };
   }
 
   async function authSessionMetadata() {
@@ -436,9 +438,6 @@ export function createWorkerServer(options = {}) {
 
     state.usagePollPromise = (async () => {
       if (config.adapterId === 'claude-code') {
-        state.usage.lastPollAt = new Date().toISOString();
-        state.usage.pollError = null;
-        await persistUsage().catch((error) => { state.usage.pollError = `Could not persist usage: ${error.message}`; });
         return publicUsage();
       }
       try {
@@ -533,18 +532,19 @@ export function createWorkerServer(options = {}) {
   }
 
   function publicAuthentication({ login = null, session = null } = {}) {
+    const authenticated = login?.authenticated ?? state.auth.phase === 'authenticated';
     return {
-      authenticated: login?.authenticated ?? state.auth.phase === 'authenticated',
+      authenticated,
       phase: state.auth.phase,
       method: config.adapterId === 'claude-code' ? 'browser_oauth' : 'device_code',
       detail: login?.detail ?? null,
       refreshing: Boolean(state.authRefreshPromise),
       session,
       challenge: {
-        verificationUri: state.auth.verificationUrl,
-        userCode: state.auth.userCode,
-        requiresInput: config.adapterId === 'claude-code' && state.auth.phase === 'waiting_for_user',
-        instructions: state.auth.transcript.slice(-6000)
+        verificationUri: authenticated ? null : state.auth.verificationUrl,
+        userCode: authenticated ? null : state.auth.userCode,
+        requiresInput: !authenticated && config.adapterId === 'claude-code' && state.auth.phase === 'waiting_for_user',
+        instructions: authenticated ? '' : state.auth.transcript.slice(-6000)
       }
     };
   }
@@ -576,10 +576,9 @@ export function createWorkerServer(options = {}) {
     });
     child.once('close', (code) => {
       state.auth.phase = code === 0 ? 'authenticated' : 'failed';
-      if (code !== 0) {
-        state.auth.verificationUrl = null;
-        state.auth.userCode = null;
-      }
+      state.auth.verificationUrl = null;
+      state.auth.userCode = null;
+      if (code === 0) state.auth.transcript = '';
       state.loginProcess = null;
     });
     return publicAuthentication();

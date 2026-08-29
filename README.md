@@ -56,7 +56,7 @@ flowchart LR
 - Claude Code exposes per-request token telemetry in its stream but no supported subscription quota-window endpoint, so that adapter reports quota/account capabilities as unavailable rather than inventing data.
 - The control plane depends only on the versioned wrapper contract; both provider workers use the same UI and API surface.
 
-The complete system model and provider-adapter boundary are documented in [`docs/architecture.md`](./docs/architecture.md) and [`docs/adapter-contract.md`](./docs/adapter-contract.md).
+The complete system model is available as [Markdown](./docs/architecture.md), [editable Mermaid](./docs/architecture.mmd), and a [standalone SVG](./docs/architecture.svg). The provider boundary is documented in [`docs/adapter-contract.md`](./docs/adapter-contract.md).
 
 ## API
 

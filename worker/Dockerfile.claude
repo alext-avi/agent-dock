@@ -1,0 +1,26 @@
+FROM node:22-bookworm-slim
+
+ENV NPM_CONFIG_PREFIX=/opt/claude \
+    PATH=/opt/claude/bin:$PATH \
+    HOME=/claude-home \
+    CLAUDE_HOME=/claude-home \
+    CLAUDE_CONFIG_DIR=/claude-home/.claude \
+    AGENT_ADAPTER=claude-code \
+    DISABLE_AUTOUPDATER=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --home-dir /home/agent --shell /bin/sh agent \
+    && mkdir -p /app /workspace /claude-home/.claude /opt/claude /agent-data \
+    && chown -R agent:agent /app /workspace /claude-home /opt/claude /agent-data
+
+WORKDIR /app
+COPY --chown=agent:agent server.mjs protocol.mjs entrypoint-claude.sh ./
+COPY --chown=agent:agent adapters ./adapters
+RUN chmod 0755 /app/entrypoint-claude.sh
+
+USER agent
+WORKDIR /workspace
+EXPOSE 7777
+ENTRYPOINT ["/app/entrypoint-claude.sh"]

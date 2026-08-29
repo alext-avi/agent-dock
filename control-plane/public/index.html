@@ -80,10 +80,20 @@
               <div><dt>HARNESS</dt><dd id="cli-version">—</dd></div>
               <div><dt>AUTH</dt><dd id="auth-state">—</dd></div>
               <div><dt>TASK</dt><dd id="job-state">idle</dd></div>
-              <div><dt>PRIMARY LIMIT</dt><dd id="primary-quota-summary">—</dd></div>
-              <div><dt>SECONDARY</dt><dd id="secondary-quota-summary">—</dd></div>
               <div><dt>AGENT TOTAL</dt><dd id="agent-total-summary">0</dd></div>
             </dl>
+            <div class="runtime-quota-grid" aria-label="Subscription quota windows">
+              <div class="runtime-quota-card">
+                <div class="runtime-quota-heading"><span id="primary-quota-label">Primary quota</span><strong id="primary-quota-summary">—</strong></div>
+                <span class="quota-bar"><span id="primary-quota-bar"></span></span>
+                <small id="primary-quota-reset">Available after authentication</small>
+              </div>
+              <div class="runtime-quota-card">
+                <div class="runtime-quota-heading"><span id="secondary-quota-label">Secondary quota</span><strong id="secondary-quota-summary">—</strong></div>
+                <span class="quota-bar"><span id="secondary-quota-bar"></span></span>
+                <small id="secondary-quota-reset">Available after authentication</small>
+              </div>
+            </div>
             <details id="runtime-details" class="runtime-details">
               <summary><span>Usage &amp; session details</span><small id="runtime-details-hint">Expand for quota windows and authentication controls</small><span class="details-chevron">⌄</span></summary>
               <div class="runtime-detail-grid">
@@ -119,6 +129,11 @@
                   <div id="device-flow" class="device-flow hidden">
                     <a id="auth-link" href="#" target="_blank" rel="noopener">Open provider sign-in ↗</a>
                     <code id="auth-code"></code>
+                    <form id="auth-complete-form" class="auth-complete hidden">
+                      <label for="auth-completion-code">Authorization code <span>returned by the provider after sign-in</span></label>
+                      <div><input id="auth-completion-code" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="Paste the one-time code"><button id="auth-complete-button" class="button secondary" type="submit">Complete login</button></div>
+                      <small id="auth-complete-message">Forwarded once to the CLI; never saved by Agent Dock.</small>
+                    </form>
                     <pre id="auth-transcript"></pre>
                   </div>
                 </div>
@@ -219,7 +234,7 @@
         <fieldset class="runtime-choice">
           <legend>Runtime template</legend>
           <label class="runtime-option selected"><input type="radio" name="runtimeTemplate" value="codex-cli" checked><span><strong>Codex CLI container</strong><small>Create the definition now; container provisioning follows separately.</small></span><span class="pill ready">available</span></label>
-          <label class="runtime-option disabled"><input type="radio" name="runtimeTemplate" value="claude-code" disabled><span><strong>Claude Code container</strong><small>Same wrapper contract with a Claude adapter.</small></span><span class="pill neutral">planned</span></label>
+          <label class="runtime-option"><input type="radio" name="runtimeTemplate" value="claude-code"><span><strong>Claude Code container</strong><small>Official Claude Code CLI behind the same wrapper contract.</small></span><span class="pill ready">available</span></label>
           <label class="runtime-option disabled"><input type="radio" name="runtimeTemplate" value="remote" disabled><span><strong>Pair existing worker</strong><small>One-time pairing without displaying worker credentials.</small></span><span class="pill neutral">planned</span></label>
         </fieldset>
         <p id="create-message" class="usage-error hidden"></p>
@@ -228,6 +243,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=3"></script>
+    <script type="module" src="/app.js?v=4"></script>
   </body>
 </html>

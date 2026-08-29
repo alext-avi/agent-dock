@@ -11,6 +11,7 @@ Current protocol version: `agent-wrapper/v1`.
 | `GET` | `/v1/health` | Unauthenticated liveness and adapter identity |
 | `GET` | `/v1/status` | Agent, capability, authentication, task, execution, and cached usage state |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
+| `POST` | `/v1/auth/complete` | Submit a provider-issued one-time browser authorization code when the adapter requires it |
 | `POST` | `/v1/auth/refresh` | Ask the adapter to refresh or validate its managed session |
 | `GET` | `/v1/workspace` | List durable workspace artifacts |
 | `GET` | `/v1/usage` | Read cached request and account usage |
@@ -26,7 +27,7 @@ Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. 
 
 - `agent`: logical agent ID, adapter identity, provider name, display name, runtime version, and start time.
 - `capabilities`: auth methods, refresh support, task streaming/cancellation, usage sources, and workspace operations actually implemented by the adapter.
-- `authentication`: generic auth phase, optional device challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs.
+- `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded once to the waiting CLI process and is never logged or persisted.
 - `task.active`: the active task ID/status or `null`.
 - `execution`: the isolation boundary and workspace path.
 - `usage`: normalized request totals/history, `quotaWindows[]`, and an optional `account` activity summary.
@@ -77,7 +78,7 @@ A new adapter must implement the following behaviors behind the wrapper:
 8. Normalize request usage, quota windows, and account activity only where the provider exposes them.
 9. Keep provider credential files, raw auth responses, and raw tokens inside the worker boundary.
 
-The current Codex translator lives in `worker/adapters/codex.mjs`. A Claude adapter should satisfy this contract with its own install/auth/run/usage implementation while leaving `control-plane/` unchanged.
+The Codex and Claude Code translators live in `worker/adapters/codex.mjs` and `worker/adapters/claude.mjs`. Both satisfy this contract; the control plane does not branch on provider-specific event or credential formats.
 
 ## Compatibility
 

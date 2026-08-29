@@ -5,6 +5,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent } from './adapters/codex.mjs';
+import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -87,6 +88,7 @@ const LEGACY_ROUTES = new Map([
   ['/health', '/v1/health'],
   ['/status', '/v1/status'],
   ['/auth/start', '/v1/auth/login'],
+  ['/auth/complete', '/v1/auth/complete'],
   ['/auth/refresh', '/v1/auth/refresh'],
   ['/workspace', '/v1/workspace'],
   ['/usage', '/v1/usage'],
@@ -150,11 +152,17 @@ async function listWorkspace(root, maxEntries = 250) {
 
 export function createWorkerServer(options = {}) {
   const demoMode = options.demoMode ?? process.env.DEMO_MODE === '1';
+  const adapterId = options.adapter ?? process.env.AGENT_ADAPTER ?? 'codex-cli';
+  if (!['codex-cli', 'claude-code'].includes(adapterId)) throw new Error(`Unsupported AGENT_ADAPTER: ${adapterId}`);
+  const adapterManifest = adapterId === 'claude-code' ? claudeAdapterManifest : codexAdapterManifest;
+  const normalizeProviderEvent = adapterId === 'claude-code' ? normalizeClaudeEvent : normalizeCodexEvent;
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
     port: Number(options.port ?? process.env.PORT ?? 7777),
     agentId: options.agentId ?? process.env.AGENT_ID ?? 'worker-01',
+    adapterId,
     codexHome: options.codexHome ?? process.env.CODEX_HOME ?? '/codex-home',
+    claudeHome: options.claudeHome ?? process.env.CLAUDE_HOME ?? process.env.HOME ?? '/claude-home',
     workspace: options.workspace ?? process.env.WORKSPACE_PATH ?? '/workspace',
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
@@ -174,7 +182,9 @@ export function createWorkerServer(options = {}) {
     demoAuthLastRefreshAt: new Date().toISOString()
   };
 
-  const codexEnv = { ...process.env, CODEX_HOME: config.codexHome };
+  const providerEnv = config.adapterId === 'claude-code'
+    ? { ...process.env, HOME: config.claudeHome, CLAUDE_CONFIG_DIR: path.join(config.claudeHome, '.claude'), BROWSER: process.env.BROWSER ?? 'echo' }
+    : { ...process.env, CODEX_HOME: config.codexHome };
 
   async function loadUsage() {
     if (!config.dataPath) return;
@@ -257,16 +267,39 @@ export function createWorkerServer(options = {}) {
     };
   }
 
+  async function readClaudeAuthStatus() {
+    const result = await capture('claude', ['auth', 'status'], { env: providerEnv, cwd: config.workspace, timeout: 15_000 });
+    let status = null;
+    try { status = JSON.parse(result.output); }
+    catch { /* Older releases may return text despite the documented JSON default. */ }
+    const authenticated = result.code === 0 && (status ? Boolean(status.loggedIn ?? status.authenticated ?? status.isAuthenticated) : !/not logged in|logged out|authentication required/i.test(result.output));
+    return { authenticated, status, detail: result.output || 'No authentication status returned' };
+  }
+
   async function authSessionMetadata() {
     if (config.demoMode) {
       return {
-        authMode: 'chatgpt',
+        authMode: config.adapterId === 'claude-code' ? 'claude.ai' : 'chatgpt',
         storage: 'demo',
         credentialStored: true,
-        hasRefreshToken: true,
-        canForceRefresh: true,
+        hasRefreshToken: config.adapterId === 'codex-cli',
+        canForceRefresh: adapterManifest.capabilities.authentication.refresh,
         lastRefreshAt: state.demoAuthLastRefreshAt,
         accessTokenExpiresAt: new Date(Date.parse(state.demoAuthLastRefreshAt) + 10 * 24 * 60 * 60 * 1000).toISOString(),
+        error: null
+      };
+    }
+
+    if (config.adapterId === 'claude-code') {
+      const login = await readClaudeAuthStatus();
+      return {
+        authMode: login.status?.authMethod ?? login.status?.authMode ?? 'claude.ai',
+        storage: 'cli-managed',
+        credentialStored: login.authenticated,
+        hasRefreshToken: null,
+        canForceRefresh: false,
+        lastRefreshAt: null,
+        accessTokenExpiresAt: null,
         error: null
       };
     }
@@ -325,7 +358,7 @@ export function createWorkerServer(options = {}) {
     return new Promise((resolve, reject) => {
       const child = spawn('codex', ['app-server', '--listen', 'stdio://'], {
         cwd: config.workspace,
-        env: codexEnv,
+        env: providerEnv,
         stdio: ['pipe', 'pipe', 'pipe']
       });
       let stdoutBuffer = '';
@@ -402,6 +435,12 @@ export function createWorkerServer(options = {}) {
     if (!force && lastPoll && Date.now() - lastPoll < config.usagePollIntervalMs) return publicUsage();
 
     state.usagePollPromise = (async () => {
+      if (config.adapterId === 'claude-code') {
+        state.usage.lastPollAt = new Date().toISOString();
+        state.usage.pollError = null;
+        await persistUsage().catch((error) => { state.usage.pollError = `Could not persist usage: ${error.message}`; });
+        return publicUsage();
+      }
       try {
         const snapshot = await queryCodexAccount();
         if (snapshot.rateLimits) state.usage.rateLimits = snapshot.rateLimits;
@@ -420,6 +459,9 @@ export function createWorkerServer(options = {}) {
   }
 
   async function forceAuthenticationRefresh() {
+    if (!adapterManifest.capabilities.authentication.refresh) {
+      throw Object.assign(new Error(`${adapterManifest.displayName} does not expose an explicit session-refresh operation`), { status: 409 });
+    }
     if (state.authRefreshPromise) return state.authRefreshPromise;
     state.authRefreshPromise = (async () => {
       if (state.usagePollPromise) await state.usagePollPromise;
@@ -448,7 +490,7 @@ export function createWorkerServer(options = {}) {
   }
 
   function observeUsage(job, event) {
-    if (event.type === 'turn.completed' && event.usage) job.tokenUsage = normalizeTokenUsage(event.usage);
+    if (event?.type === 'usage.observed' && event.data?.request) job.tokenUsage = normalizeTokenUsage(event.data.request);
   }
 
   async function finalizeJobUsage(job) {
@@ -479,24 +521,29 @@ export function createWorkerServer(options = {}) {
 
   async function authStatus() {
     if (config.demoMode) return { authenticated: true, detail: 'Demo mode' };
-    const result = await capture('codex', ['login', 'status'], { env: codexEnv, cwd: config.workspace });
-    const authenticated = result.code === 0 && !/not logged in/i.test(result.output);
+    const result = config.adapterId === 'claude-code'
+      ? await readClaudeAuthStatus()
+      : await capture('codex', ['login', 'status'], { env: providerEnv, cwd: config.workspace });
+    const authenticated = config.adapterId === 'claude-code'
+      ? result.authenticated
+      : result.code === 0 && !/not logged in/i.test(result.output);
     if (authenticated) state.auth.phase = 'authenticated';
     else if (!state.loginProcess && state.auth.phase !== 'failed') state.auth.phase = 'needs_auth';
-    return { authenticated, detail: result.output || 'No login status returned' };
+    return { authenticated, detail: result.detail ?? result.output ?? 'No login status returned' };
   }
 
   function publicAuthentication({ login = null, session = null } = {}) {
     return {
       authenticated: login?.authenticated ?? state.auth.phase === 'authenticated',
       phase: state.auth.phase,
-      method: 'device_code',
+      method: config.adapterId === 'claude-code' ? 'browser_oauth' : 'device_code',
       detail: login?.detail ?? null,
       refreshing: Boolean(state.authRefreshPromise),
       session,
       challenge: {
         verificationUri: state.auth.verificationUrl,
         userCode: state.auth.userCode,
+        requiresInput: config.adapterId === 'claude-code' && state.auth.phase === 'waiting_for_user',
         instructions: state.auth.transcript.slice(-6000)
       }
     };
@@ -506,10 +553,12 @@ export function createWorkerServer(options = {}) {
     if (config.demoMode) return publicAuthentication();
     if (state.loginProcess) return publicAuthentication();
     state.auth = { phase: 'waiting_for_user', transcript: '', verificationUrl: null, userCode: null };
-    const child = spawn('codex', ['login', '--device-auth'], {
+    const command = config.adapterId === 'claude-code' ? 'claude' : 'codex';
+    const args = config.adapterId === 'claude-code' ? ['auth', 'login'] : ['login', '--device-auth'];
+    const child = spawn(command, args, {
       cwd: config.workspace,
-      env: codexEnv,
-      stdio: ['ignore', 'pipe', 'pipe']
+      env: providerEnv,
+      stdio: [config.adapterId === 'claude-code' ? 'pipe' : 'ignore', 'pipe', 'pipe']
     });
     state.loginProcess = child;
     const consume = (chunk) => {
@@ -536,22 +585,38 @@ export function createWorkerServer(options = {}) {
     return publicAuthentication();
   }
 
+  function completeLogin(code) {
+    if (config.adapterId !== 'claude-code') {
+      throw Object.assign(new Error(`${adapterManifest.displayName} does not require a browser authorization code`), { status: 409 });
+    }
+    if (!state.loginProcess || state.auth.phase !== 'waiting_for_user') {
+      throw Object.assign(new Error('Start Claude Code login before submitting an authorization code'), { status: 409 });
+    }
+    if (typeof code !== 'string' || !code.trim() || code.length > 8192 || /[\r\n]/.test(code)) {
+      throw Object.assign(new Error('code must be a single non-empty line'), { status: 400 });
+    }
+    state.loginProcess.stdin.end(`${code.trim()}\n`);
+    return publicAuthentication();
+  }
+
   function emitCanonical(res, type, { taskId = null, data = {} } = {}) {
     res.write(`${JSON.stringify(wrapperEvent(type, { taskId, data }))}\n`);
   }
 
   function emitProviderEvent(res, event, job) {
-    observeUsage(job, event);
-    const normalized = normalizeCodexEvent(event);
-    if (normalized) emitCanonical(res, normalized.type, { taskId: job.id, data: normalized.data });
+    const normalized = normalizeProviderEvent(event);
+    if (!normalized) return;
+    observeUsage(job, normalized);
+    emitCanonical(res, normalized.type, { taskId: job.id, data: normalized.data });
   }
 
   async function runDemo(res, job, prompt) {
     emitCanonical(res, 'task.started', { taskId: job.id, data: { executionMode: 'demo' } });
     await new Promise((resolve) => setTimeout(resolve, 120));
-    emitProviderEvent(res, { type: 'item.completed', item: { type: 'agent_message', text: `Demo worker received: ${prompt}` } }, job);
+    emitCanonical(res, 'message.completed', { taskId: job.id, data: { role: 'assistant', text: `Demo worker received: ${prompt}` } });
     await new Promise((resolve) => setTimeout(resolve, 120));
-    emitProviderEvent(res, { type: 'turn.completed', usage: { input_tokens: 12, cached_input_tokens: 3, output_tokens: 8 } }, job);
+    job.tokenUsage = normalizeTokenUsage({ input_tokens: 12, cached_input_tokens: 3, output_tokens: 8 });
+    emitCanonical(res, 'usage.observed', { taskId: job.id, data: { request: job.tokenUsage } });
     job.status = 'succeeded';
     job.exitCode = 0;
   }
@@ -567,7 +632,7 @@ export function createWorkerServer(options = {}) {
 
     const child = spawn('codex', args, {
       cwd: config.workspace,
-      env: codexEnv,
+      env: providerEnv,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     job.child = child;
@@ -610,6 +675,54 @@ export function createWorkerServer(options = {}) {
     job.exitCode = code;
   }
 
+  async function runClaude(res, job, prompt, instructions) {
+    const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+    if (instructions) args.push('--append-system-prompt', instructions);
+    if (config.allowUnsandboxed) args.push('--dangerously-skip-permissions');
+    else args.push('--permission-mode', 'dontAsk');
+
+    const child = spawn('claude', args, {
+      cwd: config.workspace,
+      env: providerEnv,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    job.child = child;
+    emitCanonical(res, 'task.started', {
+      taskId: job.id,
+      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions' }
+    });
+    child.stdin.end(prompt);
+
+    let stdoutBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk.toString('utf8');
+      const lines = stdoutBuffer.split('\n');
+      stdoutBuffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { emitProviderEvent(res, JSON.parse(line), job); }
+        catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } }); }
+      }
+    });
+    child.stderr.on('data', (chunk) => emitCanonical(res, 'log', {
+      taskId: job.id,
+      data: { level: 'warning', source: 'provider', message: clean(chunk.toString('utf8')) }
+    }));
+    const code = await new Promise((resolve) => {
+      child.once('error', (error) => {
+        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
+        resolve(-1);
+      });
+      child.once('close', (exitCode) => resolve(exitCode ?? -1));
+    });
+    if (stdoutBuffer.trim()) {
+      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
+      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
+    }
+    job.status = code === 0 ? 'succeeded' : job.cancelled ? 'cancelled' : 'failed';
+    job.exitCode = code;
+  }
+
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://worker.local');
@@ -618,7 +731,7 @@ export function createWorkerServer(options = {}) {
         return json(res, 200, wrapperResponse({
           ok: true,
           service: 'agent-wrapper',
-          adapter: { id: codexAdapterManifest.id, provider: codexAdapterManifest.provider }
+          adapter: { id: adapterManifest.id, provider: adapterManifest.provider }
         }));
       }
       if (!authorized(req, config.token)) return json(res, 401, wrapperResponse({ error: 'Unauthorized' }));
@@ -627,7 +740,9 @@ export function createWorkerServer(options = {}) {
         await usageReady;
         const [login, version] = await Promise.all([
           authStatus(),
-          config.demoMode ? Promise.resolve({ output: 'codex-cli demo' }) : capture('codex', ['--version'], { env: codexEnv })
+          config.demoMode
+            ? Promise.resolve({ output: `${adapterManifest.id} demo` })
+            : capture(config.adapterId === 'claude-code' ? 'claude' : 'codex', ['--version'], { env: providerEnv })
         ]);
         if (login.authenticated && !state.activeJob) await refreshAccountUsage();
         const session = await authSessionMetadata();
@@ -636,14 +751,14 @@ export function createWorkerServer(options = {}) {
           agent: {
             id: config.agentId,
             adapter: {
-              id: codexAdapterManifest.id,
-              provider: codexAdapterManifest.provider,
-              displayName: codexAdapterManifest.displayName
+              id: adapterManifest.id,
+              provider: adapterManifest.provider,
+              displayName: adapterManifest.displayName
             },
             version: version.output,
             startedAt: state.startedAt
           },
-          capabilities: codexAdapterManifest.capabilities,
+          capabilities: adapterManifest.capabilities,
           authentication: publicAuthentication({ login, session }),
           task: {
             active: state.activeJob
@@ -664,6 +779,11 @@ export function createWorkerServer(options = {}) {
         return json(res, 202, wrapperResponse({ authentication: publicAuthentication() }));
       }
 
+      if (req.method === 'POST' && route === '/v1/auth/complete') {
+        const body = await readJson(req, 16 * 1024);
+        return json(res, 202, wrapperResponse({ authentication: completeLogin(body.code) }));
+      }
+
       if (req.method === 'POST' && route === '/v1/auth/refresh') {
         if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'Wait for the active task to finish before refreshing authentication' }));
         if (state.loginProcess) return json(res, 409, wrapperResponse({ error: 'Finish the current device login before refreshing authentication' }));
@@ -679,7 +799,7 @@ export function createWorkerServer(options = {}) {
             usage: refreshed.usage
           }));
         } catch (error) {
-          error.status = 502;
+          error.status ??= 502;
           throw error;
         }
       }
@@ -723,6 +843,7 @@ export function createWorkerServer(options = {}) {
         });
         try {
           if (config.demoMode) await runDemo(res, job, prompt);
+          else if (config.adapterId === 'claude-code') await runClaude(res, job, prompt, instructions);
           else await runCodex(res, job, prompt, instructions);
           const usage = await finalizeJobUsage(job);
           emitCanonical(res, 'usage.updated', { taskId: job.id, data: { usage } });

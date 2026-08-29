@@ -6,6 +6,8 @@ services:
       PORT: "3000"
       WORKER_URL: http://worker:7777
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      CLAUDE_WORKER_URL: http://claude-worker:7777
+      CLAUDE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CONTROL_PLANE_DATA_PATH: /control-data/agents.json
     ports:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
@@ -13,6 +15,8 @@ services:
       - control-data:/control-data
     depends_on:
       worker:
+        condition: service_healthy
+      claude-worker:
         condition: service_healthy
     restart: unless-stopped
 
@@ -43,8 +47,45 @@ services:
     init: true
     restart: unless-stopped
 
+  claude-worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.claude
+    environment:
+      PORT: "7777"
+      WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      AGENT_ID: claude-worker-01
+      AGENT_ADAPTER: claude-code
+      HOME: /claude-home
+      CLAUDE_HOME: /claude-home
+      CLAUDE_CONFIG_DIR: /claude-home/.claude
+      CLAUDE_VERSION: ${CLAUDE_VERSION:-latest}
+      ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
+      AGENT_DATA_PATH: /agent-data/usage.json
+      USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
+      DISABLE_AUTOUPDATER: "1"
+      BROWSER: echo
+    volumes:
+      - claude-auth:/claude-home
+      - claude-bin:/opt/claude
+      - claude-agent-data:/agent-data
+      - ./claude-workspace:/workspace
+    expose:
+      - "7777"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7777/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    init: true
+    restart: unless-stopped
+
 volumes:
   codex-auth:
   codex-bin:
   agent-data:
+  claude-auth:
+  claude-bin:
+  claude-agent-data:
   control-data:

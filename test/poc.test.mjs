@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
+import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -194,4 +195,60 @@ test('worker rejects unauthenticated direct API calls', async (t) => {
   const response = await fetch(`${workerUrl}/v1/status`, { headers: { authorization: 'Bearer wrong' } });
   assert.equal(response.status, 401);
   assert.equal((await response.json()).apiVersion, 'agent-wrapper/v1');
+});
+
+test('Claude Code implements the same wrapper contract and normalizes stream usage', async (t) => {
+  const token = 'claude-worker-secret';
+  const worker = createWorkerServer({ token, adapter: 'claude-code', demoMode: true, workspace: process.cwd() });
+  const workerUrl = await listen(worker);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    claudeWorkerUrl: workerUrl,
+    claudeWorkerToken: token,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const createdResponse = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Claude Worker', adapter: 'claude-code' })
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = (await createdResponse.json()).agent;
+
+  const status = await (await fetch(`${controlUrl}/api/v1/agents/${created.id}/status`)).json();
+  assert.equal(status.agent.adapter.id, 'claude-code');
+  assert.equal(status.agent.adapter.provider, 'anthropic');
+  assert.equal(status.capabilities.authentication.refresh, false);
+  assert.equal(status.capabilities.usage.quotaWindows, false);
+  assert.equal(status.authentication.method, 'browser_oauth');
+  assert.equal(status.authentication.session.canForceRefresh, false);
+
+  const runResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'hello Claude worker' })
+  });
+  const events = (await runResponse.text()).trim().split('\n').map(JSON.parse);
+  assert.equal(events[1].type, 'message.completed');
+  assert.equal(events[1].data.text, 'Demo worker received: hello Claude worker');
+  assert.ok(events.some((event) => event.type === 'usage.observed'));
+  assert.equal(events.at(-1).data.status, 'succeeded');
+
+  const normalized = normalizeClaudeEvent({
+    type: 'result',
+    usage: { input_tokens: 10, cache_read_input_tokens: 5, cache_creation_input_tokens: 2, output_tokens: 3 }
+  });
+  assert.deepEqual(normalized.data.request, {
+    inputTokens: 17,
+    cachedInputTokens: 7,
+    outputTokens: 3,
+    totalTokens: 20
+  });
 });

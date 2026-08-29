@@ -108,9 +108,20 @@ function makeAgent(input, existingIds, defaults = {}) {
 }
 
 export function createControlPlane(options = {}) {
+  const primaryWorkerToken = options.workerToken ?? process.env.WORKER_TOKEN ?? '';
   const config = {
     workerUrl: (options.workerUrl ?? process.env.WORKER_URL ?? 'http://127.0.0.1:7777').replace(/\/$/, ''),
-    workerToken: options.workerToken ?? process.env.WORKER_TOKEN ?? '',
+    workerToken: primaryWorkerToken,
+    workerTemplates: {
+      'codex-cli': {
+        workerUrl: (options.workerUrl ?? process.env.WORKER_URL ?? 'http://127.0.0.1:7777').replace(/\/$/, ''),
+        workerToken: primaryWorkerToken
+      },
+      'claude-code': {
+        workerUrl: (options.claudeWorkerUrl ?? process.env.CLAUDE_WORKER_URL ?? '').replace(/\/$/, ''),
+        workerToken: options.claudeWorkerToken ?? process.env.CLAUDE_WORKER_TOKEN ?? primaryWorkerToken
+      }
+    },
     publicDir: options.publicDir ?? join(moduleDir, 'public'),
     dataPath: options.dataPath === null ? null : (options.dataPath ?? process.env.CONTROL_PLANE_DATA_PATH ?? null),
     defaultAgentId: options.defaultAgentId ?? process.env.DEFAULT_AGENT_ID ?? 'worker-01'
@@ -243,7 +254,8 @@ export function createControlPlane(options = {}) {
       if (req.method === 'GET') return json(res, 200, { agents: [...agents.values()].map(publicAgent) });
       if (req.method === 'POST') {
         const body = await readJson(req);
-        const agent = makeAgent(body, new Set(agents.keys()));
+        const adapter = typeof body.adapter === 'string' ? body.adapter : 'codex-cli';
+        const agent = makeAgent(body, new Set(agents.keys()), config.workerTemplates[adapter] ?? {});
         agents.set(agent.id, agent);
         await persistAgents();
         return json(res, 201, { agent: publicAgent(agent) });
@@ -284,12 +296,13 @@ export function createControlPlane(options = {}) {
   }
 
   async function handleAgentOperation(req, res, url) {
-    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|auth\/login|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
+    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
     const operation = match[2];
     if (req.method === 'GET' && operation === 'status') return proxyJson(req, res, agent, '/v1/status');
     if (req.method === 'POST' && operation === 'auth/login') return proxyJson(req, res, agent, '/v1/auth/login');
+    if (req.method === 'POST' && operation === 'auth/complete') return proxyJson(req, res, agent, '/v1/auth/complete');
     if (req.method === 'POST' && operation === 'auth/refresh') return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);
     if (req.method === 'GET' && operation === 'workspace') return proxyJson(req, res, agent, '/v1/workspace');
     if (req.method === 'GET' && operation === 'usage') return proxyJson(req, res, agent, '/v1/usage');
@@ -321,6 +334,7 @@ export function createControlPlane(options = {}) {
       if (!agent && url.pathname.startsWith('/api/')) return json(res, 404, { error: 'No agents configured' });
       if (req.method === 'GET' && ['/api/v1/status', '/api/status'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/status');
       if (req.method === 'POST' && ['/api/v1/auth/login', '/api/auth/start'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/login');
+      if (req.method === 'POST' && ['/api/v1/auth/complete', '/api/auth/complete'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/complete');
       if (req.method === 'POST' && ['/api/v1/auth/refresh', '/api/auth/refresh'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);
       if (req.method === 'GET' && ['/api/v1/workspace', '/api/workspace'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/workspace');
       if (req.method === 'GET' && ['/api/v1/usage', '/api/usage'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/usage');

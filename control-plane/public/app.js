@@ -32,6 +32,12 @@ const ui = {
   jobState: $('#job-state'),
   primaryQuotaSummary: $('#primary-quota-summary'),
   secondaryQuotaSummary: $('#secondary-quota-summary'),
+  primaryQuotaLabel: $('#primary-quota-label'),
+  secondaryQuotaLabel: $('#secondary-quota-label'),
+  primaryQuotaBar: $('#primary-quota-bar'),
+  secondaryQuotaBar: $('#secondary-quota-bar'),
+  primaryQuotaReset: $('#primary-quota-reset'),
+  secondaryQuotaReset: $('#secondary-quota-reset'),
   agentTotalSummary: $('#agent-total-summary'),
   runtimeDetails: $('#runtime-details'),
   runtimeDetailsHint: $('#runtime-details-hint'),
@@ -40,6 +46,10 @@ const ui = {
   deviceFlow: $('#device-flow'),
   authLink: $('#auth-link'),
   authCode: $('#auth-code'),
+  authCompleteForm: $('#auth-complete-form'),
+  authCompletionCode: $('#auth-completion-code'),
+  authCompleteButton: $('#auth-complete-button'),
+  authCompleteMessage: $('#auth-complete-message'),
   authTranscript: $('#auth-transcript'),
   authTitle: $('#auth-title'),
   authCopy: $('#auth-copy'),
@@ -167,6 +177,10 @@ function createAgentCard(agent) {
       <span class="pill neutral status-pill">checking</span>
     </div>
     <p class="agent-card-description"></p>
+    <div class="card-quota-windows" aria-label="Subscription quota windows">
+      <div class="card-quota-row card-quota-primary"><div><span class="card-quota-label">Primary quota</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
+      <div class="card-quota-row card-quota-secondary"><div><span class="card-quota-label">Secondary quota</span><strong class="card-quota-value">—</strong></div><span class="quota-bar"><span></span></span></div>
+    </div>
     <dl class="card-metrics">
       <div><dt>AUTH</dt><dd class="card-auth">—</dd></div>
       <div><dt>USAGE</dt><dd class="card-usage">—</dd></div>
@@ -205,6 +219,26 @@ function updateAgentCard(card, status) {
   const highest = windows.length ? Math.max(...windows.map((window) => Number(window.usedPercent) || 0)) : null;
   card.querySelector('.card-usage').textContent = highest === null ? '—' : `${highest.toFixed(0)}% used`;
   card.querySelector('.card-requests').textContent = formatTokens(status.usage?.totals?.requests ?? 0);
+  const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
+  const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
+  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Primary quota');
+  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Secondary quota');
+}
+
+function quotaFillClass(used) {
+  if (used >= 90) return 'danger';
+  if (used >= 70) return 'warning';
+  return '';
+}
+
+function renderCardQuota(row, window, fallbackLabel) {
+  const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
+  row.querySelector('.card-quota-label').textContent = window?.label || fallbackLabel;
+  row.querySelector('.card-quota-value').textContent = window ? `${used.toFixed(0)}%` : 'Unavailable';
+  const fill = row.querySelector('.quota-bar span');
+  fill.style.width = window ? `${used}%` : '0%';
+  fill.className = quotaFillClass(used);
+  row.classList.toggle('unavailable', !window);
 }
 
 function markAgentCardOffline(card, message) {
@@ -319,6 +353,8 @@ function renderAuth(auth = {}) {
     ui.authLink.classList.add('hidden');
   }
   ui.authCode.textContent = auth.challenge?.userCode || '';
+  ui.authCode.classList.toggle('hidden', !auth.challenge?.userCode);
+  ui.authCompleteForm.classList.toggle('hidden', !auth.challenge?.requiresInput);
   ui.authTranscript.textContent = auth.challenge?.instructions || 'Waiting for the device login instructions…';
 }
 
@@ -360,8 +396,7 @@ function renderQuotaRow(label, window) {
   bar.className = 'quota-bar';
   const fill = document.createElement('span');
   fill.style.width = `${used}%`;
-  if (used >= 90) fill.className = 'danger';
-  else if (used >= 70) fill.className = 'warning';
+  fill.className = quotaFillClass(used);
   bar.append(fill);
   const value = document.createElement('span');
   value.className = 'quota-value';
@@ -373,6 +408,23 @@ function renderQuotaRow(label, window) {
   reset.textContent = resetDate ? `${duration} · resets ${resetDate.toLocaleString()}` : duration;
   row.append(name, bar, value, reset);
   return row;
+}
+
+function renderRuntimeQuota(scope, window, fallbackLabel) {
+  const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
+  const label = ui[`${scope}QuotaLabel`];
+  const summary = ui[`${scope}QuotaSummary`];
+  const bar = ui[`${scope}QuotaBar`];
+  const reset = ui[`${scope}QuotaReset`];
+  label.textContent = window?.label || fallbackLabel;
+  summary.textContent = window ? `${used.toFixed(0)}% used` : 'Unavailable';
+  bar.style.width = window ? `${used}%` : '0%';
+  bar.className = quotaFillClass(used);
+  const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
+  const duration = window?.windowDurationMinutes ? `${window.windowDurationMinutes}m window` : 'quota window';
+  reset.textContent = window
+    ? (resetDate ? `${duration} · resets ${resetDate.toLocaleString()}` : duration)
+    : `${currentHarnessName} does not currently expose this window`;
 }
 
 function renderUsage(usage = {}) {
@@ -390,8 +442,8 @@ function renderUsage(usage = {}) {
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  ui.primaryQuotaSummary.textContent = primary ? `${Number(primary.usedPercent ?? 0).toFixed(0)}% used` : '—';
-  ui.secondaryQuotaSummary.textContent = secondary ? `${Number(secondary.usedPercent ?? 0).toFixed(0)}% used` : '—';
+  renderRuntimeQuota('primary', primary, 'Primary quota');
+  renderRuntimeQuota('secondary', secondary, 'Secondary quota');
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
@@ -421,13 +473,18 @@ function renderStatus(status) {
   ui.refreshUsage.disabled = false;
   ui.authBox.classList.toggle('authenticated', authenticated);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
+  const browserOAuth = status.authentication?.method === 'browser_oauth';
   ui.authCopy.textContent = authenticated
     ? `The worker holds a renewable ${currentHarnessName} login. Safe session dates are surfaced; credentials never leave the worker.`
-    : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
-  ui.authButton.textContent = authenticated ? 'Connected' : 'Start device login';
+    : browserOAuth
+      ? `The worker starts ${currentHarnessName}'s browser OAuth flow. Agent Dock forwards only the provider's one-time completion code and never stores it.`
+      : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
+  ui.authButton.textContent = authenticated ? 'Connected' : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
   ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
   if (!authenticated) {
-    ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user' ? 'Waiting for device authentication' : 'Authentication required';
+    ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user'
+      ? (browserOAuth ? 'Waiting for browser authentication' : 'Waiting for device authentication')
+      : 'Authentication required';
     if (ui.runtimeDetails.dataset.autoOpened !== 'true') {
       ui.runtimeDetails.open = true;
       ui.runtimeDetails.dataset.autoOpened = 'true';
@@ -452,6 +509,10 @@ function renderRuntimeUnavailable(message) {
   ui.jobState.textContent = 'idle';
   ui.primaryQuotaSummary.textContent = '—';
   ui.secondaryQuotaSummary.textContent = '—';
+  ui.primaryQuotaBar.style.width = '0%';
+  ui.secondaryQuotaBar.style.width = '0%';
+  ui.primaryQuotaReset.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
+  ui.secondaryQuotaReset.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
   ui.agentTotalSummary.textContent = '0';
   ui.runtimeDetailsHint.textContent = definitionOnly ? 'Runtime provisioning required' : 'Worker unavailable';
   ui.runButton.disabled = true;
@@ -490,6 +551,25 @@ async function startAuth() {
     ui.authRefreshMessage.textContent = error.message;
     ui.authRefreshMessage.classList.add('error');
     ui.authButton.disabled = false;
+  }
+}
+
+async function completeAuthentication(event) {
+  event.preventDefault();
+  const code = ui.authCompletionCode.value.trim();
+  if (!code) return;
+  ui.authCompleteButton.disabled = true;
+  ui.authCompleteMessage.textContent = 'Sending the one-time code directly to the CLI…';
+  try {
+    const result = await api(agentApi('auth/complete'), { method: 'POST', body: JSON.stringify({ code }) });
+    ui.authCompletionCode.value = '';
+    renderAuth(result.authentication);
+    ui.authCompleteMessage.textContent = 'Code accepted; waiting for Claude Code to confirm the session…';
+    if (!authPolling) authPolling = setInterval(refreshStatus, 1800);
+  } catch (error) {
+    ui.authCompleteMessage.textContent = error.message;
+  } finally {
+    ui.authCompleteButton.disabled = false;
   }
 }
 
@@ -688,6 +768,7 @@ $('#cancel-create').addEventListener('click', () => ui.createDialog.close());
 ui.configForm.addEventListener('submit', saveAgent);
 $('#delete-agent').addEventListener('click', deleteCurrentAgent);
 ui.authButton.addEventListener('click', startAuth);
+ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);
 ui.cancelButton.addEventListener('click', cancelRun);
 ui.refreshUsage.addEventListener('click', refreshUsage);

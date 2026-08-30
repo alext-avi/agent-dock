@@ -4,8 +4,9 @@ flowchart TB
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
-    API["REST/JSON + NDJSON proxy\nAgent CRUD + lifecycle operations"]
-    Registry["Schema-v2 JSON registry\nAgent definitions separate from runtimes"]
+    API["REST/JSON + NDJSON proxy\nAgent + MCP lifecycle operations"]
+    Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
+    McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Provisioner["Docker runtime manager\nExclusive ownership enforcement"]
   end
 
@@ -26,13 +27,16 @@ flowchart TB
   end
 
   Providers["OpenAI · Anthropic · OpenCode providers · host Ollama"]
-  MCP["Future per-agent MCP/tool recipes"]
+  MCP["Per-agent MCP servers\nstdio command policy · remote HTTP"]
+  FutureMcp["Future control-plane MCP server\nExplicit safe-tool allowlist"]
+  Guard["Never exposed as MCP tools\nMCP admin · storage/mount mutation"]
   Data["Future scoped data attachments"]
   React["Planned web client\nReact + TypeScript + Vite"]
   Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
   API <--> Registry
+  API <--> McpService
   API --> Provisioner --> Engine
   Engine --> RuntimeA
   Engine --> RuntimeB
@@ -43,7 +47,11 @@ flowchart TB
   API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  MCP -.-> RuntimeA
-  MCP -.-> RuntimeB
+  McpService -->|"same servers payload"| WA
+  McpService -->|"same servers payload"| WB
+  WA --> MCP
+  WB --> MCP
+  FutureMcp -.-> API
+  FutureMcp --- Guard
   Data -.-> VA
   Data -.-> VB

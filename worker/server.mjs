@@ -8,6 +8,7 @@ import { codexAdapterManifest, normalizeCodexEvent } from './adapters/codex.mjs'
 import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
 import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
+import { createMcpManager } from './mcp/manager.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
@@ -179,6 +180,9 @@ export function createWorkerServer(options = {}) {
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
     dataPath: options.dataPath === null ? null : (options.dataPath ?? process.env.AGENT_DATA_PATH ?? (demoMode ? null : '/agent-data/usage.json')),
+    mcpStatePath: options.mcpStatePath === null ? null : (options.mcpStatePath ?? process.env.MCP_STATE_PATH ?? (demoMode ? null : '/agent-data/mcp/state.json')),
+    mcpConfigDir: options.mcpConfigDir ?? process.env.MCP_CONFIG_DIR ?? (demoMode ? path.join('/tmp', `agent-dock-mcp-${options.agentId ?? process.env.AGENT_ID ?? 'worker-01'}`) : '/agent-data/mcp'),
+    mcpAllowedCommands: options.mcpAllowedCommands ?? String(process.env.MCP_ALLOWED_COMMANDS ?? '').split(',').map((value) => value.trim()).filter(Boolean),
     usagePollIntervalMs: Number(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? 60_000)
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
@@ -207,6 +211,18 @@ export function createWorkerServer(options = {}) {
           BROWSER: process.env.BROWSER ?? 'echo'
         }
       : { ...process.env, CODEX_HOME: config.codexHome };
+
+  const mcpManager = createMcpManager({
+    adapterId: config.adapterId,
+    environment: providerEnv,
+    workspace: config.workspace,
+    allowedCommands: config.mcpAllowedCommands,
+    statePath: config.mcpStatePath,
+    configDir: config.mcpConfigDir,
+    providerConfigPath: config.opencodeConfigPath,
+    run: capture,
+    demoMode: config.demoMode
+  });
 
   async function loadUsage() {
     if (!config.dataPath) return;
@@ -294,9 +310,14 @@ export function createWorkerServer(options = {}) {
         }
       } : {})
     }]));
+    let existing = {};
+    try { existing = JSON.parse(await readFile(config.opencodeConfigPath, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
     const contents = {
+      ...existing,
       $schema: 'https://opencode.ai/config.json',
       provider: {
+        ...(existing.provider ?? {}),
         ollama: {
           npm: '@ai-sdk/openai-compatible',
           name: config.ollamaDisplayName,
@@ -861,6 +882,7 @@ export function createWorkerServer(options = {}) {
   }
 
   function emitProviderEvent(res, event, job) {
+    mcpManager.observe(event).catch(() => {});
     const normalized = normalizeProviderEvent(event);
     if (!normalized) return;
     observeUsage(job, normalized);
@@ -934,13 +956,15 @@ export function createWorkerServer(options = {}) {
 
   async function runClaude(res, job, prompt, instructions) {
     const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+    const mcpContext = await mcpManager.taskContext(providerEnv);
+    args.push(...mcpContext.args);
     if (instructions) args.push('--append-system-prompt', instructions);
     if (config.allowUnsandboxed) args.push('--dangerously-skip-permissions');
     else args.push('--permission-mode', 'dontAsk');
 
     const child = spawn('claude', args, {
       cwd: config.workspace,
-      env: providerEnv,
+      env: mcpContext.env,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     job.child = child;
@@ -985,13 +1009,14 @@ export function createWorkerServer(options = {}) {
       ? `Agent profile instructions:\n${instructions}\n\nTask:\n${prompt}`
       : prompt;
     const args = ['run', '--format', 'json', '--dir', config.workspace];
+    const mcpContext = await mcpManager.taskContext(providerEnv);
     if (job.model) args.push('--model', job.model);
     if (config.allowUnsandboxed) args.push('--auto');
     args.push(fullPrompt);
 
     const child = spawn('opencode', args, {
       cwd: config.workspace,
-      env: providerEnv,
+      env: mcpContext.env,
       stdio: ['ignore', 'pipe', 'pipe']
     });
     job.child = child;
@@ -1045,6 +1070,24 @@ export function createWorkerServer(options = {}) {
 
       if (req.method === 'GET' && route === '/v1/providers') {
         return json(res, 200, wrapperResponse(await providerConnections()));
+      }
+
+      if (req.method === 'GET' && route === '/v1/mcp') {
+        return json(res, 200, wrapperResponse({ mcp: await mcpManager.inspect({ probe: url.searchParams.get('probe') === '1' }) }));
+      }
+
+      if (req.method === 'POST' && route === '/v1/mcp/validate') {
+        const body = await readJson(req);
+        const servers = Array.isArray(body.servers) ? body.servers : null;
+        const validation = mcpManager.validate(servers ?? body.servers);
+        return json(res, validation.valid ? 200 : 400, wrapperResponse({ mcp: { servers: servers ?? [], validation } }));
+      }
+
+      if (req.method === 'PUT' && route === '/v1/mcp') {
+        if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'Wait for the active task to finish before changing MCP configuration' }));
+        const body = await readJson(req);
+        if (!Array.isArray(body.servers)) return json(res, 400, wrapperResponse({ error: 'servers must be an array' }));
+        return json(res, 200, wrapperResponse({ mcp: await mcpManager.apply(body.servers) }));
       }
 
       if (req.method === 'GET' && route === '/v1/status') {

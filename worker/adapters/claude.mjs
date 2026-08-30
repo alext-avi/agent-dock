@@ -1,4 +1,5 @@
 import { normalizeTokenUsage } from '../protocol.mjs';
+import { claudeMcpCapabilities } from './mcp/claude.mjs';
 
 export const claudeAdapterManifest = Object.freeze({
   id: 'claude-code',
@@ -7,6 +8,7 @@ export const claudeAdapterManifest = Object.freeze({
   capabilities: {
     authentication: { methods: ['browser_oauth'], refresh: false },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    mcp: claudeMcpCapabilities,
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
     workspace: { list: true }
   }

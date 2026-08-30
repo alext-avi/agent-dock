@@ -1,4 +1,14 @@
 import { normalizeTokenUsage } from '../protocol.mjs';
+import { openCodeMcpCapabilities } from './opencode-mcp.mjs';
+
+export {
+  OpenCodeMcpValidationError,
+  openCodeMcpCapabilities,
+  openCodeMcpTaskEnvironment,
+  parseOpenCodeMcpList,
+  renderOpenCodeMcpConfig,
+  validateOpenCodeMcpServers
+} from './opencode-mcp.mjs';
 
 export const opencodeAdapterManifest = Object.freeze({
   id: 'opencode',
@@ -10,9 +20,12 @@ export const opencodeAdapterManifest = Object.freeze({
     providers: { list: true, discovery: true, localConnections: true },
     models: { discovery: true, selection: true, orderedFallback: false },
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
-    workspace: { list: true }
+    workspace: { list: true },
+    mcp: openCodeMcpCapabilities
   }
 });
+
+export const openCodeAdapterManifest = opencodeAdapterManifest;
 
 function textFrom(value) {
   if (typeof value === 'string') return value;

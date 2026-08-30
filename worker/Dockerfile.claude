@@ -18,6 +18,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --chown=agent:agent server.mjs protocol.mjs entrypoint-claude.sh ./
 COPY --chown=agent:agent adapters ./adapters
+COPY --chown=agent:agent mcp ./mcp
 RUN chmod 0755 /app/entrypoint-claude.sh
 
 USER agent

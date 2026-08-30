@@ -81,6 +81,9 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
     // The image tag this runtime is actually running, so drift from the
     // configured image is visible rather than silent. A local tag, not a secret.
     image: runtime.image ?? null,
+    // True when the configured image has been rebuilt since this container was
+    // created, null when either side is unknown. Refreshing clears it.
+    outdated: runtime.outdated ?? null,
     createdAt: runtime.createdAt ?? null,
     updatedAt: runtime.updatedAt ?? null
   };
@@ -506,6 +509,11 @@ export function createControlPlane(options = {}) {
             // Keep the cached id current. A container replaced out of band moves
             // its id, and a stale one costs a needless name lookup every time.
             if (inspected.containerId) runtime.containerId = inspected.containerId;
+            runtime.imageId = inspected.imageId ?? runtime.imageId ?? null;
+            const current = await runtimeManager.currentImageId(runtime.adapter);
+            // Only claim staleness when both sides are known. An unknown image
+            // is reported as unknown rather than guessed either way.
+            runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
             runtime.updatedAt = new Date().toISOString();
           } catch {
             runtime.state = 'unknown';

@@ -173,6 +173,22 @@ export class DockerRuntimeManager {
     return null;
   }
 
+  // The image id currently behind an adapter's configured tag. Compared against
+  // what a container is actually running, this is what makes staleness a fact
+  // rather than a guess.
+  async currentImageId(adapter) {
+    const template = ADAPTERS[adapter];
+    if (!template) return null;
+    const reference = this.imageOverrides[adapter] ?? process.env[template.imageEnv] ?? template.defaultImage;
+    try {
+      const value = await this.request('GET', `/images/${encodeURIComponent(reference)}/json`);
+      return value?.Id ?? null;
+    } catch {
+      // An image that is not present locally cannot be compared against.
+      return null;
+    }
+  }
+
   async resolveNetwork() {
     if (this.network) return this.network;
     const inspected = await this.request('GET', `/containers/${encodeURIComponent(this.controlContainer)}/json`);
@@ -358,6 +374,9 @@ export class DockerRuntimeManager {
       state: value.State?.Running ? 'running' : value.State?.Status ?? 'stopped',
       health: value.State?.Health?.Status ?? null,
       image: value.Config?.Image ?? null,
+      // The tag is a mutable pointer; the resolved image id is what actually
+      // says which build this container is running.
+      imageId: value.Image ?? null,
       // The id moves whenever a container is replaced, including out of band.
       containerId: value.Id
     };

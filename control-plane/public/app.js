@@ -16,6 +16,7 @@ const ui = {
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
   createAdapter: $('#create-adapter'),
+  createAdapterRadios: $$('#create-adapter input[name="adapter"]'),
   attachRuntimeOption: $('#attach-runtime-option'),
   attachRuntimeRadio: $('#attach-runtime-radio'),
   attachRuntimeField: $('#attach-runtime-field'),
@@ -234,13 +235,19 @@ function selectTab(name, { updateHash = true, focus = false } = {}) {
 }
 
 function createAgentCard(agent) {
-  const card = document.createElement('article');
+  // The whole card is the link into the agent. Keep it free of nested
+  // interactive controls so it stays one predictable target.
+  const card = document.createElement('a');
   card.className = 'agent-card';
   card.dataset.agentId = agent.id;
+  card.href = `/agents/${encodeURIComponent(agent.id)}`;
   card.innerHTML = `
     <div class="agent-card-heading">
       <div><p class="kicker"></p><h2></h2></div>
-      <span class="pill neutral status-pill">checking</span>
+      <div class="agent-card-state">
+        <span class="pill neutral status-pill">checking</span>
+        <span class="card-update"></span>
+      </div>
     </div>
     <p class="agent-card-description"></p>
     <div class="card-quota-windows" aria-label="Subscription quota windows">
@@ -251,25 +258,11 @@ function createAgentCard(agent) {
       <div><dt>AUTH</dt><dd class="card-auth">—</dd></div>
       <div><dt>USAGE</dt><dd class="card-usage">—</dd></div>
       <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
-    </dl>
-    <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Open agent</a><button class="text-button card-delete">Delete</button></div></div>`;
+    </dl>`;
   card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${runtimeLabel(agent.runtime)} · ${agent.id}`;
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
-  const configure = card.querySelector('.configure-link');
-  configure.href = `/agents/${encodeURIComponent(agent.id)}`;
-  card.querySelector('.card-delete').addEventListener('click', async () => {
-    try {
-      if (!await deleteAgentRecord(agent)) return;
-      card.remove();
-      const count = ui.agentGrid.children.length;
-      ui.agentCount.textContent = String(count).padStart(2, '0');
-      ui.emptyFleet.classList.toggle('hidden', count !== 0);
-    } catch (error) {
-      setConnection('offline', error.message);
-    }
-  });
   return card;
 }
 
@@ -367,8 +360,14 @@ async function refreshDashboardStatuses() {
   }
 }
 
+// The harness is chosen with radio cards rather than a select, so read the
+// checked one rather than an element value.
+function selectedAdapter() {
+  return ui.createAdapterRadios.find((radio) => radio.checked)?.value ?? 'codex-cli';
+}
+
 function syncCreateRuntimeOptions() {
-  const adapter = ui.createAdapter.value;
+  const adapter = selectedAdapter();
   const available = retainedRuntimes.filter((runtime) => runtime.managed && runtime.binding === 'retained' && runtime.adapter === adapter && runtime.attachmentCount === 0);
   ui.attachRuntimeSelect.replaceChildren();
   for (const runtime of available) {
@@ -1019,7 +1018,7 @@ async function loadAgent(id) {
 }
 
 ui.createForm.addEventListener('submit', createAgent);
-ui.createAdapter.addEventListener('change', syncCreateRuntimeOptions);
+for (const radio of ui.createAdapterRadios) radio.addEventListener('change', syncCreateRuntimeOptions);
 for (const radio of $$('[name="runtimeMode"]')) radio.addEventListener('change', syncCreateRuntimeOptions);
 $('#new-agent').addEventListener('click', openCreateDialog);
 $('#empty-new-agent').addEventListener('click', openCreateDialog);

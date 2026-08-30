@@ -194,6 +194,10 @@ export function createWorkerServer(options = {}) {
     // Experimental, off by default. Enables the undocumented Claude OAuth usage
     // source described in worker/adapters/claude-usage.mjs.
     claudeOAuthUsage: options.claudeOAuthUsage ?? process.env.CLAUDE_OAUTH_USAGE === '1',
+    // Deliberately slower than USAGE_POLL_INTERVAL_MS. That interval governs
+    // Codex's local app-server call, which is free; this one governs an
+    // undocumented remote endpoint that is known to rate limit.
+    claudeUsageIntervalMs: Number(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS ?? 300_000),
     claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
     claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };
@@ -678,8 +682,14 @@ export function createWorkerServer(options = {}) {
     await usageReady;
     if (state.usagePollPromise) return state.usagePollPromise;
     const lastPoll = state.usage.lastPollAt ? Date.parse(state.usage.lastPollAt) : 0;
+    // The dashboard polls /v1/status every few seconds per agent, and each
+    // authenticated status read asks for a usage refresh, so this floor is what
+    // actually determines how hard the provider gets hit.
+    const minimumInterval = claudeUsageEnabled
+      ? Math.max(config.usagePollIntervalMs, config.claudeUsageIntervalMs)
+      : config.usagePollIntervalMs;
     const bounded = !force || claudeUsageEnabled;
-    if (bounded && lastPoll && Date.now() - lastPoll < config.usagePollIntervalMs) return publicUsage();
+    if (bounded && lastPoll && Date.now() - lastPoll < minimumInterval) return publicUsage();
 
     state.usagePollPromise = (async () => {
       if (config.adapterId === 'codex-cli') {

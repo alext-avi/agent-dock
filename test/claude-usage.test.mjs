@@ -238,6 +238,40 @@ test('the Claude worker reports experimental quota windows without disclosing th
   assert.equal(calls, 1, 'the usage endpoint was polled more than once inside the poll interval');
 });
 
+test('the experimental source is polled no harder than its own floor', async (t) => {
+  const token = 'claude-usage-floor';
+  const home = await claudeHomeWithCredential(t);
+  const payload = await fixture('claude-usage-limits');
+  let calls = 0;
+
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    // A fast general interval must not drag the provider call along with it:
+    // the Claude floor is the larger of the two.
+    usagePollIntervalMs: 1,
+    claudeUsageIntervalMs: 60_000,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse(payload);
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+    await fetch(`${workerUrl}/v1/status`, { headers });
+  }
+  assert.equal(calls, 1, `the endpoint was called ${calls} times inside one floor window`);
+});
+
 test('a failing telemetry source keeps local request history intact', async (t) => {
   const token = 'claude-usage-degraded';
   const home = await claudeHomeWithCredential(t);

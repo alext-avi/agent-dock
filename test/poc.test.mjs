@@ -808,3 +808,66 @@ test('destructive runtime operations cannot overlap', async () => {
   release();
   manager.claimRuntime('runtime-1', 'destroyed')();
 });
+
+
+// Container identity has two keys with opposite failure modes: an id that is
+// unambiguous but goes stale, and a name that survives replacement but can be
+// reused by an unrelated container. These pin the resolution rules.
+function stubDocker(manager, containers) {
+  manager.request = async (method, path) => {
+    const match = path.match(/^\/containers\/([^/]+)\/json$/);
+    if (!match) throw new Error(`unexpected docker call ${method} ${path}`);
+    const found = containers[decodeURIComponent(match[1])];
+    if (!found) throw Object.assign(new Error('Docker API 404 for ' + path), { status: 409 });
+    return found;
+  };
+}
+
+test('a runtime resolves by id first and falls back to its stable name', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const runtime = { id: 'rt-1', containerId: 'id-old', containerName: 'agent-dock-rt-1' };
+  const ours = { Id: 'id-new', Config: { Labels: { 'com.agent-dock.runtime-id': 'rt-1' } }, State: { Running: true } };
+
+  // Both present: the immutable id wins.
+  stubDocker(manager, { 'id-old': { ...ours, Id: 'id-old' }, 'agent-dock-rt-1': ours });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-old');
+
+  // The id has gone stale — a replaced container — so the name carries it.
+  stubDocker(manager, { 'agent-dock-rt-1': ours });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-new');
+
+  // Neither resolves.
+  stubDocker(manager, {});
+  assert.equal(await manager.resolveContainer(runtime), null);
+});
+
+test('a container holding the name but not the identity is never acted on', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const runtime = { id: 'rt-1', containerId: 'id-gone', containerName: 'agent-dock-rt-1' };
+
+  // Something unrelated has taken the name. Destructive calls resolve to
+  // nothing rather than to the impostor.
+  stubDocker(manager, {
+    'agent-dock-rt-1': { Id: 'id-someone-else', Config: { Labels: { 'com.agent-dock.runtime-id': 'rt-other' } }, State: { Running: true } }
+  });
+  assert.equal(await manager.resolveContainer(runtime, { requireIdentity: true }), null);
+  assert.equal(await manager.resolveContainer(runtime), null, 'a mismatched label is never ours, read or write');
+
+  // An unlabelled container answering to the name is not provably ours either,
+  // so it is readable but never destroyable.
+  stubDocker(manager, {
+    'agent-dock-rt-1': { Id: 'id-unlabelled', Config: { Labels: {} }, State: { Running: true } }
+  });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-unlabelled');
+  assert.equal(await manager.resolveContainer(runtime, { requireIdentity: true }), null);
+
+  // stop() must not touch anything it could not verify.
+  let stopped = false;
+  manager.request = async (method, path) => {
+    if (path.endsWith('/json')) throw Object.assign(new Error('Docker API 404'), { status: 409 });
+    stopped = true;
+    return null;
+  };
+  await manager.stop(runtime);
+  assert.equal(stopped, false, 'stop acted on a container it could not verify');
+});

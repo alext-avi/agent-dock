@@ -503,6 +503,9 @@ export function createControlPlane(options = {}) {
             runtime.state = inspected.state;
             runtime.health = inspected.health;
             runtime.image = inspected.image ?? runtime.image ?? null;
+            // Keep the cached id current. A container replaced out of band moves
+            // its id, and a stale one costs a needless name lookup every time.
+            if (inspected.containerId) runtime.containerId = inspected.containerId;
             runtime.updatedAt = new Date().toISOString();
           } catch {
             runtime.state = 'unknown';

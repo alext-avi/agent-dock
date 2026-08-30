@@ -65,12 +65,20 @@ function dockerError(status, body, path) {
   return error;
 }
 
-// A runtime's container name is derived from its immutable runtime id, so it
-// survives replacement. The id does not. Everything that addresses a container
-// should prefer the name and treat the stored id as a cached detail.
+// Two ways to name the same container, with opposite failure modes. The id is
+// immutable and refers to exactly one container ever, but goes stale the moment
+// the container is replaced. The name survives replacement, but Docker lets a
+// name be reused, so it can resolve to an unrelated container.
+//
+// Resolution therefore tries the id first — a stale id 404s, which is a loud,
+// safe failure — and falls back to the name only when the id no longer resolves.
+// Whatever it lands on is then checked against the runtime-id label before any
+// destructive call, so a reused name cannot get an unrelated container deleted.
 function containerRef(runtime) {
-  return runtime.containerName || runtime.containerId || '';
+  return runtime.containerId || runtime.containerName || '';
 }
+
+const RUNTIME_ID_LABEL = 'com.agent-dock.runtime-id';
 
 function runtimeVolumes(runtimeId) {
   const prefix = safeName(`agent-dock-${runtimeId}`);
@@ -140,6 +148,29 @@ export class DockerRuntimeManager {
     } catch {
       return result.body;
     }
+  }
+
+  // Returns the container that genuinely belongs to this runtime, or null.
+  // `requireIdentity` is set for destructive calls: a container that does not
+  // carry this runtime's label is not ours to stop, replace, or delete, even if
+  // it answers to the right name.
+  async resolveContainer(runtime, { requireIdentity = false } = {}) {
+    const candidates = [runtime.containerId, runtime.containerName].filter(Boolean);
+    for (const reference of candidates) {
+      let value;
+      try {
+        value = await this.request('GET', `/containers/${encodeURIComponent(reference)}/json`);
+      } catch (error) {
+        if (error.status === 409 || String(error.message).includes('404')) continue;
+        throw error;
+      }
+      const label = value?.Config?.Labels?.[RUNTIME_ID_LABEL] ?? null;
+      if (label && label !== runtime.id) continue;
+      // An unlabelled container answering to our name is not provably ours.
+      if (requireIdentity && label !== runtime.id) continue;
+      return { id: value.Id, inspected: value };
+    }
+    return null;
   }
 
   async resolveNetwork() {
@@ -291,7 +322,20 @@ export class DockerRuntimeManager {
       volumes,
       labels
     });
-    await this.request('DELETE', `/containers/${encodeURIComponent(containerRef(runtime))}?force=true`, undefined, [204, 404]);
+    const resolved = await this.resolveContainer(runtime, { requireIdentity: true });
+    if (resolved) {
+      await this.request('DELETE', `/containers/${encodeURIComponent(resolved.id)}?force=true`, undefined, [204, 404]);
+    } else {
+      // Nothing of ours is there. If something unrelated holds the name, say so
+      // rather than deleting it or failing obscurely on create.
+      const squatter = await this.resolveContainer({ containerName: runtime.containerName, id: runtime.id });
+      if (squatter) {
+        throw Object.assign(
+          new Error(`Container name ${runtime.containerName} is held by a container that is not this runtime`),
+          { status: 409 }
+        );
+      }
+    }
     const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(runtime.containerName)}`, body);
     await this.request('POST', `/containers/${encodeURIComponent(created.Id)}/start`);
     return {
@@ -307,27 +351,30 @@ export class DockerRuntimeManager {
 
   async inspect(runtime) {
     if (!containerRef(runtime)) return { state: runtime.state ?? 'unknown' };
-    try {
-      const value = await this.request('GET', `/containers/${encodeURIComponent(containerRef(runtime))}/json`);
-      return {
-        state: value.State?.Running ? 'running' : value.State?.Status ?? 'stopped',
-        health: value.State?.Health?.Status ?? null,
-        image: value.Config?.Image ?? null
-      };
-    } catch (error) {
-      if (error.message.includes('Docker API 404')) return { state: 'missing', health: null };
-      throw error;
-    }
+    const resolved = await this.resolveContainer(runtime);
+    if (!resolved) return { state: 'missing', health: null, image: null };
+    const value = resolved.inspected;
+    return {
+      state: value.State?.Running ? 'running' : value.State?.Status ?? 'stopped',
+      health: value.State?.Health?.Status ?? null,
+      image: value.Config?.Image ?? null,
+      // The id moves whenever a container is replaced, including out of band.
+      containerId: value.Id
+    };
   }
 
   async stop(runtime) {
     if (!containerRef(runtime)) return;
-    await this.request('POST', `/containers/${encodeURIComponent(containerRef(runtime))}/stop?t=10`, undefined, [204, 304, 404]);
+    const resolved = await this.resolveContainer(runtime, { requireIdentity: true });
+    if (!resolved) return;
+    await this.request('POST', `/containers/${encodeURIComponent(resolved.id)}/stop?t=10`, undefined, [204, 304, 404]);
   }
 
   async start(runtime) {
     if (!containerRef(runtime)) throw new Error('Managed runtime has no container identity');
-    await this.request('POST', `/containers/${encodeURIComponent(containerRef(runtime))}/start`, undefined, [204, 304]);
+    const resolved = await this.resolveContainer(runtime, { requireIdentity: true });
+    if (!resolved) throw Object.assign(new Error('Runtime container no longer exists'), { status: 409 });
+    await this.request('POST', `/containers/${encodeURIComponent(resolved.id)}/start`, undefined, [204, 304]);
   }
 
   async destroy(runtime) {
@@ -341,7 +388,10 @@ export class DockerRuntimeManager {
 
   async #destroy(runtime) {
     if (containerRef(runtime)) {
-      await this.request('DELETE', `/containers/${encodeURIComponent(containerRef(runtime))}?force=true`, undefined, [204, 404]);
+      const resolved = await this.resolveContainer(runtime, { requireIdentity: true });
+      if (resolved) {
+        await this.request('DELETE', `/containers/${encodeURIComponent(resolved.id)}?force=true`, undefined, [204, 404]);
+      }
     }
     for (const name of Object.values(runtime.volumes ?? {})) {
       await this.request('DELETE', `/volumes/${encodeURIComponent(name)}?force=true`, undefined, [204, 404]);

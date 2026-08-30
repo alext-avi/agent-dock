@@ -20,7 +20,11 @@ When Ollama is listening on the host's default port, the OpenCode worker discove
 
 If port 3000 is already occupied, set `CONTROL_PLANE_PORT` in `.env` before starting Compose—for example, `CONTROL_PLANE_PORT=3080` makes the UI available at `http://localhost:3080`.
 
-The first boot of each agent can take a minute because its worker installs its own CLI at runtime. Managed runtimes deliberately do not share writable binary caches or auth homes: each receives four uniquely named volumes for its CLI installation, credentials/config, telemetry, and workspace. The `control-data` volume stores schema-v2 agent definitions and runtime bindings. Set `CODEX_VERSION`, `CLAUDE_VERSION`, or `OPENCODE_VERSION` in `.env` to pin a release.
+The first boot of each agent can take a minute because its worker installs its own CLI at runtime. Managed runtimes deliberately do not share writable binary caches or auth homes: each receives four uniquely named volumes for its CLI installation, credentials/config, telemetry, and workspace. The `control-data` volume stores schema-v3 agent definitions, runtime bindings, MCP definitions, and per-agent MCP bindings. Set `CODEX_VERSION`, `CLAUDE_VERSION`, or `OPENCODE_VERSION` in `.env` to pin a release.
+
+Use **Tools & MCP** on an agent page to create a remote HTTP or local stdio MCP definition, attach a reusable definition, validate it against the selected harness, and apply the complete desired state. The control plane and all three workers use the same canonical payload in both directions; only the isolated worker translates it into Codex, Claude Code, or OpenCode configuration. Connector credentials are referenced by worker environment-variable name and never returned to the control plane. Local stdio MCP is denied unless its exact executable appears in `MCP_ALLOWED_COMMANDS` (comma-separated in `.env`).
+
+Claude Code is always launched with a worker-owned strict MCP file, including an empty file before its first connector is configured. OpenCode resolves its merged configuration before task start and disables MCP entries introduced outside Agent Dock's managed set; an unreadable or invalid merged configuration prevents the task from starting.
 
 The worker image includes the operating-system CA certificate bundle required by the Codex CLI for TLS connections during device authentication.
 
@@ -71,6 +75,7 @@ flowchart LR
 - OpenCode exposes per-request token/cost events but account quotas remain provider-specific, so the adapter advertises request telemetry without inventing account windows. OpenCode is a multi-provider harness; it does not itself supply subsidized tokens.
 - OpenCode discovers local Ollama models and can explicitly pin one as `ollama/<model>`. The effective model is included in task-start events and request history. Automatic cross-provider fallback is intentionally disabled.
 - The control plane depends only on the versioned wrapper contract; both provider workers use the same UI and API surface.
+- MCP definition CRUD and per-agent bindings persist in the control plane, while validation, vendor translation, activation, and health remain worker responsibilities. `GET` and `PUT /v1/mcp` round-trip the same `servers[]` DTO.
 
 The complete system model is available as [Markdown](./docs/architecture.md), [editable Mermaid](./docs/architecture.mmd), and a [standalone SVG](./docs/architecture.svg). The provider boundary is documented in [`docs/adapter-contract.md`](./docs/adapter-contract.md).
 
@@ -84,6 +89,13 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET`, `POST` | `/api/v1/agents` | List or create agent records |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/agents/:id` | Read, edit, or delete one agent record |
 | `GET` | `/api/v1/runtimes` | List safe runtime identities, lifecycle state, isolation mode, and attachment counts |
+| `GET`, `POST` | `/api/v1/mcp/servers` | List or create reusable provider-neutral MCP definitions |
+| `GET`, `PATCH`, `DELETE` | `/api/v1/mcp/servers/:id` | Read, update, or delete an unattached MCP definition |
+| `GET` | `/api/v1/agents/:id/mcp` | Read desired bindings plus the worker's round-tripped state and sanitized health |
+| `POST` | `/api/v1/agents/:id/mcp/bindings` | Attach an MCP definition to an agent |
+| `PATCH`, `DELETE` | `/api/v1/agents/:id/mcp/bindings/:serverId` | Enable/disable or detach one binding |
+| `POST` | `/api/v1/agents/:id/mcp/validate` | Validate a definition against the agent harness and command policy |
+| `POST` | `/api/v1/agents/:id/mcp/apply` | Replace the worker's complete managed MCP desired state |
 | `GET` | `/api/v1/agents/:id/status` | Adapter, capability, auth, task, execution, and usage status |
 | `GET` | `/api/v1/agents/:id/providers` | Safe provider-connection health and discoverable model metadata; never credentials or private endpoint URLs |
 | `POST` | `/api/v1/agents/:id/auth/login` | Start the adapter's interactive login flow |
@@ -121,7 +133,7 @@ curl -N http://localhost:3000/api/v1/agents/worker-01/tasks \
 
 The worker invokes `codex exec --dangerously-bypass-approvals-and-sandbox` by default because the Docker container is the POC's non-interactive execution boundary. The agent can modify the bind-mounted `workspace/`, run processes inside the worker, and use the worker's network. Do not mount source, SSH keys, cloud credentials, the Docker socket, or sensitive host paths into it. Set `ALLOW_UNSANDBOXED=0` to use Codex's `workspace-write` sandbox instead, understanding that unattended tool execution may be more constrained.
 
-The included Compose file retains one bootstrap worker for each adapter so schema-v1 installations can migrate without losing logins. Those bindings are labeled `shared-legacy`, and the control plane prevents newly created agents from attaching to an already-bound bootstrap runtime. All new managed agents provision an exclusive container and complete private volume set. One-time remote-worker pairing, MCP installation, and arbitrary data mounts remain distinct next capabilities. The Tools & MCP and Data tabs establish those future management surfaces without presenting nonfunctional credential or mount controls.
+The included Compose file retains one bootstrap worker for each adapter so schema-v1 installations can migrate without losing logins. Those bindings are labeled `shared-legacy`, and the control plane prevents newly created agents from attaching to an already-bound bootstrap runtime. All new managed agents provision an exclusive container and complete private volume set. One-time remote-worker pairing, connector-secret injection, tool installation, and arbitrary data mounts remain distinct next capabilities.
 
 That floor is per worker process. Each agent has its own container and its own copy of the credential, so a fleet of agents signed in to one subscription still multiplies calls to that account by the number of agents; there is no shared cross-agent budget. Raise `CLAUDE_OAUTH_USAGE_INTERVAL_MS` before running many Claude agents against a single account.
 
@@ -130,6 +142,8 @@ This prototype deliberately omits multi-tenancy, scheduling, webhooks, queue dur
 The experimental Claude usage source is the one place a provider credential is read by Agent Dock code rather than only by the vendor CLI. That read happens inside the worker, against the worker's own private auth volume; the token is never returned, logged, persisted, or sent to the control plane or browser, and only normalized quota windows cross the wrapper. The response is reduced to the quota fields before anything is written to the telemetry volume, so the account and billing state it also carries is not retained at rest. It targets an endpoint Anthropic does not document and for which no third-party OAuth flow or scoped usage-only token exists, so it may break without notice and is disabled unless you set `CLAUDE_OAUTH_USAGE=1`. The account-profile endpoint, which returns names, email addresses, and organization identifiers, is deliberately not called.
 
 The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. Each managed runtime has a unique random wrapper bearer token stored only in the server-side registry and its worker environment; it is transport authentication, not a provider credential. Mounting `/var/run/docker.sock` gives the local control plane host-level container authority. For remote deployment, isolate that authority behind a narrowly scoped provisioner, put the UI behind real authentication and TLS, replace stored bearer tokens with secret-manager references or pairing credentials, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
+
+The planned control-plane MCP server will use an explicit safe-tool registry. It will not expose MCP definition/binding/apply operations or storage, volume, and mount mutation operations, even though the operator REST/UI uses adjacent internal services. This separation is enforced in code rather than delegated to agent instructions.
 
 Users and operators remain responsible for complying with applicable OpenAI terms and account rules. This project does not implement automatic account rollover or subscription provisioning.
 

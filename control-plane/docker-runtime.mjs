@@ -78,6 +78,7 @@ export class DockerRuntimeManager {
     this.versionOverrides = options.versions ?? {};
     this.usagePollIntervalMs = String(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? '60000');
     this.allowUnsandboxed = String(options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED ?? '1');
+    this.mcpAllowedCommands = String(options.mcpAllowedCommands ?? process.env.MCP_ALLOWED_COMMANDS ?? '');
   }
 
   async request(method, path, body, accepted = [200, 201, 204]) {
@@ -158,6 +159,7 @@ export class DockerRuntimeManager {
         WORKER_TOKEN: workerToken,
         AGENT_ID: workerId,
         ALLOW_UNSANDBOXED: this.allowUnsandboxed,
+        MCP_ALLOWED_COMMANDS: this.mcpAllowedCommands,
         AGENT_DATA_PATH: '/agent-data/usage.json',
         USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
         [template.versionEnv]: version,

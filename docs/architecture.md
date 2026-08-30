@@ -9,8 +9,9 @@ flowchart TB
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
-    API["REST/JSON + NDJSON proxy\nAgent CRUD + lifecycle operations"]
-    Registry["Schema-v2 JSON registry\nAgent definitions separate from runtimes"]
+    API["REST/JSON + NDJSON proxy\nAgent + MCP lifecycle operations"]
+    Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
+    McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Provisioner["Docker runtime manager\nExclusive ownership enforcement"]
   end
 
@@ -31,13 +32,16 @@ flowchart TB
   end
 
   Providers["OpenAI · Anthropic · OpenCode providers · host Ollama"]
-  MCP["Future per-agent MCP/tool recipes"]
+  MCP["Per-agent MCP servers\nstdio command policy · remote HTTP"]
+  FutureMcp["Future control-plane MCP server\nExplicit safe-tool allowlist"]
+  Guard["Never exposed as MCP tools\nMCP admin · storage/mount mutation"]
   Data["Future scoped data attachments"]
   React["Planned web client\nReact + TypeScript + Vite"]
   Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
   API <--> Registry
+  API <--> McpService
   API --> Provisioner --> Engine
   Engine --> RuntimeA
   Engine --> RuntimeB
@@ -48,8 +52,12 @@ flowchart TB
   API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  MCP -.-> RuntimeA
-  MCP -.-> RuntimeB
+  McpService -->|"same servers payload"| WA
+  McpService -->|"same servers payload"| WB
+  WA --> MCP
+  WB --> MCP
+  FutureMcp -.-> API
+  FutureMcp --- Guard
   Data -.-> VA
   Data -.-> VB
 ```
@@ -57,14 +65,14 @@ flowchart TB
 | Layer | Current stack |
 |---|---|
 | Browser | Current: semantic HTML5, hand-written CSS, vanilla JavaScript ES modules, Fetch API, visibility-aware 3-second status polling. Planned: React + TypeScript + Vite after an explicit React/Vue spike. |
-| Control plane | Node.js 22, built-in `http`, schema-v2 filesystem-backed JSON registry, streaming Fetch proxy, Docker Engine Unix-socket client |
+| Control plane | Node.js 22, built-in `http`, schema-v3 filesystem-backed JSON registry, provider-neutral MCP service, streaming Fetch proxy, Docker Engine Unix-socket client |
 | Worker wrapper | Node.js 22, built-in `http`, `child_process`, filesystem persistence |
 | Provider harnesses | Official `@openai/codex`, `@anthropic-ai/claude-code`, and `opencode-ai` CLI distributions |
 | Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
 | Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/token, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Concurrent runtime attachment is rejected. |
-| Persistence | Current: schema-v2 JSON definitions/runtime registry plus unique Docker named volumes per managed agent. Planned: SQLite locally behind a Postgres-ready repository boundary. |
-| Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default | 
+| Persistence | Current: schema-v3 JSON agent/runtime/MCP registry plus unique Docker named volumes per managed agent. Planned: SQLite locally behind a Postgres-ready repository boundary. |
+| Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default |
 | Authentication | Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default |
 | Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |
 
-The control plane never parses provider credential files. Provider-specific commands, auth behavior, event formats, and supported usage telemetry stop at the adapter boundary. The local POC mounts the Docker socket into the server-side control plane; production deployment requires a constrained provisioner boundary instead of exposing host-level Docker authority to the web service.
+The control plane never parses provider credential files or vendor MCP configuration. Provider-specific commands, auth behavior, event formats, MCP rendering, and supported usage telemetry stop at the adapter boundary. The future control-plane MCP server will intentionally omit MCP administration and storage/mount mutation tools from its code-level tool registry. The local POC mounts the Docker socket into the server-side control plane; production deployment requires a constrained provisioner boundary instead of exposing host-level Docker authority to the web service.

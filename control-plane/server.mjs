@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
+import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const MIME = {
@@ -215,6 +216,8 @@ export function createControlPlane(options = {}) {
 
   const agents = new Map();
   const runtimes = new Map();
+  const mcpServers = new Map();
+  const mcpBindings = new Map();
   let persistQueue = Promise.resolve();
   const defaultAgent = () => agents.get(config.defaultAgentId) ?? agents.values().next().value ?? null;
   const attachmentCount = (runtimeId) => [...agents.values()].filter((agent) => agent.runtimeId === runtimeId).length;
@@ -222,7 +225,13 @@ export function createControlPlane(options = {}) {
 
   async function persistAgents() {
     if (!config.dataPath) return;
-    const payload = { schemaVersion: 2, agents: [...agents.values()], runtimes: [...runtimes.values()] };
+    const payload = {
+      schemaVersion: 3,
+      agents: [...agents.values()],
+      runtimes: [...runtimes.values()],
+      mcpServers: [...mcpServers.values()],
+      mcpBindings: [...mcpBindings.values()]
+    };
     persistQueue = persistQueue.then(async () => {
       await mkdir(dirname(config.dataPath), { recursive: true });
       const temporary = `${config.dataPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -289,6 +298,28 @@ export function createControlPlane(options = {}) {
           }
           for (const agent of stored.agents) {
             if (agent?.id && agent?.name) agents.set(agent.id, normalizeStoredAgent(agent));
+          }
+          if (stored.schemaVersion >= 3) {
+            for (const server of stored.mcpServers ?? []) {
+              if (server?.id && server?.name) mcpServers.set(server.id, normalizeStoredMcpDefinition(server));
+            }
+            for (const binding of stored.mcpBindings ?? []) {
+              if (!binding?.agentId || !binding?.serverId) continue;
+              const id = `${binding.agentId}:${binding.serverId}`;
+              mcpBindings.set(id, {
+                id,
+                agentId: binding.agentId,
+                serverId: binding.serverId,
+                enabled: binding.enabled !== false,
+                state: binding.state ?? 'pending',
+                error: binding.error ?? null,
+                appliedAt: binding.appliedAt ?? null,
+                createdAt: binding.createdAt ?? new Date().toISOString(),
+                updatedAt: binding.updatedAt ?? new Date().toISOString()
+              });
+            }
+          } else {
+            migrated = true;
           }
         } else {
           migrated = true;
@@ -374,6 +405,28 @@ export function createControlPlane(options = {}) {
     }
     return { response, runtime };
   }
+
+  async function workerRequest(agent, method, pathname, body = undefined, timeout = 30_000) {
+    const { response } = await workerFetch(agent, pathname, {
+      method,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      timeout
+    });
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const validationMessage = value.mcp?.validation?.errors?.map((item) => item.message).filter(Boolean).join('; ');
+      throw Object.assign(new Error(value.error ?? validationMessage ?? `Worker returned HTTP ${response.status}`), { status: response.status });
+    }
+    return value;
+  }
+
+  const mcpService = createMcpService({
+    servers: mcpServers,
+    bindings: mcpBindings,
+    agents,
+    persist: persistAgents,
+    workerRequest
+  });
 
   async function proxyJson(req, res, agent, pathname, timeout = 15_000) {
     const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : null;
@@ -555,9 +608,54 @@ export function createControlPlane(options = {}) {
         runtime.updatedAt = new Date().toISOString();
       }
       agents.delete(id);
+      for (const [bindingId, binding] of mcpBindings) {
+        if (binding.agentId === id) mcpBindings.delete(bindingId);
+      }
       await persistAgents();
       res.writeHead(204, { 'cache-control': 'no-store' });
       return res.end();
+    }
+    return false;
+  }
+
+  async function handleMcp(req, res, url) {
+    if (url.pathname === '/api/v1/mcp/servers') {
+      if (req.method === 'GET') return json(res, 200, { servers: mcpService.listServers() });
+      if (req.method === 'POST') return json(res, 201, { server: await mcpService.createServer(await readJson(req)) });
+      return false;
+    }
+
+    const serverMatch = url.pathname.match(/^\/api\/v1\/mcp\/servers\/([^/]+)$/);
+    if (serverMatch) {
+      const serverId = decodeURIComponent(serverMatch[1]);
+      if (req.method === 'GET') return json(res, 200, { server: mcpService.getServer(serverId) });
+      if (req.method === 'PATCH') return json(res, 200, { server: await mcpService.updateServer(serverId, await readJson(req)) });
+      if (req.method === 'DELETE') {
+        await mcpService.deleteServer(serverId);
+        res.writeHead(204, { 'cache-control': 'no-store' });
+        return res.end();
+      }
+      return false;
+    }
+
+    const agentMatch = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/mcp(?:\/(apply|validate|bindings)(?:\/([^/]+))?)?$/);
+    if (!agentMatch) return false;
+    const agentId = decodeURIComponent(agentMatch[1]);
+    const operation = agentMatch[2] ?? 'inspect';
+    const serverId = agentMatch[3] ? decodeURIComponent(agentMatch[3]) : null;
+    if (operation === 'inspect' && req.method === 'GET') return json(res, 200, await mcpService.inspectAgent(agentId));
+    if (operation === 'apply' && req.method === 'POST') return json(res, 200, await mcpService.applyAgent(agentId));
+    if (operation === 'validate' && req.method === 'POST') return json(res, 200, await mcpService.validateForAgent(agentId, await readJson(req)));
+    if (operation === 'bindings' && !serverId && req.method === 'POST') {
+      const body = await readJson(req);
+      return json(res, 201, await mcpService.bind(agentId, body.serverId, body));
+    }
+    if (operation === 'bindings' && serverId && req.method === 'PATCH') {
+      return json(res, 200, await mcpService.setBinding(agentId, serverId, await readJson(req)));
+    }
+    if (operation === 'bindings' && serverId && req.method === 'DELETE') {
+      const result = await mcpService.unbind(agentId, serverId);
+      return json(res, 200, result);
     }
     return false;
   }
@@ -584,6 +682,8 @@ export function createControlPlane(options = {}) {
     try {
       await registryReady;
       const url = new URL(req.url, 'http://control.local');
+      const mcp = await handleMcp(req, res, url);
+      if (mcp !== false) return mcp;
       const crud = await handleAgentCrud(req, res, url);
       if (crud !== false) return crud;
       const operation = await handleAgentOperation(req, res, url);

@@ -236,6 +236,25 @@ textarea.instructions { color: #c1cac3; }
 .capability-grid, .data-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .capability-card { min-height: 330px; display: flex; flex-direction: column; align-items: stretch; }
 .capability-card > .button { align-self: start; margin-top: auto; }
+.capability-copy { margin: -8px 0 16px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.mcp-toolbar { display: grid; grid-template-columns: minmax(150px, 1fr) auto auto; gap: 8px; margin-bottom: 14px; }
+.mcp-toolbar .button { padding: 10px 12px; }
+.mcp-list { display: grid; gap: 10px; min-height: 150px; }
+.mcp-row { padding: 13px; background: #0d110f; border: 1px solid var(--line); }
+.mcp-row-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.mcp-row-heading strong, .mcp-row-heading small { display: block; }
+.mcp-row-heading strong { font-size: 13px; }
+.mcp-row-heading small { margin-top: 4px; color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; }
+.mcp-endpoint { display: block; margin: 11px 0 7px; overflow: hidden; color: var(--aqua); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.mcp-meta { margin: 0; color: var(--faint); font: 9px/1.45 ui-monospace, monospace; }
+.mcp-row-actions { display: flex; gap: 7px; margin-top: 11px; }
+.danger-text { color: var(--danger); }
+.mcp-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.mcp-footer .run-message { min-height: 16px; line-height: 1.4; }
+.empty-capability.compact { padding: 8px 0 18px; }
+.mcp-transport-fields { display: grid; gap: 14px; margin-top: 16px; padding: 15px; background: #0d110f; border: 1px solid var(--line); }
+.mcp-transport-fields .field { margin: 0; }
+.dialog-spacer { flex: 1; }
 .empty-capability { max-width: 440px; padding: 18px 0 26px; }
 .empty-capability h3 { margin: 13px 0 8px; }
 .empty-capability p { color: var(--muted); margin: 0; font-size: 12px; line-height: 1.65; }
@@ -273,6 +292,8 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .agent-grid { grid-template-columns: 1fr; }
   .card-quota-windows { grid-template-columns: 1fr; }
   .capability-grid, .data-grid { grid-template-columns: 1fr; }
+  .mcp-toolbar { grid-template-columns: 1fr; }
+  .mcp-footer { align-items: stretch; flex-direction: column; }
   .form-grid { grid-template-columns: 1fr; }
   .model-policy-footer { flex-direction: column; }
   .field.full { grid-column: auto; }

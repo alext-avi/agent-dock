@@ -11,6 +11,7 @@ RUN apt-get update \
     && mkdir -p /workspace /codex-home /opt/codex
 COPY server.mjs protocol.mjs entrypoint.sh ./
 COPY adapters ./adapters
+COPY mcp ./mcp
 RUN chmod 0755 /app/entrypoint.sh
 
 WORKDIR /workspace

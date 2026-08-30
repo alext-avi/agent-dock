@@ -1,0 +1,226 @@
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import {
+  applyCodexMcpServers,
+  codexMcpCapabilities,
+  validateCodexMcpServers
+} from '../adapters/codex-mcp.mjs';
+import {
+  claudeMcpCapabilities,
+  claudeMcpTaskArguments,
+  observeClaudeMcpInit,
+  renderClaudeMcpConfig,
+  validateClaudeMcpServers
+} from '../adapters/mcp/claude.mjs';
+import {
+  openCodeMcpCapabilities,
+  openCodeMcpTaskEnvironment,
+  parseOpenCodeMcpList,
+  renderOpenCodeMcpConfig,
+  validateOpenCodeMcpServers
+} from '../adapters/opencode-mcp.mjs';
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function atomicJson(file, value) {
+  await mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, file);
+}
+
+function missingSecret(pathname) {
+  const error = new Error(`Worker secret ${pathname} is not configured in this agent container`);
+  error.status = 409;
+  return error;
+}
+
+function resolveServers(servers, environment, { requireSecrets }) {
+  return servers.map((server) => {
+    const resolved = clone(server);
+    resolved.environment = { ...(server.environment ?? {}) };
+    resolved.headers = { ...(server.headers ?? {}) };
+    for (const [target, reference] of Object.entries(server.secretEnvironment ?? {})) {
+      const sourceEnv = typeof reference === 'string' ? reference : reference.sourceEnv;
+      const value = environment[sourceEnv];
+      if (value === undefined && requireSecrets) throw missingSecret(sourceEnv);
+      if (value !== undefined) resolved.environment[target] = value;
+    }
+    for (const [header, reference] of Object.entries(server.secretHeaders ?? {})) {
+      const value = environment[reference.sourceEnv];
+      if (value === undefined && requireSecrets) throw missingSecret(reference.sourceEnv);
+      if (value !== undefined) resolved.headers[header] = `${reference.prefix ?? ''}${value}`;
+    }
+    return resolved;
+  });
+}
+
+function publicState(state, capabilities, health) {
+  return {
+    schemaVersion: 1,
+    capabilities,
+    generation: state.generation,
+    appliedAt: state.appliedAt,
+    activation: capabilities.activation ?? 'next-task',
+    restartRequired: capabilities.restartRequired === true,
+    servers: clone(state.servers),
+    health: clone(health)
+  };
+}
+
+function openCodeConfigurationError() {
+  const error = new Error('OpenCode configuration could not be resolved safely before task start');
+  error.status = 409;
+  error.code = 'OPENCODE_CONFIG_UNAVAILABLE';
+  return error;
+}
+
+function openCodeServerNames(output) {
+  let resolved;
+  try {
+    resolved = JSON.parse(String(output ?? ''));
+  } catch {
+    throw openCodeConfigurationError();
+  }
+  if (!resolved || typeof resolved !== 'object' || Array.isArray(resolved)) {
+    throw openCodeConfigurationError();
+  }
+  if (resolved.mcp === undefined) return [];
+  if (!resolved.mcp || typeof resolved.mcp !== 'object' || Array.isArray(resolved.mcp)) {
+    throw openCodeConfigurationError();
+  }
+  return Object.keys(resolved.mcp);
+}
+
+export function createMcpManager(options) {
+  const adapterId = options.adapterId;
+  const environment = options.environment ?? process.env;
+  const workspace = options.workspace ?? '/workspace';
+  const allowedCommands = new Set(options.allowedCommands ?? []);
+  const statePath = options.statePath;
+  const configDir = options.configDir;
+  const providerConfigPath = options.providerConfigPath;
+  const run = options.run;
+  const demoMode = options.demoMode === true;
+  const capabilities = adapterId === 'claude-code'
+    ? claudeMcpCapabilities
+    : adapterId === 'opencode' ? openCodeMcpCapabilities : codexMcpCapabilities;
+  let state = { schemaVersion: 1, generation: 0, appliedAt: null, servers: [] };
+  let health = { checkedAt: null, servers: [] };
+  let ready = load();
+
+  async function load() {
+    if (!statePath) return;
+    try {
+      const stored = JSON.parse(await readFile(statePath, 'utf8'));
+      if (Array.isArray(stored.servers)) state = { ...state, ...stored, servers: stored.servers };
+      if (stored.health) health = stored.health;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  async function persist() {
+    if (statePath) await atomicJson(statePath, { ...state, health });
+  }
+
+  function validate(servers, { requireSecrets = false } = {}) {
+    if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
+    let resolved;
+    try { resolved = resolveServers(servers, environment, { requireSecrets }); }
+    catch (error) { return { valid: false, errors: [{ field: 'secret', code: 'missing_worker_secret', message: error.message }], warnings: [] }; }
+    const context = { workspace, allowedCommands };
+    if (adapterId === 'claude-code') return validateClaudeMcpServers(resolved, context);
+    if (adapterId === 'opencode') return validateOpenCodeMcpServers(resolved, context);
+    return validateCodexMcpServers(resolved, context);
+  }
+
+  async function apply(servers) {
+    await ready;
+    const desired = clone(servers);
+    const validation = validate(desired, { requireSecrets: true });
+    if (!validation.valid) {
+      const error = new Error(validation.errors.map((item) => item.message).join('; ') || 'Invalid MCP configuration');
+      error.status = 400;
+      error.validation = validation;
+      throw error;
+    }
+    const resolved = resolveServers(desired, environment, { requireSecrets: true });
+    if (adapterId === 'claude-code') {
+      await atomicJson(path.join(configDir, 'claude.json'), renderClaudeMcpConfig(resolved, { workspace, allowedCommands }));
+    } else if (adapterId === 'opencode') {
+      let baseConfig = {};
+      try { baseConfig = JSON.parse(await readFile(providerConfigPath, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await atomicJson(providerConfigPath, renderOpenCodeMcpConfig(resolved, { baseConfig, workspace, allowedCommands }));
+    } else {
+      await applyCodexMcpServers(resolved, {
+        previousServers: resolveServers(state.servers, environment, { requireSecrets: false }),
+        allowedCommands,
+        env: environment,
+        run,
+        demoMode
+      });
+    }
+    state = { schemaVersion: 1, generation: state.generation + 1, appliedAt: new Date().toISOString(), servers: desired };
+    health = {
+      checkedAt: state.appliedAt,
+      servers: desired.map((server) => ({ name: server.name, status: 'configured', error: null }))
+    };
+    await persist();
+    return publicState(state, capabilities, health);
+  }
+
+  async function inspect({ probe = false } = {}) {
+    await ready;
+    if (probe && adapterId === 'opencode' && !demoMode && typeof run === 'function') {
+      const resolved = resolveServers(state.servers, environment, { requireSecrets: false });
+      const taskEnv = openCodeMcpTaskEnvironment(environment, resolved, { allowedCommands });
+      const result = await run('opencode', ['mcp', 'list'], { env: taskEnv, timeout: 30_000 });
+      health = { checkedAt: new Date().toISOString(), ...parseOpenCodeMcpList(result.output, resolved) };
+      await persist();
+    }
+    return publicState(state, capabilities, health);
+  }
+
+  async function taskContext(baseEnvironment) {
+    await ready;
+    const resolved = resolveServers(state.servers, environment, { requireSecrets: true });
+    if (adapterId === 'claude-code') {
+      const configPath = path.join(configDir, 'claude.json');
+      // Re-render at every task start so a brand-new worker always has a strict
+      // empty file and worker-local secret rotation is reflected immediately.
+      await atomicJson(configPath, renderClaudeMcpConfig(resolved, { workspace, allowedCommands }));
+      return { args: claudeMcpTaskArguments(configPath), env: baseEnvironment };
+    }
+    if (adapterId === 'opencode') {
+      let disableServerNames = [];
+      if (!demoMode) {
+        if (typeof run !== 'function') throw openCodeConfigurationError();
+        const result = await run('opencode', ['debug', 'config', '--pure'], {
+          env: baseEnvironment,
+          cwd: workspace,
+          timeout: 30_000
+        });
+        if (result.code !== 0) throw openCodeConfigurationError();
+        disableServerNames = openCodeServerNames(result.output);
+      }
+      return {
+        args: [],
+        env: openCodeMcpTaskEnvironment(baseEnvironment, resolved, { allowedCommands, disableServerNames })
+      };
+    }
+    return { args: [], env: baseEnvironment };
+  }
+
+  async function observe(event) {
+    if (adapterId !== 'claude-code') return;
+    const observation = observeClaudeMcpInit(event);
+    if (!observation) return;
+    health = { checkedAt: observation.observedAt, servers: observation.servers, errors: observation.errors };
+    await persist();
+  }
+
+  return { capabilities, validate, apply, inspect, taskContext, observe };
+}

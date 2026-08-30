@@ -1,4 +1,5 @@
 import { normalizeTokenUsage } from '../protocol.mjs';
+import { codexMcpCapabilities } from './codex-mcp.mjs';
 
 export const codexAdapterManifest = Object.freeze({
   id: 'codex-cli',
@@ -7,6 +8,7 @@ export const codexAdapterManifest = Object.freeze({
   capabilities: {
     authentication: { methods: ['device_code'], refresh: true },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    mcp: codexMcpCapabilities,
     usage: { requestTokens: true, accountActivity: true, quotaWindows: true },
     workspace: { list: true }
   }

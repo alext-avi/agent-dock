@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=5">
+    <link rel="stylesheet" href="/styles.css?v=6">
   </head>
   <body>
     <header class="topbar">
@@ -186,9 +186,15 @@
         <section id="tools-panel" class="tab-panel hidden" role="tabpanel" data-panel="tools">
           <div class="capability-grid">
             <article class="panel capability-card">
-              <div class="panel-heading"><div><p class="kicker">CONNECTIONS</p><h2>MCP servers</h2></div><span class="pill neutral">0 connected</span></div>
-              <div class="empty-capability"><span class="empty-icon">⌁</span><h3>No MCP servers attached</h3><p>Connectors will give this agent scoped access to services and their tools without baking credentials into the container.</p></div>
-              <button class="button secondary" disabled>Add MCP server · next iteration</button>
+              <div class="panel-heading"><div><p class="kicker">CONNECTIONS</p><h2>MCP servers</h2></div><span id="mcp-count" class="pill neutral">checking</span></div>
+              <p class="capability-copy">One definition format is translated inside the isolated worker for Codex, Claude Code, or OpenCode. Secret fields reference worker environment variables; credentials never return to this page.</p>
+              <div class="mcp-toolbar">
+                <select id="mcp-library" aria-label="Available MCP server definitions"><option value="">No unattached definitions</option></select>
+                <button id="attach-mcp" class="button secondary" type="button">Attach existing</button>
+                <button id="new-mcp" class="button primary" type="button">New server</button>
+              </div>
+              <div id="mcp-list" class="mcp-list"><p class="empty">Loading MCP configuration…</p></div>
+              <div class="mcp-footer"><span id="mcp-message" class="run-message" role="status"></span><button id="apply-mcp" class="text-button" type="button">Apply desired state</button></div>
             </article>
             <article class="panel capability-card">
               <div class="panel-heading"><div><p class="kicker">CONTAINER</p><h2>Installed tools</h2></div><span class="pill neutral">base image</span></div>
@@ -265,7 +271,34 @@
       </form>
     </dialog>
 
+    <dialog id="mcp-dialog">
+      <form id="mcp-form" method="dialog">
+        <input id="mcp-definition-id" type="hidden">
+        <div class="dialog-heading"><div><p class="kicker">WORKER CONNECTION</p><h2 id="mcp-dialog-title">New MCP server</h2></div><button id="close-mcp-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
+        <p class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
+        <div class="form-grid">
+          <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="company_docs"></label>
+          <label class="field">Transport<select id="mcp-transport"><option value="http">Remote HTTP</option><option value="stdio">Local stdio process</option></select></label>
+        </div>
+        <section id="mcp-http-fields" class="mcp-transport-fields">
+          <label class="field">Server URL<input id="mcp-url" type="url" placeholder="https://mcp.example.com/mcp"></label>
+          <label class="field">Bearer token worker variable <span>optional reference; value stays in the container</span><input id="mcp-bearer-env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_MCP_TOKEN"></label>
+        </section>
+        <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
+          <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
+          <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
+          <div class="form-grid">
+            <label class="field">Secret target variable <span>optional</span><input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="API_TOKEN"></label>
+            <label class="field">Worker source variable <span>optional</span><input id="mcp-secret-source" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN"></label>
+          </div>
+        </section>
+        <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>
+        <p id="mcp-form-message" class="usage-error hidden"></p>
+        <div class="actions dialog-actions"><button id="delete-mcp-definition" class="button danger hidden" type="button">Delete definition</button><span class="dialog-spacer"></span><button id="cancel-mcp" class="button secondary" type="button">Cancel</button><button id="save-mcp" class="button primary" type="submit">Save and attach</button></div>
+      </form>
+    </dialog>
+
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=6"></script>
+    <script type="module" src="/app.js?v=7"></script>
   </body>
 </html>

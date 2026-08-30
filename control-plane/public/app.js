@@ -29,6 +29,28 @@ const ui = {
   modelPolicyCopy: $('#model-policy-copy'),
   providerStatus: $('#provider-status'),
   providerModels: $('#provider-models'),
+  mcpCount: $('#mcp-count'),
+  mcpLibrary: $('#mcp-library'),
+  mcpList: $('#mcp-list'),
+  mcpMessage: $('#mcp-message'),
+  mcpDialog: $('#mcp-dialog'),
+  mcpForm: $('#mcp-form'),
+  mcpDefinitionId: $('#mcp-definition-id'),
+  mcpDialogTitle: $('#mcp-dialog-title'),
+  mcpName: $('#mcp-name'),
+  mcpTransport: $('#mcp-transport'),
+  mcpHttpFields: $('#mcp-http-fields'),
+  mcpStdioFields: $('#mcp-stdio-fields'),
+  mcpUrl: $('#mcp-url'),
+  mcpBearerEnv: $('#mcp-bearer-env'),
+  mcpCommand: $('#mcp-command'),
+  mcpArgs: $('#mcp-args'),
+  mcpSecretTarget: $('#mcp-secret-target'),
+  mcpSecretSource: $('#mcp-secret-source'),
+  mcpTimeout: $('#mcp-timeout'),
+  mcpFormMessage: $('#mcp-form-message'),
+  saveMcp: $('#save-mcp'),
+  deleteMcpDefinition: $('#delete-mcp-definition'),
   saveAgent: $('#save-agent'),
   saveMessage: $('#save-message'),
   pageAgentName: $('#page-agent-name'),
@@ -106,6 +128,9 @@ let dashboardRefreshInFlight = false;
 let statusRefreshInFlight = false;
 let liveUpdateTimer = null;
 let retainedRuntimes = [];
+let mcpDefinitions = [];
+let mcpBindings = [];
+let mcpRefreshInFlight = false;
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -231,6 +256,7 @@ function selectTab(name, { updateHash = true, focus = false } = {}) {
   for (const panel of ui.tabPanels) panel.classList.toggle('hidden', panel.dataset.panel !== selected);
   if (updateHash) history.replaceState(null, '', `#${selected}`);
   if (focus && selected === 'test') setTimeout(() => ui.prompt.focus(), 100);
+  if (selected === 'tools' && currentAgent) refreshMcp();
 }
 
 function createAgentCard(agent) {
@@ -500,6 +526,278 @@ async function refreshProviders() {
       modelSelection: { supported: currentAgent.adapter === 'opencode' },
       connections: [{ status: 'unavailable', displayName: 'Provider discovery', models: [], error: error.message }]
     });
+  }
+}
+
+function mcpEndpoint(server) {
+  if (server.transport === 'http') return server.url;
+  return [server.command, ...(server.args ?? [])].filter(Boolean).join(' ');
+}
+
+function mcpSecretReferences(server) {
+  return [
+    ...Object.values(server.secretEnvironment ?? {}).map((value) => value.sourceEnv),
+    ...Object.values(server.secretHeaders ?? {}).map((value) => value.sourceEnv)
+  ].filter(Boolean);
+}
+
+function renderMcpLibrary() {
+  const bound = new Set(mcpBindings.map((binding) => binding.serverId));
+  const available = mcpDefinitions.filter((server) => !bound.has(server.id));
+  ui.mcpLibrary.replaceChildren();
+  if (!available.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No unattached definitions';
+    ui.mcpLibrary.append(option);
+  } else {
+    for (const server of available) {
+      const option = document.createElement('option');
+      option.value = server.id;
+      option.textContent = `${server.name} · ${server.transport}`;
+      ui.mcpLibrary.append(option);
+    }
+  }
+  $('#attach-mcp').disabled = !available.length;
+}
+
+function bindingHealth(binding, runtime = {}) {
+  const health = runtime.mcp?.health?.servers?.find((item) => item.name === binding.server.name);
+  if (health?.status) return health.status;
+  return binding.state || 'pending';
+}
+
+function renderMcp(result, definitions) {
+  mcpDefinitions = definitions;
+  mcpBindings = result.bindings ?? [];
+  const runtime = result.runtime ?? {};
+  ui.mcpCount.textContent = `${mcpBindings.length} attached`;
+  ui.mcpCount.className = `pill ${mcpBindings.some((binding) => binding.state === 'error') ? 'error' : mcpBindings.length ? 'ready' : 'neutral'}`;
+  ui.mcpList.replaceChildren();
+  if (!mcpBindings.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-capability compact';
+    empty.innerHTML = '<span class="empty-icon">⌁</span><h3>No MCP servers attached</h3><p>Create a remote or allowlisted local server, or attach a reusable definition from the control-plane library.</p>';
+    ui.mcpList.append(empty);
+  }
+  for (const binding of mcpBindings) {
+    const server = binding.server;
+    const row = document.createElement('article');
+    row.className = 'mcp-row';
+    const heading = document.createElement('div');
+    heading.className = 'mcp-row-heading';
+    const identity = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = server.name;
+    const transport = document.createElement('small');
+    transport.textContent = `${server.transport === 'http' ? 'remote HTTP' : 'local stdio'} · ${bindingHealth(binding, runtime).replaceAll('_', ' ')}`;
+    identity.append(name, transport);
+    const status = document.createElement('span');
+    status.className = `pill ${binding.state === 'error' ? 'error' : binding.enabled ? 'ready' : 'neutral'}`;
+    status.textContent = binding.enabled ? binding.state : 'disabled';
+    heading.append(identity, status);
+    const endpoint = document.createElement('code');
+    endpoint.className = 'mcp-endpoint';
+    endpoint.textContent = mcpEndpoint(server);
+    const refs = mcpSecretReferences(server);
+    const meta = document.createElement('p');
+    meta.className = 'mcp-meta';
+    meta.textContent = refs.length
+      ? `Worker secret reference${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`
+      : `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+    const actions = document.createElement('div');
+    actions.className = 'mcp-row-actions';
+    const validate = document.createElement('button');
+    validate.className = 'text-button';
+    validate.type = 'button';
+    validate.textContent = 'Validate';
+    validate.addEventListener('click', () => validateMcp(server.id));
+    const edit = document.createElement('button');
+    edit.className = 'text-button';
+    edit.type = 'button';
+    edit.textContent = 'Edit';
+    edit.addEventListener('click', () => openMcpDialog(server));
+    const detach = document.createElement('button');
+    detach.className = 'text-button danger-text';
+    detach.type = 'button';
+    detach.textContent = 'Detach';
+    detach.addEventListener('click', () => detachMcp(server));
+    actions.append(validate, edit, detach);
+    row.append(heading, endpoint, meta, actions);
+    if (binding.error) {
+      const error = document.createElement('p');
+      error.className = 'usage-error';
+      error.textContent = binding.error;
+      row.append(error);
+    }
+    ui.mcpList.append(row);
+  }
+  renderMcpLibrary();
+  if (runtime.unavailable) ui.mcpMessage.textContent = `Desired state is available; worker inspection failed: ${runtime.error}`;
+}
+
+async function refreshMcp() {
+  if (!currentAgent || mcpRefreshInFlight) return;
+  mcpRefreshInFlight = true;
+  try {
+    const [agentMcp, library] = await Promise.all([
+      api(agentApi('mcp')),
+      api(`${API_ROOT}/mcp/servers`)
+    ]);
+    renderMcp(agentMcp, library.servers ?? []);
+  } catch (error) {
+    ui.mcpMessage.textContent = error.message;
+    ui.mcpCount.textContent = 'unavailable';
+    ui.mcpCount.className = 'pill error';
+  } finally {
+    mcpRefreshInFlight = false;
+  }
+}
+
+function syncMcpTransportFields() {
+  const http = ui.mcpTransport.value === 'http';
+  ui.mcpHttpFields.classList.toggle('hidden', !http);
+  ui.mcpStdioFields.classList.toggle('hidden', http);
+  ui.mcpUrl.required = http;
+  ui.mcpCommand.required = !http;
+}
+
+function openMcpDialog(server = null) {
+  ui.mcpForm.reset();
+  ui.mcpDefinitionId.value = server?.id ?? '';
+  ui.mcpDialogTitle.textContent = server ? `Edit ${server.name}` : 'New MCP server';
+  ui.mcpName.value = server?.name ?? '';
+  ui.mcpTransport.value = server?.transport ?? 'http';
+  ui.mcpUrl.value = server?.url ?? '';
+  ui.mcpCommand.value = server?.command ?? '';
+  ui.mcpArgs.value = (server?.args ?? []).join('\n');
+  ui.mcpTimeout.value = String(Math.round((server?.timeoutMs ?? 30_000) / 1000));
+  const bearer = Object.entries(server?.secretHeaders ?? {}).find(([header, value]) => header.toLowerCase() === 'authorization' && value.prefix === 'Bearer ');
+  ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
+  const environment = Object.entries(server?.secretEnvironment ?? {})[0];
+  ui.mcpSecretTarget.value = environment?.[0] ?? '';
+  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+  ui.mcpFormMessage.textContent = '';
+  ui.mcpFormMessage.classList.add('hidden');
+  ui.deleteMcpDefinition.classList.toggle('hidden', !server);
+  ui.saveMcp.textContent = server ? 'Save and apply' : 'Save and attach';
+  syncMcpTransportFields();
+  ui.mcpDialog.showModal();
+}
+
+function mcpFormPayload() {
+  const transport = ui.mcpTransport.value;
+  const sourceEnv = ui.mcpSecretSource.value.trim();
+  const targetEnv = ui.mcpSecretTarget.value.trim();
+  if ((sourceEnv && !targetEnv) || (!sourceEnv && targetEnv)) throw new Error('Both stdio secret variable fields are required when either is set.');
+  const bearer = ui.mcpBearerEnv.value.trim();
+  return {
+    name: ui.mcpName.value.trim(),
+    transport,
+    command: transport === 'stdio' ? ui.mcpCommand.value.trim() : null,
+    args: transport === 'stdio' ? ui.mcpArgs.value.split('\n').map((value) => value.trim()).filter(Boolean) : [],
+    cwd: null,
+    url: transport === 'http' ? ui.mcpUrl.value.trim() : null,
+    environment: {},
+    secretEnvironment: transport === 'stdio' && sourceEnv ? { [targetEnv]: { sourceEnv } } : {},
+    headers: {},
+    secretHeaders: transport === 'http' && bearer ? { Authorization: { sourceEnv: bearer, prefix: 'Bearer ' } } : {},
+    timeoutMs: Number(ui.mcpTimeout.value) * 1000
+  };
+}
+
+async function applyMcp() {
+  ui.mcpMessage.textContent = 'Applying desired MCP state inside the worker…';
+  try {
+    await api(agentApi('mcp/apply'), { method: 'POST', body: '{}' });
+    ui.mcpMessage.textContent = 'Applied. New tasks will use this configuration.';
+  } catch (error) {
+    ui.mcpMessage.textContent = error.message;
+  } finally {
+    await refreshMcp();
+  }
+}
+
+async function saveMcpDefinition(event) {
+  event.preventDefault();
+  ui.saveMcp.disabled = true;
+  ui.mcpFormMessage.classList.add('hidden');
+  try {
+    const payload = mcpFormPayload();
+    const id = ui.mcpDefinitionId.value;
+    const result = await api(id ? `${API_ROOT}/mcp/servers/${encodeURIComponent(id)}` : `${API_ROOT}/mcp/servers`, {
+      method: id ? 'PATCH' : 'POST',
+      body: JSON.stringify(payload)
+    });
+    const server = result.server;
+    if (!id) {
+      await api(agentApi('mcp/bindings'), {
+        method: 'POST',
+        body: JSON.stringify({ serverId: server.id, apply: false })
+      });
+    }
+    ui.mcpDialog.close();
+    await refreshMcp();
+    await applyMcp();
+  } catch (error) {
+    ui.mcpFormMessage.textContent = error.message;
+    ui.mcpFormMessage.classList.remove('hidden');
+  } finally {
+    ui.saveMcp.disabled = false;
+  }
+}
+
+async function attachExistingMcp() {
+  const serverId = ui.mcpLibrary.value;
+  if (!serverId) return;
+  ui.mcpMessage.textContent = 'Attaching definition…';
+  try {
+    await api(agentApi('mcp/bindings'), { method: 'POST', body: JSON.stringify({ serverId, apply: false }) });
+    await applyMcp();
+  } catch (error) {
+    ui.mcpMessage.textContent = error.message;
+    await refreshMcp();
+  }
+}
+
+async function validateMcp(serverId) {
+  ui.mcpMessage.textContent = 'Validating against this worker harness and command policy…';
+  try {
+    const result = await api(agentApi('mcp/validate'), { method: 'POST', body: JSON.stringify({ serverId }) });
+    const warnings = result.mcp?.validation?.warnings?.length ?? 0;
+    ui.mcpMessage.textContent = `Valid for ${adapterLabel(currentAgent.adapter)}${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}.`;
+  } catch (error) {
+    ui.mcpMessage.textContent = error.message;
+  }
+}
+
+async function detachMcp(server) {
+  if (!window.confirm(`Detach ${server.name} from ${currentAgent.name}?`)) return;
+  ui.mcpMessage.textContent = `Detaching ${server.name}…`;
+  try {
+    await api(agentApi(`mcp/bindings/${encodeURIComponent(server.id)}`), { method: 'DELETE' });
+    ui.mcpMessage.textContent = `${server.name} detached and desired state reapplied.`;
+  } catch (error) {
+    ui.mcpMessage.textContent = error.message;
+  } finally {
+    await refreshMcp();
+  }
+}
+
+async function deleteMcpDefinition() {
+  const serverId = ui.mcpDefinitionId.value;
+  const server = mcpDefinitions.find((item) => item.id === serverId);
+  if (!server || !window.confirm(`Delete the reusable MCP definition ${server.name}? It must not be attached to another agent.`)) return;
+  try {
+    const attachedHere = mcpBindings.some((binding) => binding.serverId === serverId);
+    if (attachedHere) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
+    await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
+    ui.mcpDialog.close();
+    ui.mcpMessage.textContent = `${server.name} deleted.`;
+    await refreshMcp();
+  } catch (error) {
+    ui.mcpFormMessage.textContent = error.message;
+    ui.mcpFormMessage.classList.remove('hidden');
   }
 }
 
@@ -817,6 +1115,11 @@ async function refreshStatus() {
   }
 }
 
+async function refreshAgentLive() {
+  await refreshStatus();
+  if (location.hash === '#tools') await refreshMcp();
+}
+
 async function startAuth() {
   ui.authButton.disabled = true;
   ui.runtimeDetails.open = true;
@@ -1003,7 +1306,7 @@ async function runTask() {
   } finally {
     running = false;
     ui.cancelButton.classList.add('hidden');
-    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders()]);
+    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders(), refreshMcp()]);
   }
 }
 
@@ -1028,8 +1331,8 @@ async function loadAgent(id) {
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;
     selectTab(location.hash.slice(1), { updateHash: false });
-    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders()]);
-    startLiveUpdates(refreshStatus);
+    await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders(), refreshMcp()]);
+    startLiveUpdates(refreshAgentLive);
   } catch (error) {
     setConnection('offline', error.message);
     ui.pageAgentName.textContent = 'Agent unavailable';
@@ -1045,6 +1348,14 @@ $('#empty-new-agent').addEventListener('click', openCreateDialog);
 $('#close-agent-dialog').addEventListener('click', () => ui.createDialog.close());
 $('#cancel-create').addEventListener('click', () => ui.createDialog.close());
 ui.configForm.addEventListener('submit', saveAgent);
+ui.mcpForm.addEventListener('submit', saveMcpDefinition);
+ui.mcpTransport.addEventListener('change', syncMcpTransportFields);
+$('#new-mcp').addEventListener('click', () => openMcpDialog());
+$('#attach-mcp').addEventListener('click', attachExistingMcp);
+$('#apply-mcp').addEventListener('click', applyMcp);
+$('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
+$('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
+ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
 ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
 });

@@ -11,6 +11,9 @@ Current protocol version: `agent-wrapper/v1`.
 | `GET` | `/v1/health` | Unauthenticated liveness and adapter identity |
 | `GET` | `/v1/status` | Agent, capability, authentication, task, execution, and cached usage state |
 | `GET` | `/v1/providers` | Safe provider-connection health and model discovery metadata |
+| `GET` | `/v1/mcp` | Read the canonical managed MCP payload, generation, capabilities, and sanitized health |
+| `POST` | `/v1/mcp/validate` | Validate a canonical MCP payload against adapter and worker policy without executing it |
+| `PUT` | `/v1/mcp` | Atomically replace the worker's complete managed MCP desired state |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
 | `POST` | `/v1/auth/complete` | Submit a provider-issued one-time browser authorization code when the adapter requires it |
 | `POST` | `/v1/auth/refresh` | Ask the adapter to refresh or validate its managed session |
@@ -25,6 +28,8 @@ Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. 
 `modelPolicy` is provider-neutral: `mode` is `provider-default` or `pinned`, and a pinned policy includes a canonical `primary` model ID such as `ollama/gpt-oss:20b`. `fallbacks` and `externalFallback` are reserved policy fields, but the current wrapper rejects automatic fallback rather than silently changing providers. The control plane injects the saved policy and ignores task-level overrides from browser clients.
 
 `GET /v1/providers` returns `connections[]` with a stable ID, type, display name, coarse location, credential mode, health, last-check time, and discoverable `models[]`. It must not return credentials or private connection URLs. For Ollama, the model data may include context length, capabilities, family, parameter size, and quantization.
+
+MCP management uses one round-trippable `servers[]` DTO in both directions; provider configuration is never used as the control-plane data model. See [`mcp-contract.md`](./mcp-contract.md). Secret fields contain worker-environment references, not values.
 
 ## Status model
 
@@ -95,8 +100,9 @@ A new adapter must implement the following behaviors behind the wrapper:
 8. Cancel the active provider process.
 9. Normalize request usage, quota windows, and account activity only where the provider exposes them.
 10. Keep provider credential files, raw auth responses, raw tokens, and private connection URLs inside the worker boundary.
+11. Validate, apply, inspect, and activate the canonical MCP desired state without returning resolved connector secrets.
 
-The Codex and Claude Code translators live in `worker/adapters/codex.mjs` and `worker/adapters/claude.mjs`. Both satisfy this contract; the control plane does not branch on provider-specific event or credential formats.
+The Codex, Claude Code, and OpenCode translators live under `worker/adapters/`. All satisfy this contract; the control plane does not branch on provider-specific event, credential, or MCP configuration formats.
 
 ## Compatibility
 

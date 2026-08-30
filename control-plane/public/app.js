@@ -1,3 +1,12 @@
+import {
+  buildMcpWorkshopPrompt,
+  createWorkshopRunState,
+  extractMcpWorkshopProposal,
+  mergeMcpQuickEdit,
+  observeWorkshopRunEvent,
+  requireSuccessfulWorkshopRun
+} from './mcp-workshop.js';
+
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
@@ -5,12 +14,25 @@ const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 
 const ui = {
   dashboardView: $('#dashboard-view'),
+  registryView: $('#registry-view'),
   agentView: $('#agent-view'),
   connectionDot: $('#connection-dot'),
   connectionLabel: $('#connection-label'),
   agentGrid: $('#agent-grid'),
   emptyFleet: $('#empty-fleet'),
   agentCount: $('#agent-count'),
+  registryCount: $('#registry-count'),
+  registryList: $('#registry-list'),
+  registryMessage: $('#registry-message'),
+  workshopAgent: $('#workshop-agent'),
+  workshopObjective: $('#workshop-objective'),
+  runWorkshop: $('#run-workshop'),
+  cancelWorkshop: $('#cancel-workshop'),
+  workshopStatus: $('#workshop-status'),
+  workshopConversation: $('#workshop-conversation'),
+  workshopProposal: $('#workshop-proposal'),
+  workshopValidation: $('#workshop-validation'),
+  reviewWorkshopProposal: $('#review-workshop-proposal'),
   createDialog: $('#create-agent-dialog'),
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
@@ -36,6 +58,7 @@ const ui = {
   mcpForm: $('#mcp-form'),
   mcpDefinitionId: $('#mcp-definition-id'),
   mcpDialogTitle: $('#mcp-dialog-title'),
+  mcpDialogCopy: $('#mcp-dialog-copy'),
   mcpName: $('#mcp-name'),
   mcpTransport: $('#mcp-transport'),
   mcpHttpFields: $('#mcp-http-fields'),
@@ -48,6 +71,8 @@ const ui = {
   mcpSecretSource: $('#mcp-secret-source'),
   mcpTimeout: $('#mcp-timeout'),
   mcpFormMessage: $('#mcp-form-message'),
+  mcpCanonicalDetails: $('#mcp-canonical-details'),
+  mcpCanonicalPreview: $('#mcp-canonical-preview'),
   saveMcp: $('#save-mcp'),
   deleteMcpDefinition: $('#delete-mcp-definition'),
   saveAgent: $('#save-agent'),
@@ -130,6 +155,12 @@ let retainedRuntimes = [];
 let mcpDefinitions = [];
 let mcpBindings = [];
 let mcpRefreshInFlight = false;
+let workshopRunning = false;
+let workshopActiveAgentId = null;
+let workshopAssistantText = '';
+let workshopDraft = null;
+let workshopRunState = createWorkshopRunState();
+let mcpDialogBase = {};
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -149,6 +180,10 @@ async function api(path, options = {}) {
 
 function agentApi(operation = '') {
   return `${API_ROOT}/agents/${encodeURIComponent(currentAgent.id)}${operation ? `/${operation}` : ''}`;
+}
+
+function agentEndpoint(agentId, operation = '') {
+  return `${API_ROOT}/agents/${encodeURIComponent(agentId)}${operation ? `/${operation}` : ''}`;
 }
 
 function adapterLabel(adapter) {
@@ -353,6 +388,7 @@ function markAgentCardOffline(card, message) {
 
 async function loadDashboard() {
   ui.dashboardView.classList.remove('hidden');
+  ui.registryView.classList.add('hidden');
   ui.agentView.classList.add('hidden');
   document.title = 'Agent Dock — Fleet';
   try {
@@ -531,6 +567,233 @@ function mcpSecretReferences(server) {
   ].filter(Boolean);
 }
 
+function createRegistryRow(server) {
+  const row = document.createElement('article');
+  row.className = 'registry-row';
+  const heading = document.createElement('div');
+  heading.className = 'registry-row-heading';
+  const identity = document.createElement('div');
+  const name = document.createElement('strong');
+  name.textContent = server.name;
+  const transport = document.createElement('small');
+  transport.textContent = server.transport === 'http' ? 'remote HTTP' : 'local stdio';
+  identity.append(name, transport);
+  const state = document.createElement('span');
+  state.className = 'pill ready';
+  state.textContent = 'operator saved';
+  heading.append(identity, state);
+  const endpoint = document.createElement('code');
+  endpoint.className = 'mcp-endpoint';
+  endpoint.textContent = mcpEndpoint(server);
+  const references = mcpSecretReferences(server);
+  const meta = document.createElement('p');
+  meta.className = 'mcp-meta';
+  meta.textContent = `${references.length ? `Worker references: ${references.join(', ')}` : 'No credential references'} · ${Math.round(server.timeoutMs / 1000)}s timeout · updated ${relativeTime(server.updatedAt)}`;
+  const actions = document.createElement('div');
+  actions.className = 'registry-row-actions';
+  const edit = document.createElement('button');
+  edit.className = 'text-button';
+  edit.type = 'button';
+  edit.textContent = 'Edit definition';
+  edit.addEventListener('click', () => openMcpDialog(server));
+  const attach = document.createElement('a');
+  attach.className = 'text-button configure-link';
+  attach.href = '/';
+  attach.textContent = 'Choose agent';
+  actions.append(edit, attach);
+  row.append(heading, endpoint, meta, actions);
+  return row;
+}
+
+function renderRegistryDefinitions(definitions) {
+  mcpDefinitions = definitions;
+  ui.registryCount.textContent = String(definitions.length).padStart(2, '0');
+  ui.registryList.replaceChildren();
+  if (!definitions.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-capability compact';
+    empty.innerHTML = '<span class="empty-icon">⌁</span><h3>No saved definitions</h3><p>Ask a harness to investigate a connector, or create the canonical definition manually.</p>';
+    ui.registryList.append(empty);
+    return;
+  }
+  for (const server of definitions) ui.registryList.append(createRegistryRow(server));
+}
+
+async function refreshRegistry() {
+  const result = await api(`${API_ROOT}/mcp/servers`);
+  renderRegistryDefinitions(result.servers ?? []);
+}
+
+async function populateWorkshopAgents(agents) {
+  const statuses = await Promise.all(agents.map(async (agent) => {
+    try {
+      return { agent, status: await api(agentEndpoint(agent.id, 'status'), { signal: AbortSignal.timeout(4000) }) };
+    } catch (error) {
+      return { agent, status: null, error };
+    }
+  }));
+  ui.workshopAgent.replaceChildren();
+  let preferred = '';
+  let available = '';
+  for (const entry of statuses) {
+    const option = document.createElement('option');
+    option.value = entry.agent.id;
+    const authenticated = entry.status?.authentication?.authenticated === true;
+    const busy = Boolean(entry.status?.task?.active);
+    const state = busy ? 'busy' : authenticated ? 'connected' : entry.status ? 'needs auth' : 'offline';
+    option.textContent = `${entry.agent.name} · ${adapterLabel(entry.agent.adapter)} · ${state}`;
+    option.disabled = busy || !entry.status;
+    if (!available && !option.disabled) available = entry.agent.id;
+    if (!preferred && authenticated && !busy) preferred = entry.agent.id;
+    ui.workshopAgent.append(option);
+  }
+  if (!statuses.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No agents available';
+    ui.workshopAgent.append(option);
+  }
+  ui.workshopAgent.value = preferred || available;
+  ui.runWorkshop.disabled = !ui.workshopAgent.value;
+}
+
+function appendWorkshopLine(kind, text) {
+  const row = document.createElement('div');
+  row.className = `event-line ${kind}`;
+  const type = document.createElement('span');
+  type.className = 'event-type';
+  type.textContent = kind;
+  row.append(type, document.createTextNode(text));
+  ui.workshopConversation.append(row);
+  ui.workshopConversation.scrollTop = ui.workshopConversation.scrollHeight;
+}
+
+function appendWorkshopEvent(event) {
+  observeWorkshopRunEvent(workshopRunState, event);
+  if (event.type === 'message.completed' && typeof event.data?.text === 'string') workshopAssistantText += `${event.data.text}\n`;
+  const display = eventText(event);
+  if (display) appendWorkshopLine(display.kind, display.text);
+}
+
+async function validateWorkshopDraft(agentId, proposal, warnings) {
+  try {
+    const result = await api(agentEndpoint(agentId, 'mcp/validate'), {
+      method: 'POST',
+      body: JSON.stringify({ server: proposal })
+    });
+    const adapterWarnings = result.mcp?.validation?.warnings?.length ?? 0;
+    const notes = [...warnings, ...(adapterWarnings ? [`Harness returned ${adapterWarnings} validation warning${adapterWarnings === 1 ? '' : 's'}.`] : [])];
+    ui.workshopValidation.textContent = notes.length
+      ? `Structurally valid for the selected harness. ${notes.join(' ')}`
+      : 'Structurally valid for the selected harness; connection still requires an operator test.';
+  } catch (error) {
+    ui.workshopValidation.textContent = `Proposal needs operator adjustment: ${error.message}`;
+  }
+}
+
+async function runWorkshop() {
+  if (workshopRunning) return;
+  const agentId = ui.workshopAgent.value;
+  const objective = ui.workshopObjective.value.trim();
+  if (!agentId || !objective) {
+    ui.workshopStatus.textContent = !agentId ? 'Choose an available harness.' : 'Describe the connector first.';
+    return;
+  }
+  let prompt;
+  try { prompt = buildMcpWorkshopPrompt(objective); }
+  catch (error) { ui.workshopStatus.textContent = error.message; return; }
+
+  workshopRunning = true;
+  workshopActiveAgentId = agentId;
+  workshopAssistantText = '';
+  workshopDraft = null;
+  workshopRunState = createWorkshopRunState();
+  ui.runWorkshop.disabled = true;
+  ui.cancelWorkshop.classList.remove('hidden');
+  ui.workshopProposal.classList.add('hidden');
+  ui.workshopConversation.replaceChildren();
+  appendWorkshopLine('user', objective);
+  ui.workshopStatus.textContent = 'Opening harness stream…';
+  try {
+    const response = await fetch(agentEndpoint(agentId, 'tasks'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    });
+    if (!response.ok || !response.body) {
+      const error = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(error.error ?? `HTTP ${response.status}`);
+    }
+    ui.workshopStatus.textContent = 'Harness investigating…';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { appendWorkshopEvent(JSON.parse(line)); }
+        catch { appendWorkshopEvent({ type: 'log', data: { level: 'info', message: line } }); }
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) {
+      try { appendWorkshopEvent(JSON.parse(buffer)); }
+      catch { appendWorkshopEvent({ type: 'log', data: { level: 'info', message: buffer } }); }
+    }
+    requireSuccessfulWorkshopRun(workshopRunState);
+    const extracted = extractMcpWorkshopProposal(workshopAssistantText);
+    workshopDraft = extracted.proposal;
+    ui.workshopProposal.classList.remove('hidden');
+    ui.workshopStatus.textContent = 'Proposal ready for review';
+    await validateWorkshopDraft(agentId, extracted.proposal, extracted.warnings);
+  } catch (error) {
+    appendWorkshopLine('error', error.message);
+    ui.workshopStatus.textContent = error.message;
+  } finally {
+    workshopRunning = false;
+    workshopActiveAgentId = null;
+    ui.runWorkshop.disabled = !ui.workshopAgent.value;
+    ui.cancelWorkshop.classList.add('hidden');
+  }
+}
+
+async function cancelWorkshop() {
+  if (!workshopActiveAgentId) return;
+  ui.cancelWorkshop.disabled = true;
+  try {
+    await api(agentEndpoint(workshopActiveAgentId, 'tasks/cancel'), { method: 'POST', body: '{}' });
+    ui.workshopStatus.textContent = 'Cancelling…';
+  } catch (error) {
+    ui.workshopStatus.textContent = error.message;
+  } finally {
+    ui.cancelWorkshop.disabled = false;
+  }
+}
+
+async function loadRegistry() {
+  currentAgent = null;
+  ui.dashboardView.classList.add('hidden');
+  ui.agentView.classList.add('hidden');
+  ui.registryView.classList.remove('hidden');
+  document.title = 'MCP Registry — Agent Dock';
+  try {
+    const [library, fleet] = await Promise.all([
+      api(`${API_ROOT}/mcp/servers`),
+      api(`${API_ROOT}/agents`)
+    ]);
+    renderRegistryDefinitions(library.servers ?? []);
+    await populateWorkshopAgents(fleet.agents ?? []);
+    setConnection('online', 'MCP registry online');
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.registryMessage.textContent = error.message;
+  }
+}
+
 function renderMcpLibrary() {
   const bound = new Set(mcpBindings.map((binding) => binding.serverId));
   const available = mcpDefinitions.filter((server) => !bound.has(server.id));
@@ -652,10 +915,17 @@ function syncMcpTransportFields() {
   ui.mcpCommand.required = !http;
 }
 
-function openMcpDialog(server = null) {
+function openMcpDialog(server = null, { proposal = false } = {}) {
+  const editing = Boolean(server?.id);
+  mcpDialogBase = server ? JSON.parse(JSON.stringify(server)) : {};
   ui.mcpForm.reset();
-  ui.mcpDefinitionId.value = server?.id ?? '';
-  ui.mcpDialogTitle.textContent = server ? `Edit ${server.name}` : 'New MCP server';
+  ui.mcpDefinitionId.value = editing ? server.id : '';
+  ui.mcpDialogTitle.textContent = proposal ? 'Review harness proposal' : editing ? `Edit ${server.name}` : 'New MCP server';
+  ui.mcpDialogCopy.textContent = proposal
+    ? 'The harness drafted this credential-free payload. Review every field before saving it to the operator-controlled registry.'
+    : currentAgent
+      ? 'This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.'
+      : 'This reusable canonical definition is stored by the control plane. Attach and apply it from an individual agent page.';
   ui.mcpName.value = server?.name ?? '';
   ui.mcpTransport.value = server?.transport ?? 'http';
   ui.mcpUrl.value = server?.url ?? '';
@@ -666,12 +936,23 @@ function openMcpDialog(server = null) {
   ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
   const environment = Object.entries(server?.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
-  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+  ui.mcpSecretSource.value = typeof environment?.[1] === 'string' ? environment[1] : environment?.[1]?.sourceEnv ?? '';
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
-  ui.deleteMcpDefinition.classList.toggle('hidden', !server);
-  ui.saveMcp.textContent = server ? 'Save and apply' : 'Save and attach';
+  ui.deleteMcpDefinition.classList.toggle('hidden', !editing);
+  ui.saveMcp.textContent = currentAgent
+    ? editing ? 'Save and apply' : 'Save and attach'
+    : editing ? 'Save definition' : 'Save to registry';
   syncMcpTransportFields();
+  const hasExtendedFields = Boolean(
+    server?.cwd
+    || Object.keys(server?.environment ?? {}).length
+    || Object.keys(server?.headers ?? {}).length
+    || Object.keys(server?.secretEnvironment ?? {}).length > 1
+    || Object.keys(server?.secretHeaders ?? {}).some((header) => header.toLowerCase() !== 'authorization')
+  );
+  ui.mcpCanonicalDetails.open = proposal || hasExtendedFields;
+  syncMcpCanonicalPreview();
   ui.mcpDialog.showModal();
 }
 
@@ -680,20 +961,25 @@ function mcpFormPayload() {
   const sourceEnv = ui.mcpSecretSource.value.trim();
   const targetEnv = ui.mcpSecretTarget.value.trim();
   if ((sourceEnv && !targetEnv) || (!sourceEnv && targetEnv)) throw new Error('Both stdio secret variable fields are required when either is set.');
-  const bearer = ui.mcpBearerEnv.value.trim();
-  return {
+  return mergeMcpQuickEdit(mcpDialogBase, {
     name: ui.mcpName.value.trim(),
     transport,
     command: transport === 'stdio' ? ui.mcpCommand.value.trim() : null,
     args: transport === 'stdio' ? ui.mcpArgs.value.split('\n').map((value) => value.trim()).filter(Boolean) : [],
-    cwd: null,
     url: transport === 'http' ? ui.mcpUrl.value.trim() : null,
-    environment: {},
-    secretEnvironment: transport === 'stdio' && sourceEnv ? { [targetEnv]: { sourceEnv } } : {},
-    headers: {},
-    secretHeaders: transport === 'http' && bearer ? { Authorization: { sourceEnv: bearer, prefix: 'Bearer ' } } : {},
+    secretTarget: targetEnv,
+    secretSource: sourceEnv,
+    bearerEnv: ui.mcpBearerEnv.value.trim(),
     timeoutMs: Number(ui.mcpTimeout.value) * 1000
-  };
+  });
+}
+
+function syncMcpCanonicalPreview() {
+  try {
+    ui.mcpCanonicalPreview.textContent = JSON.stringify(mcpFormPayload(), null, 2);
+  } catch (error) {
+    ui.mcpCanonicalPreview.textContent = error.message;
+  }
 }
 
 async function applyMcp() {
@@ -720,15 +1006,24 @@ async function saveMcpDefinition(event) {
       body: JSON.stringify(payload)
     });
     const server = result.server;
-    if (!id) {
+    if (!id && currentAgent) {
       await api(agentApi('mcp/bindings'), {
         method: 'POST',
         body: JSON.stringify({ serverId: server.id, apply: false })
       });
     }
     ui.mcpDialog.close();
-    await refreshMcp();
-    await applyMcp();
+    if (currentAgent) {
+      await refreshMcp();
+      await applyMcp();
+    } else {
+      await refreshRegistry();
+      ui.registryMessage.textContent = `${server.name} saved to the registry. Attach it from an agent page when ready.`;
+      if (!id && workshopDraft?.name === server.name) {
+        workshopDraft = null;
+        ui.workshopProposal.classList.add('hidden');
+      }
+    }
   } catch (error) {
     ui.mcpFormMessage.textContent = error.message;
     ui.mcpFormMessage.classList.remove('hidden');
@@ -779,12 +1074,17 @@ async function deleteMcpDefinition() {
   const server = mcpDefinitions.find((item) => item.id === serverId);
   if (!server || !window.confirm(`Delete the reusable MCP definition ${server.name}? It must not be attached to another agent.`)) return;
   try {
-    const attachedHere = mcpBindings.some((binding) => binding.serverId === serverId);
+    const attachedHere = currentAgent && mcpBindings.some((binding) => binding.serverId === serverId);
     if (attachedHere) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
     await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
     ui.mcpDialog.close();
-    ui.mcpMessage.textContent = `${server.name} deleted.`;
-    await refreshMcp();
+    if (currentAgent) {
+      ui.mcpMessage.textContent = `${server.name} deleted.`;
+      await refreshMcp();
+    } else {
+      ui.registryMessage.textContent = `${server.name} deleted from the registry.`;
+      await refreshRegistry();
+    }
   } catch (error) {
     ui.mcpFormMessage.textContent = error.message;
     ui.mcpFormMessage.classList.remove('hidden');
@@ -1271,6 +1571,7 @@ async function cancelRun() {
 async function loadAgent(id) {
   ui.agentView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
+  ui.registryView.classList.add('hidden');
   try {
     const result = await api(`${API_ROOT}/agents/${encodeURIComponent(id)}`);
     currentAgent = result.agent;
@@ -1295,13 +1596,23 @@ $('#close-agent-dialog').addEventListener('click', () => ui.createDialog.close()
 $('#cancel-create').addEventListener('click', () => ui.createDialog.close());
 ui.configForm.addEventListener('submit', saveAgent);
 ui.mcpForm.addEventListener('submit', saveMcpDefinition);
+ui.mcpForm.addEventListener('input', syncMcpCanonicalPreview);
 ui.mcpTransport.addEventListener('change', syncMcpTransportFields);
 $('#new-mcp').addEventListener('click', () => openMcpDialog());
+$('#new-registry-mcp').addEventListener('click', () => openMcpDialog());
 $('#attach-mcp').addEventListener('click', attachExistingMcp);
 $('#apply-mcp').addEventListener('click', applyMcp);
 $('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
 $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
+ui.runWorkshop.addEventListener('click', runWorkshop);
+ui.cancelWorkshop.addEventListener('click', cancelWorkshop);
+ui.reviewWorkshopProposal.addEventListener('click', () => {
+  if (workshopDraft) openMcpDialog(workshopDraft, { proposal: true });
+});
+ui.workshopObjective.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') runWorkshop();
+});
 ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
 });
@@ -1329,4 +1640,5 @@ window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { 
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
+else if (window.location.pathname === '/mcp' || window.location.pathname === '/mcp/') loadRegistry();
 else loadDashboard();

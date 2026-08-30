@@ -74,6 +74,7 @@ flowchart LR
 - OpenCode discovers local Ollama models and can explicitly pin one as `ollama/<model>`. The effective model is included in task-start events and request history. Automatic cross-provider fallback is intentionally disabled.
 - The control plane depends only on the versioned wrapper contract; both provider workers use the same UI and API surface.
 - MCP definition CRUD and per-agent bindings persist in the control plane, while validation, vendor translation, activation, and health remain worker responsibilities. `GET` and `PUT /v1/mcp` round-trip the same `servers[]` DTO.
+- The standalone `/mcp` registry reuses operator-approved definitions across agents. Its workshop can run an existing agent harness to research and draft a credential-free definition, but the harness cannot save, attach, apply, or delete MCP state; review and mutation remain operator UI actions.
 
 The complete system model is available as [Markdown](./docs/architecture.md), [editable Mermaid](./docs/architecture.mmd), and a [standalone SVG](./docs/architecture.svg). The provider boundary is documented in [`docs/adapter-contract.md`](./docs/adapter-contract.md).
 

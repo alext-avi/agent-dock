@@ -15,7 +15,6 @@ const ui = {
   createDialog: $('#create-agent-dialog'),
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
-  createAdapter: $('#create-adapter'),
   createAdapterRadios: $$('#create-adapter input[name="adapter"]'),
   attachRuntimeOption: $('#attach-runtime-option'),
   attachRuntimeRadio: $('#attach-runtime-radio'),
@@ -283,13 +282,22 @@ function updateAgentCard(card, status) {
   pill.className = `pill status-pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
   card.querySelector('.card-auth').textContent = authenticated ? 'connected' : 'required';
   const windows = status.usage?.quotaWindows ?? [];
-  const highest = windows.length ? Math.max(...windows.map((window) => Number(window.usedPercent) || 0)) : null;
-  card.querySelector('.card-usage').textContent = highest === null ? '—' : `${highest.toFixed(0)}% used`;
+  const stale = Boolean(status.usage?.pollErrorKind);
+  // Name the window the headline number came from. The card only draws two bars,
+  // so a bare maximum taken across every window can report a percentage that
+  // nothing visible on the card accounts for.
+  const worst = windows.reduce(
+    (highest, window) => (highest && Number(highest.usedPercent) >= Number(window.usedPercent) ? highest : window),
+    null
+  );
+  card.querySelector('.card-usage').textContent = worst
+    ? `${Number(worst.usedPercent).toFixed(0)}% ${worst.label}${stale ? ' · stale' : ''}`
+    : '—';
   card.querySelector('.card-requests').textContent = formatTokens(status.usage?.totals?.requests ?? 0);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Quota window');
-  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Additional window');
+  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Quota window', stale);
+  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Additional window', stale);
   card.querySelector('.card-update').textContent = `live · ${relativeTime(new Date().toISOString())}`;
 }
 
@@ -299,9 +307,10 @@ function quotaFillClass(used) {
   return '';
 }
 
-function renderCardQuota(row, window, fallbackLabel) {
+function renderCardQuota(row, window, fallbackLabel, stale = false) {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
-  const refresh = quotaRefreshLabel(window?.resetsAt);
+  // A retained reading from before a failed poll has an untrustworthy countdown.
+  const refresh = stale ? 'last known' : quotaRefreshLabel(window?.resetsAt);
   row.querySelector('.card-quota-label').textContent = window
     ? `${quotaWindowLabel(window, fallbackLabel)}${refresh ? ` · ${refresh}` : ''}`
     : fallbackLabel;
@@ -310,6 +319,7 @@ function renderCardQuota(row, window, fallbackLabel) {
   fill.style.width = window ? `${used}%` : '0%';
   fill.className = quotaFillClass(used);
   row.classList.toggle('unavailable', !window);
+  row.classList.toggle('stale', Boolean(window) && stale);
 }
 
 function markAgentCardOffline(card, message) {
@@ -596,7 +606,7 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
   }
 }
 
-function renderQuotaRow(label, window) {
+function renderQuotaRow(label, window, stale = false) {
   const used = Math.max(0, Math.min(100, Number(window?.usedPercent ?? 0)));
   const row = document.createElement('div');
   row.className = 'quota-row';
@@ -612,12 +622,13 @@ function renderQuotaRow(label, window) {
   const value = document.createElement('span');
   value.className = 'quota-value';
   value.textContent = `${used.toFixed(0)}%`;
+  if (stale) row.classList.add('stale');
   const reset = document.createElement('small');
   reset.className = 'quota-reset';
   const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
   const formattedDuration = formatQuotaDuration(window?.windowDurationMinutes);
   const duration = formattedDuration ? `${formattedDuration} window` : 'quota window';
-  reset.textContent = resetDate ? quotaRefreshLabel(window.resetsAt) : duration;
+  reset.textContent = stale ? 'last known reading' : resetDate ? quotaRefreshLabel(window.resetsAt) : duration;
   row.append(name, bar, value, reset);
   return row;
 }
@@ -630,7 +641,8 @@ const POLL_ERROR_COPY = {
   throttled: 'The provider is rate limiting usage polling. Retrying shortly.',
   network: 'The usage source is unreachable.',
   http: 'The usage source returned an error.',
-  malformed: 'The usage source returned an unrecognized response.'
+  malformed: 'The usage source returned an unrecognized response.',
+  provider: 'The harness reported a usage error.'
 };
 
 function quotaUnavailableReason(usage = {}) {
@@ -642,21 +654,26 @@ function quotaUnavailableReason(usage = {}) {
   return 'No quota window reported.';
 }
 
-function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = '') {
+function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = '', stale = false) {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
   const label = ui[`${scope}QuotaLabel`];
   const summary = ui[`${scope}QuotaSummary`];
   const bar = ui[`${scope}QuotaBar`];
   const reset = ui[`${scope}QuotaReset`];
   label.textContent = quotaWindowLabel(window, fallbackLabel);
-  summary.textContent = window ? `${used.toFixed(0)}% used` : 'Unavailable';
+  summary.textContent = window ? `${used.toFixed(0)}% used${stale ? ' · stale' : ''}` : 'Unavailable';
   bar.style.width = window ? `${used}%` : '0%';
   bar.className = quotaFillClass(used);
   // An empty bar reads as "0% used". Mark the track so unavailable looks unavailable.
   bar.parentElement?.classList.toggle('unavailable', !window);
-  reset.textContent = window
-    ? (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable')
-    : unavailableReason;
+  // A retained window from before a failed poll is not a current reading, and its
+  // reset countdown is no longer trustworthy either.
+  bar.parentElement?.classList.toggle('stale', Boolean(window) && stale);
+  reset.textContent = !window
+    ? unavailableReason
+    : stale
+      ? `Last known reading · ${unavailableReason}`
+      : (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable');
 }
 
 function renderUsage(usage = {}) {
@@ -668,15 +685,18 @@ function renderUsage(usage = {}) {
   ui.agentTotalSummary.textContent = formatTokens(totals.totalTokens ?? 0);
   ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
   ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
-  ui.usagePolledAt.textContent = usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  ui.usagePolledAt.textContent = usage.pollErrorKind && usage.lastSuccessAt
+    ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
+    : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
   const reason = quotaUnavailableReason(usage);
+  const stale = Boolean(usage.pollErrorKind);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderRuntimeQuota('primary', primary, 'Quota window', reason);
-  renderRuntimeQuota('secondary', secondary, 'Additional window', reason);
+  renderRuntimeQuota('primary', primary, 'Quota window', reason, stale);
+  renderRuntimeQuota('secondary', secondary, 'Additional window', reason, stale);
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
@@ -691,7 +711,7 @@ function renderUsage(usage = {}) {
     note.textContent = 'Experimental source: this provider publishes no supported usage API, so these windows may stop working without notice.';
     ui.quotaWindows.append(note);
   }
-  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(quotaWindowLabel(window), window));
+  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(window.label ?? quotaWindowLabel(window), window, stale));
 }
 
 function renderStatus(status) {

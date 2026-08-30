@@ -144,6 +144,9 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .quota-bar span { display: block; height: 100%; width: 0; background: var(--acid); border-radius: inherit; transition: width .25s ease; }
 .quota-bar span.warning { background: #ffca62; }
 .quota-bar span.danger { background: var(--danger); }
+/* A retained reading from before a failed poll is real but no longer current. */
+.quota-bar.stale span { opacity: .45; }
+.card-quota-row.stale, .quota-row.stale { opacity: .68; }
 /* An empty bar reads as "0% used". A hatched track reads as "no reading". */
 .quota-bar.unavailable {
   background: repeating-linear-gradient(135deg, #252c28, #252c28 4px, #1b211e 4px, #1b211e 8px);

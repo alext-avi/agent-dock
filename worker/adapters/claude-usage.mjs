@@ -29,6 +29,27 @@ export function claudeCredentialPaths(claudeHome, configDir = null) {
   return [path.join(dir, '.credentials.json')];
 }
 
+// Longest backoff worth honouring. RFC 7231 puts no ceiling on Retry-After, so a
+// buggy proxy or a hostile intermediary can send a value that would otherwise
+// wedge polling effectively forever — and it would survive a restart.
+export const MAX_RETRY_AFTER_SECONDS = 3600;
+
+// Retry-After is either delta-seconds or an HTTP-date. Reading only the numeric
+// form silently shortens a long date-form backoff to the default interval.
+export function retryAfterSeconds(header) {
+  if (typeof header !== 'string' || !header.trim()) return null;
+  const seconds = Number(header.trim());
+  if (Number.isFinite(seconds)) {
+    if (seconds <= 0) return null;
+    return Math.min(seconds, MAX_RETRY_AFTER_SECONDS);
+  }
+  const when = Date.parse(header);
+  if (!Number.isFinite(when)) return null;
+  const delta = Math.ceil((when - Date.now()) / 1000);
+  if (delta <= 0) return null;
+  return Math.min(delta, MAX_RETRY_AFTER_SECONDS);
+}
+
 export class ClaudeUsageError extends Error {
   // kind distinguishes a telemetry-source failure from an exhausted plan.
   // An exhausted plan is a *successful* response with utilization at 100 — it is
@@ -93,6 +114,10 @@ function epochSeconds(value) {
 }
 
 function percentOf(value) {
+  // Number(null) is 0, which would turn "the provider sent no reading" into a
+  // confident 0% used. An absent value and an explicit null mean the same thing
+  // and must both drop the window rather than invent one.
+  if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
   return Math.max(0, Math.min(100, number));
@@ -121,42 +146,84 @@ function windowFrom(kind, { id, labelSuffix = '', usedPercent, resetsAt, reached
 export function normalizeClaudeQuotaWindows(payload) {
   if (!payload || typeof payload !== 'object') return [];
 
-  // Preferred shape. Anthropic is migrating the flat seven_day_* keys into this
-  // self-describing array, so read it first when present.
+  // Both shapes are read and merged. Anthropic is migrating buckets into
+  // `limits[]` one at a time, so a response can legitimately carry a migrated
+  // session window alongside a not-yet-migrated flat weekly one. Preferring
+  // whichever shape appears first and ignoring the other silently drops real
+  // windows — a confident partial reading, which is worse than failing.
+  const byId = new Map();
+  const add = (window) => {
+    if (!window) return;
+    let id = window.id;
+    // Distinct windows must not collapse into one id: two entries scoped to
+    // models whose names slug identically are still two different limits.
+    for (let suffix = 2; byId.has(id); suffix += 1) id = `${window.id}#${suffix}`;
+    byId.set(id, { ...window, id });
+  };
+
   if (Array.isArray(payload.limits)) {
-    const windows = [];
     for (const limit of payload.limits) {
       const kind = limit?.kind;
       if (!WINDOW_KINDS[kind]) continue;
       const model = limit?.scope?.model?.display_name;
       const usedPercent = percentOf(limit.percent);
-      const window = windowFrom(kind, {
+      add(windowFrom(kind, {
         id: kind === 'weekly_scoped' && model ? `${kind}:${slug(model)}` : kind,
         labelSuffix: kind === 'weekly_scoped' && model ? model : '',
         usedPercent,
         resetsAt: epochSeconds(limit.resets_at),
         reached: limit.severity === 'critical' || (usedPercent !== null && usedPercent >= 100)
-      });
-      if (window) windows.push(window);
+      }));
     }
-    if (windows.length) return windows;
   }
 
-  // Legacy flat shape. Only the two documented buckets are read.
-  const windows = [];
+  // Legacy flat shape. Only the two documented buckets are read, and only when
+  // `limits[]` has not already supplied that window.
   for (const [key, kind] of [['five_hour', 'session'], ['seven_day', 'weekly_all']]) {
+    if (byId.has(kind)) continue;
     const bucket = payload[key];
     if (!bucket || typeof bucket !== 'object') continue;
     const usedPercent = percentOf(bucket.utilization);
-    const window = windowFrom(kind, {
+    add(windowFrom(kind, {
       id: kind,
       usedPercent,
       resetsAt: epochSeconds(bucket.resets_at),
       reached: usedPercent !== null && usedPercent >= 100
-    });
-    if (window) windows.push(window);
+    }));
   }
-  return windows;
+
+  return [...byId.values()];
+}
+
+// The response also carries account and billing state — credit balance, spend
+// limits, organization lock reasons, dashboard availability — that no quota
+// window uses. The worker persists whatever this returns, so reduce it to the
+// fields the normalizer actually reads rather than retaining account data at
+// rest for no purpose.
+export function minimizeClaudeUsage(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+  const minimal = {};
+  if (Array.isArray(payload.limits)) {
+    minimal.limits = payload.limits
+      .filter((limit) => WINDOW_KINDS[limit?.kind])
+      .map((limit) => {
+        const model = limit?.scope?.model?.display_name;
+        return {
+          kind: limit.kind,
+          percent: limit.percent ?? null,
+          severity: limit.severity ?? null,
+          resets_at: limit.resets_at ?? null,
+          ...(model ? { scope: { model: { display_name: model } } } : {})
+        };
+      });
+  }
+  for (const key of ['five_hour', 'seven_day']) {
+    const bucket = payload[key];
+    if (bucket && typeof bucket === 'object') {
+      minimal[key] = { utilization: bucket.utilization ?? null, resets_at: bucket.resets_at ?? null };
+    }
+  }
+  return minimal;
 }
 
 // Impure. Reads the worker-local credential and calls the endpoint, returning the
@@ -189,10 +256,9 @@ export async function fetchClaudeUsage({
     throw new ClaudeUsageError('unauthenticated', 'Claude credential was rejected; sign in again', { status: response.status });
   }
   if (response.status === 429) {
-    const header = Number(response.headers.get('retry-after'));
     throw new ClaudeUsageError('throttled', 'Usage endpoint is rate limiting telemetry polling', {
       status: 429,
-      retryAfterSeconds: Number.isFinite(header) && header > 0 ? header : null
+      retryAfterSeconds: retryAfterSeconds(response.headers.get('retry-after'))
     });
   }
   if (!response.ok) {
@@ -211,5 +277,5 @@ export async function fetchClaudeUsage({
   if (!normalizeClaudeQuotaWindows(payload).length) {
     throw new ClaudeUsageError('malformed', 'Usage payload contained no recognizable quota windows');
   }
-  return payload;
+  return minimizeClaudeUsage(payload);
 }

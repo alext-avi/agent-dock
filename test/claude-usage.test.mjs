@@ -7,9 +7,12 @@ import { test } from 'node:test';
 import { createWorkerServer } from '../worker/server.mjs';
 import {
   ClaudeUsageError,
+  MAX_RETRY_AFTER_SECONDS,
   fetchClaudeUsage,
+  minimizeClaudeUsage,
   normalizeClaudeQuotaWindows,
-  readClaudeOAuthToken
+  readClaudeOAuthToken,
+  retryAfterSeconds
 } from '../worker/adapters/claude-usage.mjs';
 
 const ACCESS_TOKEN = 'sk-ant-oat-test-do-not-disclose';
@@ -73,6 +76,12 @@ test('Claude usage normalization falls back to the legacy flat buckets', async (
   assert.deepEqual(windows.map((window) => window.id), ['session', 'weekly_all']);
   assert.equal(windows[0].usedPercent, 42.5);
   assert.equal(windows[1].usedPercent, 12);
+  // The legacy branch computes resetsAt and reached separately from limits[].
+  assert.equal(typeof windows[0].resetsAt, 'number');
+  assert.ok(windows[0].resetsAt > 1_700_000_000 && windows[0].resetsAt < 4_000_000_000);
+  assert.equal(typeof windows[1].resetsAt, 'number');
+  assert.equal(windows[0].reached, false);
+  assert.equal(windows[1].reached, false);
   assert.ok(!JSON.stringify(windows).includes('juniper_tide'));
 });
 
@@ -82,6 +91,85 @@ test('Claude usage normalization fails closed on an unrecognized payload', async
   assert.deepEqual(normalizeClaudeQuotaWindows(null), []);
   assert.deepEqual(normalizeClaudeQuotaWindows('nope'), []);
   assert.deepEqual(normalizeClaudeQuotaWindows({ limits: 'not-an-array' }), []);
+});
+
+test('Claude usage normalization merges a partially migrated payload', async () => {
+  // The migration is bucket by bucket, so a response can carry a migrated
+  // session window and a not-yet-migrated flat weekly one at the same time.
+  // Reading only whichever shape appears first drops a real window.
+  const windows = normalizeClaudeQuotaWindows({
+    limits: [{ kind: 'session', percent: 5, severity: 'normal', resets_at: null }],
+    seven_day: { utilization: 80, resets_at: '2026-09-01T00:00:00Z' }
+  });
+
+  assert.deepEqual(windows.map((window) => window.id), ['session', 'weekly_all']);
+  assert.equal(windows[1].usedPercent, 80, 'the un-migrated weekly window was dropped');
+
+  // Where both shapes describe the same window, limits[] is authoritative.
+  const overlapping = normalizeClaudeQuotaWindows({
+    limits: [{ kind: 'weekly_all', percent: 30, severity: 'normal', resets_at: null }],
+    seven_day: { utilization: 99, resets_at: null }
+  });
+  assert.deepEqual(overlapping.map((window) => [window.id, window.usedPercent]), [['weekly_all', 30]]);
+});
+
+test('Claude usage normalization never invents a reading', async () => {
+  // Number(null) is 0. An explicit null must drop the window, exactly as an
+  // absent key does — not report a confident 0% used.
+  assert.deepEqual(normalizeClaudeQuotaWindows({ limits: [{ kind: 'session', percent: null }] }), []);
+  assert.deepEqual(normalizeClaudeQuotaWindows({ five_hour: { utilization: null } }), []);
+  assert.deepEqual(normalizeClaudeQuotaWindows({ limits: [{ kind: 'session' }] }), []);
+  assert.deepEqual(normalizeClaudeQuotaWindows({ limits: [{ kind: 'session', percent: 'abc' }] }), []);
+
+  // Garbage from an undocumented endpoint is clamped, not passed through.
+  const [high] = normalizeClaudeQuotaWindows({ limits: [{ kind: 'session', percent: 140 }] });
+  assert.equal(high.usedPercent, 100);
+  const [low] = normalizeClaudeQuotaWindows({ limits: [{ kind: 'session', percent: -3 }] });
+  assert.equal(low.usedPercent, 0);
+  assert.equal(low.reached, false);
+});
+
+test('Claude usage normalization keeps colliding windows distinct', async () => {
+  const windows = normalizeClaudeQuotaWindows({
+    limits: [
+      { kind: 'weekly_scoped', percent: 10, scope: { model: { display_name: 'Claude Opus 4' } } },
+      { kind: 'weekly_scoped', percent: 90, scope: { model: { display_name: 'Claude  Opus  4!!' } } }
+    ]
+  });
+  assert.equal(windows.length, 2, 'a slug collision silently merged two different limits');
+  assert.equal(new Set(windows.map((window) => window.id)).size, 2, 'window ids must be unique');
+});
+
+test('Claude usage persists only the fields the normalizer reads', async () => {
+  const payload = await fixture('claude-usage-limits');
+  const minimal = minimizeClaudeUsage(payload);
+  const serialized = JSON.stringify(minimal);
+
+  // Account and billing state is not quota telemetry and must not be retained.
+  for (const field of ['spend', 'extra_usage', 'member_dashboard_available', 'amount_minor', 'org_level_disabled_until']) {
+    assert.ok(!serialized.includes(field), `${field} was persisted`);
+  }
+  // Minimizing must not change what the operator sees.
+  assert.deepEqual(normalizeClaudeQuotaWindows(minimal), normalizeClaudeQuotaWindows(payload));
+});
+
+test('Retry-After is parsed in both legal forms and capped', async () => {
+  assert.equal(retryAfterSeconds('120'), 120);
+  assert.equal(retryAfterSeconds('  90 '), 90);
+  assert.equal(retryAfterSeconds('0'), null);
+  assert.equal(retryAfterSeconds('-5'), null);
+  assert.equal(retryAfterSeconds(''), null);
+  assert.equal(retryAfterSeconds(null), null);
+
+  // RFC 7231 allows an HTTP-date. Reading only the numeric form would silently
+  // shorten a long backoff to the default interval.
+  const soon = new Date(Date.now() + 300_000).toUTCString();
+  const parsed = retryAfterSeconds(soon);
+  assert.ok(parsed > 250 && parsed <= 300, `expected ~300s, got ${parsed}`);
+  assert.equal(retryAfterSeconds(new Date(Date.now() - 60_000).toUTCString()), null);
+
+  // An absurd value must not wedge polling effectively forever.
+  assert.equal(retryAfterSeconds('999999999999'), MAX_RETRY_AFTER_SECONDS);
 });
 
 test('Claude credential reading fails closed on an unfamiliar shape', async (t) => {
@@ -270,6 +358,81 @@ test('the experimental source is polled no harder than its own floor', async (t)
     await fetch(`${workerUrl}/v1/status`, { headers });
   }
   assert.equal(calls, 1, `the endpoint was called ${calls} times inside one floor window`);
+});
+
+test('the worker honours a 429 backoff instead of retrying immediately', async (t) => {
+  const token = 'claude-usage-429';
+  const home = await claudeHomeWithCredential(t);
+  let calls = 0;
+
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    // No floor of its own: the backoff must be what stops the second call.
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 0,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse({ error: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } });
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  const first = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(first.usage.pollErrorKind, 'throttled');
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+  }
+  assert.equal(calls, 1, `the endpoint was called ${calls} times while backing off`);
+});
+
+test('a failed poll keeps the last good windows and marks them stale', async (t) => {
+  const token = 'claude-usage-stale';
+  const home = await claudeHomeWithCredential(t);
+  const payload = await fixture('claude-usage-limits');
+  let healthy = true;
+
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 0,
+    claudeUsageFetch: () => (healthy
+      ? jsonResponse(payload)
+      : jsonResponse({ error: 'unauthorized' }, { status: 401 }))
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  const good = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(good.usage.quotaWindows.length, 3);
+  assert.ok(good.usage.lastSuccessAt, 'a successful read must record when it happened');
+
+  healthy = false;
+  const degraded = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+
+  // The windows survive — discarding them would blank the display on any
+  // transient failure — but the failure is classified so the UI can mark them.
+  assert.equal(degraded.usage.pollErrorKind, 'unauthenticated');
+  assert.deepEqual(
+    degraded.usage.quotaWindows.map((window) => window.id),
+    ['session', 'weekly_all', 'weekly_scoped:fable']
+  );
+  assert.equal(degraded.usage.lastSuccessAt, good.usage.lastSuccessAt, 'a failed poll must not advance data freshness');
 });
 
 test('a failing telemetry source keeps local request history intact', async (t) => {

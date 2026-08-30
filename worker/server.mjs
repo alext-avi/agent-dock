@@ -104,6 +104,14 @@ function canonicalRoute(pathname) {
   return LEGACY_ROUTES.get(pathname) ?? pathname;
 }
 
+// A non-numeric interval must not become NaN: every comparison against NaN is
+// false, which would silently delete the poll floor instead of failing.
+function positiveInterval(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 function initialUsage() {
   return {
     schemaVersion: 1,
@@ -113,8 +121,14 @@ function initialUsage() {
     // Distinguishes a telemetry-source failure from an exhausted plan. An
     // exhausted plan is a successful poll reporting 100% used, never an error.
     pollErrorKind: null,
-    // Honours a 429 Retry-After from the usage endpoint.
+    // Honours a 429 Retry-After from the usage endpoint. Deliberately reset on
+    // load: a backoff deadline belongs to the process that received it, and
+    // persisting one lets a single bad Retry-After outlive a restart.
     retryAfterAt: null,
+    // When the quota windows themselves were last successfully read. lastPollAt
+    // advances on failed and skipped attempts too, so it cannot answer "how old
+    // is this number".
+    lastSuccessAt: null,
     rateLimits: null,
     accountUsage: null,
     totals: {
@@ -190,14 +204,14 @@ export function createWorkerServer(options = {}) {
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
     dataPath: options.dataPath === null ? null : (options.dataPath ?? process.env.AGENT_DATA_PATH ?? (demoMode ? null : '/agent-data/usage.json')),
-    usagePollIntervalMs: Number(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? 60_000),
+    usagePollIntervalMs: positiveInterval(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS, 60_000),
     // Experimental, off by default. Enables the undocumented Claude OAuth usage
     // source described in worker/adapters/claude-usage.mjs.
     claudeOAuthUsage: options.claudeOAuthUsage ?? process.env.CLAUDE_OAUTH_USAGE === '1',
     // Deliberately slower than USAGE_POLL_INTERVAL_MS. That interval governs
     // Codex's local app-server call, which is free; this one governs an
     // undocumented remote endpoint that is known to rate limit.
-    claudeUsageIntervalMs: Number(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS ?? 300_000),
+    claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 300_000),
     claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
     claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };
@@ -254,6 +268,8 @@ export function createWorkerServer(options = {}) {
     } catch (error) {
       if (error.code !== 'ENOENT') state.usage.pollError = `Could not load usage history: ${error.message}`;
     }
+    // A backoff deadline belongs to the process that received the 429.
+    state.usage.retryAfterAt = null;
   }
 
   async function persistUsage() {
@@ -446,6 +462,7 @@ export function createWorkerServer(options = {}) {
     return {
       updatedAt: state.usage.updatedAt,
       lastPollAt: supportsAccountUsage ? state.usage.lastPollAt : null,
+      lastSuccessAt: supportsAccountUsage ? (state.usage.lastSuccessAt ?? null) : null,
       pollError: state.usage.pollError,
       pollErrorKind: state.usage.pollErrorKind ?? null,
       quotaWindows: normalizeProviderQuotaWindows(state.usage.rateLimits),
@@ -658,6 +675,21 @@ export function createWorkerServer(options = {}) {
   // stale instead of showing a confident zero.
   async function pollClaudeUsage() {
     if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) return;
+    // Demo mode must never reach a provider. queryCodexAccount stubs itself the
+    // same way; without this a demo worker with an inherited credential would
+    // make a real call to an undocumented endpoint.
+    if (config.demoMode && !config.claudeUsageFetch) {
+      state.usage.rateLimits = {
+        limits: [
+          { kind: 'session', percent: 18, severity: 'normal', resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+          { kind: 'weekly_all', percent: 64, severity: 'normal', resets_at: new Date(Date.now() + 4 * 86_400_000).toISOString() }
+        ]
+      };
+      state.usage.pollError = null;
+      state.usage.pollErrorKind = null;
+      state.usage.lastSuccessAt = new Date().toISOString();
+      return;
+    }
     try {
       state.usage.rateLimits = await fetchClaudeUsage({
         credentialPaths: claudeCredentialPaths(config.claudeHome, providerEnv.CLAUDE_CONFIG_DIR),
@@ -667,6 +699,7 @@ export function createWorkerServer(options = {}) {
       state.usage.pollError = null;
       state.usage.pollErrorKind = null;
       state.usage.retryAfterAt = null;
+      state.usage.lastSuccessAt = new Date().toISOString();
     } catch (error) {
       const kind = error instanceof ClaudeUsageError ? error.kind : 'unknown';
       state.usage.pollError = clean(error.message).slice(-1000);
@@ -674,6 +707,11 @@ export function createWorkerServer(options = {}) {
       if (kind === 'throttled') {
         const seconds = error.retryAfterSeconds ?? Math.ceil(config.usagePollIntervalMs / 1000);
         state.usage.retryAfterAt = Date.now() + seconds * 1000;
+      } else if (kind === 'unauthenticated') {
+        // A revoked credential will not fix itself. Retrying every interval is a
+        // doomed request loop against an endpoint whose operators may read
+        // repeated failed auth as abuse; back off until something changes.
+        state.usage.retryAfterAt = Date.now() + Math.max(config.claudeUsageIntervalMs, 900_000);
       }
     }
   }

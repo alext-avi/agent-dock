@@ -65,6 +65,23 @@ function dockerError(status, body, path) {
   return error;
 }
 
+// A runtime's container name is derived from its immutable runtime id, so it
+// survives replacement. The id does not. Everything that addresses a container
+// should prefer the name and treat the stored id as a cached detail.
+function containerRef(runtime) {
+  return runtime.containerName || runtime.containerId || '';
+}
+
+function runtimeVolumes(runtimeId) {
+  const prefix = safeName(`agent-dock-${runtimeId}`);
+  return {
+    auth: `${prefix}-auth`,
+    binary: `${prefix}-bin`,
+    telemetry: `${prefix}-data`,
+    workspace: `${prefix}-workspace`
+  };
+}
+
 function safeName(value) {
   return value.toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
 }
@@ -124,48 +141,27 @@ export class DockerRuntimeManager {
     await this.request('POST', '/volumes/create', { Name: name, Labels: labels });
   }
 
-  async provision({ agentId, adapter }) {
+  // One definition of what a runtime's container is, shared by provisioning and
+  // by replacing one. Two copies would drift, and the whole point of a refresh is
+  // that the replacement matches what a fresh provision would produce.
+  async containerSpec({ adapter, workerId, workerToken, volumes, labels }) {
     const template = ADAPTERS[adapter];
-    if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
-    const runtimeId = `rt-${safeName(adapter)}-${randomUUID().slice(0, 12)}`;
-    const workerId = `worker-${randomUUID()}`;
-    const workerToken = randomBytes(32).toString('base64url');
-    const containerName = safeName(`agent-dock-${runtimeId}`);
-    const volumePrefix = safeName(`agent-dock-${runtimeId}`);
-    const volumes = {
-      auth: `${volumePrefix}-auth`,
-      binary: `${volumePrefix}-bin`,
-      telemetry: `${volumePrefix}-data`,
-      workspace: `${volumePrefix}-workspace`
+    const network = await this.resolveNetwork();
+    const image = this.imageOverrides[adapter] ?? process.env[template.imageEnv] ?? template.defaultImage;
+    const version = this.versionOverrides[adapter] ?? process.env[template.versionEnv] ?? template.version;
+    const environment = {
+      PORT: '7777',
+      WORKER_TOKEN: workerToken,
+      AGENT_ID: workerId,
+      ALLOW_UNSANDBOXED: this.allowUnsandboxed,
+      AGENT_DATA_PATH: '/agent-data/usage.json',
+      USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
+      [template.versionEnv]: version,
+      ...template.environment
     };
-    const labels = {
-      'com.agent-dock.managed': 'true',
-      'com.agent-dock.agent-id': agentId,
-      'com.agent-dock.runtime-id': runtimeId,
-      'com.agent-dock.adapter': adapter
-    };
-    const createdVolumes = [];
-    let containerId = '';
-    try {
-      for (const name of Object.values(volumes)) {
-        await this.createVolume(name, labels);
-        createdVolumes.push(name);
-      }
-      const network = await this.resolveNetwork();
-      const image = this.imageOverrides[adapter] ?? process.env[template.imageEnv] ?? template.defaultImage;
-      const version = this.versionOverrides[adapter] ?? process.env[template.versionEnv] ?? template.version;
-      const environment = {
-        PORT: '7777',
-        WORKER_TOKEN: workerToken,
-        AGENT_ID: workerId,
-        ALLOW_UNSANDBOXED: this.allowUnsandboxed,
-        MCP_ALLOWED_COMMANDS: this.mcpAllowedCommands,
-        AGENT_DATA_PATH: '/agent-data/usage.json',
-        USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
-        [template.versionEnv]: version,
-        ...template.environment
-      };
-      const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(containerName)}`, {
+    return {
+      image,
+      body: {
         Image: image,
         Env: Object.entries(environment).map(([key, value]) => `${key}=${value}`),
         Labels: labels,
@@ -189,7 +185,33 @@ export class DockerRuntimeManager {
             { Type: 'volume', Source: volumes.workspace, Target: '/workspace' }
           ]
         }
-      });
+      }
+    };
+  }
+
+  async provision({ agentId, adapter }) {
+    const template = ADAPTERS[adapter];
+    if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
+    const runtimeId = `rt-${safeName(adapter)}-${randomUUID().slice(0, 12)}`;
+    const workerId = `worker-${randomUUID()}`;
+    const workerToken = randomBytes(32).toString('base64url');
+    const containerName = safeName(`agent-dock-${runtimeId}`);
+    const volumes = runtimeVolumes(runtimeId);
+    const labels = {
+      'com.agent-dock.managed': 'true',
+      'com.agent-dock.agent-id': agentId,
+      'com.agent-dock.runtime-id': runtimeId,
+      'com.agent-dock.adapter': adapter
+    };
+    const createdVolumes = [];
+    let containerId = '';
+    try {
+      for (const name of Object.values(volumes)) {
+        await this.createVolume(name, labels);
+        createdVolumes.push(name);
+      }
+      const { image, body } = await this.containerSpec({ adapter, workerId, workerToken, volumes, labels });
+      const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(containerName)}`, body);
       containerId = created.Id;
       await this.request('POST', `/containers/${encodeURIComponent(containerId)}/start`);
       return {
@@ -203,6 +225,7 @@ export class DockerRuntimeManager {
         workerToken,
         containerId,
         containerName,
+        image,
         volumes,
         state: 'starting',
         createdAt: new Date().toISOString(),
@@ -217,13 +240,54 @@ export class DockerRuntimeManager {
     }
   }
 
+  // Replace a runtime's container with one built from the currently configured
+  // image, keeping its identity, its worker token, and all four volumes. The
+  // volumes are never deleted, so the agent stays authenticated: this is the
+  // difference between picking up new worker code and re-running an OAuth flow.
+  async recreate(runtime, { agentId = null } = {}) {
+    const template = ADAPTERS[runtime.adapter];
+    if (!template) throw Object.assign(new Error(`No runtime template exists for ${runtime.adapter}`), { status: 400 });
+    if (!runtime.containerName) {
+      throw Object.assign(new Error('Runtime has no stable container name to replace'), { status: 409 });
+    }
+    const volumes = runtime.volumes ?? runtimeVolumes(runtime.id);
+    const labels = {
+      'com.agent-dock.managed': 'true',
+      'com.agent-dock.agent-id': agentId ?? '',
+      'com.agent-dock.runtime-id': runtime.id,
+      'com.agent-dock.adapter': runtime.adapter
+    };
+    // Build the spec before removing anything: an unresolvable network or image
+    // should fail while the existing container is still running.
+    const { image, body } = await this.containerSpec({
+      adapter: runtime.adapter,
+      workerId: runtime.workerId,
+      workerToken: runtime.workerToken,
+      volumes,
+      labels
+    });
+    await this.request('DELETE', `/containers/${encodeURIComponent(containerRef(runtime))}?force=true`, undefined, [204, 404]);
+    const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(runtime.containerName)}`, body);
+    await this.request('POST', `/containers/${encodeURIComponent(created.Id)}/start`);
+    return {
+      containerId: created.Id,
+      containerName: runtime.containerName,
+      workerUrl: `http://${runtime.containerName}:7777`,
+      image,
+      volumes,
+      state: 'starting',
+      updatedAt: new Date().toISOString()
+    };
+  }
+
   async inspect(runtime) {
-    if (!runtime.containerId && !runtime.containerName) return { state: runtime.state ?? 'unknown' };
+    if (!containerRef(runtime)) return { state: runtime.state ?? 'unknown' };
     try {
-      const value = await this.request('GET', `/containers/${encodeURIComponent(runtime.containerId || runtime.containerName)}/json`);
+      const value = await this.request('GET', `/containers/${encodeURIComponent(containerRef(runtime))}/json`);
       return {
         state: value.State?.Running ? 'running' : value.State?.Status ?? 'stopped',
-        health: value.State?.Health?.Status ?? null
+        health: value.State?.Health?.Status ?? null,
+        image: value.Config?.Image ?? null
       };
     } catch (error) {
       if (error.message.includes('Docker API 404')) return { state: 'missing', health: null };
@@ -232,18 +296,18 @@ export class DockerRuntimeManager {
   }
 
   async stop(runtime) {
-    if (!runtime.containerId && !runtime.containerName) return;
-    await this.request('POST', `/containers/${encodeURIComponent(runtime.containerId || runtime.containerName)}/stop?t=10`, undefined, [204, 304, 404]);
+    if (!containerRef(runtime)) return;
+    await this.request('POST', `/containers/${encodeURIComponent(containerRef(runtime))}/stop?t=10`, undefined, [204, 304, 404]);
   }
 
   async start(runtime) {
-    if (!runtime.containerId && !runtime.containerName) throw new Error('Managed runtime has no container identity');
-    await this.request('POST', `/containers/${encodeURIComponent(runtime.containerId || runtime.containerName)}/start`, undefined, [204, 304]);
+    if (!containerRef(runtime)) throw new Error('Managed runtime has no container identity');
+    await this.request('POST', `/containers/${encodeURIComponent(containerRef(runtime))}/start`, undefined, [204, 304]);
   }
 
   async destroy(runtime) {
-    if (runtime.containerId || runtime.containerName) {
-      await this.request('DELETE', `/containers/${encodeURIComponent(runtime.containerId || runtime.containerName)}?force=true`, undefined, [204, 404]);
+    if (containerRef(runtime)) {
+      await this.request('DELETE', `/containers/${encodeURIComponent(containerRef(runtime))}?force=true`, undefined, [204, 404]);
     }
     for (const name of Object.values(runtime.volumes ?? {})) {
       await this.request('DELETE', `/volumes/${encodeURIComponent(name)}?force=true`, undefined, [204, 404]);

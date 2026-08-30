@@ -54,6 +54,7 @@ flowchart LR
 - The browser never receives the Docker socket, worker routing secrets, or provider credentials. In this local POC, the server-side control-plane container uses the Docker socket to provision runtimes; this is a privileged host boundary and must become a constrained provisioner service before multi-user deployment.
 - The fleet dashboard supports create, read, update, and lifecycle-aware delete for agent records, then reports each reachable runtime's auth, activity, usage, and request count.
 - Newly managed agents cannot share a runtime. The API rejects attaching a runtime that already has an owner.
+- A managed runtime can be moved onto a rebuilt worker image without losing its credentials. Refreshing replaces the container from the currently configured image and reattaches the same CLI, auth, telemetry, and workspace volumes, so the agent stays signed in; a refresh is refused while a task is running, and never touches a bootstrap runtime.
 - Deleting a managed agent explicitly chooses between stopping and retaining all isolated state for later exclusive reattachment, or destroying the container and every private volume after exact-ID confirmation.
 - Fleet and agent runtime status refresh every three seconds while the browser tab is visible, with overlapping requests deduplicated.
 - Each agent has a durable prompt stored by the control plane and a separate, intentionally ephemeral test conversation.
@@ -106,6 +107,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET` | `/api/v1/agents/:id/workspace` | List worker artifacts (not their contents) |
 | `GET` | `/api/v1/agents/:id/usage` | Read normalized request history, totals, quota windows, and account activity |
 | `POST` | `/api/v1/agents/:id/usage/refresh` | Ask the adapter to refresh its available usage sources |
+| `POST` | `/api/v1/agents/:id/runtime/refresh` | Replace a managed runtime's container with one built from the current image, retaining its volumes |
 
 The original unscoped runtime routes remain aliases for the default agent during the POC.
 

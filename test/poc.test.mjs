@@ -48,6 +48,8 @@ class FakeRuntimeManager {
     this.started = [];
     this.stopped = [];
     this.destroyed = [];
+    this.recreated = [];
+    this.image = 'agent-dock-worker:v1';
   }
 
   async provision({ agentId, adapter }) {
@@ -64,6 +66,8 @@ class FakeRuntimeManager {
       workerUrl: definition.workerUrl,
       workerToken: definition.token,
       containerId: `container-${suffix}`,
+      containerName: `agent-dock-runtime-${suffix}`,
+      image: this.image,
       volumes: {
         auth: `auth-${suffix}`,
         binary: `binary-${suffix}`,
@@ -79,7 +83,22 @@ class FakeRuntimeManager {
     return runtime;
   }
 
-  async inspect(runtime) { return { state: runtime.state, health: 'healthy' }; }
+  async inspect(runtime) { return { state: runtime.state, health: 'healthy', image: runtime.image ?? null }; }
+
+  // Mirrors the real manager: a new container id, the same name and volumes, and
+  // the currently configured image. Volumes are never touched.
+  async recreate(runtime, { agentId = null } = {}) {
+    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes });
+    return {
+      containerId: `container-${runtime.id}-${this.recreated.length}`,
+      containerName: runtime.containerName,
+      workerUrl: runtime.workerUrl,
+      image: this.image,
+      volumes: runtime.volumes,
+      state: 'starting',
+      updatedAt: new Date().toISOString()
+    };
+  }
   async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
   async stop(runtime) { runtime.state = 'stopped'; this.stopped.push(runtime.id); }
   async destroy(runtime) { this.destroyed.push(runtime.id); }
@@ -599,4 +618,114 @@ test('OpenCode discovers Ollama and executes a durable pinned model policy', asy
     totalTokens: 207
   });
   assert.equal(normalizeOpenCodeEvent({ type: 'text', part: { type: 'text', text: 'hello' } }).data.text, 'hello');
+});
+
+
+test('refreshing a runtime replaces its container while retaining every volume', async (t) => {
+  const token = 'refresh-worker-secret';
+  const worker = createStatusWorker({ workerId: 'refresh-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'refresh-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const created = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Refreshable', adapter: 'claude-code', runtime: { mode: 'provision' } })
+  })).json()).agent;
+
+  const before = created.runtime;
+  assert.equal(before.managed, true);
+
+  // A newer image is configured, exactly as it would be after a rebuild.
+  manager.image = 'agent-dock-worker:v2';
+
+  const response = await fetch(`${controlUrl}/api/v1/agents/${created.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+
+  assert.equal(body.refreshed, true);
+  assert.equal(body.runtime.image, 'agent-dock-worker:v2', 'the runtime did not move onto the current image');
+  assert.equal(body.runtime.id, before.id, 'refreshing must not change runtime identity');
+  assert.equal(body.runtime.binding, 'dedicated', 'exclusivity must survive a refresh');
+  assert.equal(body.runtime.attachmentCount, 1);
+
+  // The credential lives in the auth volume. Retaining it is the entire point:
+  // a refresh that dropped it would force a fresh provider login.
+  assert.equal(manager.recreated.length, 1);
+  assert.deepEqual(manager.recreated[0].volumes, manager.provisioned[0].volumes);
+  assert.equal(manager.destroyed.length, 0, 'a refresh must never destroy volumes');
+  assert.equal(manager.recreated[0].agentId, created.id);
+
+  const serialized = JSON.stringify(body);
+  assert.ok(!serialized.includes(token), 'refresh response disclosed the worker token');
+  assert.ok(!serialized.includes(workerUrl), 'refresh response disclosed the worker URL');
+});
+
+test('a runtime refresh is refused while a task is running and for unmanaged runtimes', async (t) => {
+  const token = 'busy-worker-secret';
+  const busy = createServer((req, res) => {
+    if (req.url === '/v1/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'unauthorized' }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      apiVersion: 'agent-wrapper/v1',
+      agent: { id: 'busy-worker', adapter: { id: 'claude-code', provider: 'anthropic', displayName: 'Claude Code' } },
+      authentication: { authenticated: true, phase: 'authenticated' },
+      task: { active: { id: 'task-1', status: 'running' } },
+      usage: { totals: { requests: 0 }, quotaWindows: [] }
+    }));
+  });
+  const workerUrl = await listen(busy);
+  const manager = new FakeRuntimeManager([{ workerId: 'busy-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    claudeWorkerUrl: workerUrl,
+    claudeWorkerToken: token,
+    runtimeManager: manager,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => busy.close(resolve))
+  ]));
+
+  const managed = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Busy', adapter: 'claude-code', runtime: { mode: 'provision' } })
+  })).json()).agent;
+
+  const refused = await fetch(`${controlUrl}/api/v1/agents/${managed.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(refused.status, 409, 'a refresh must not interrupt a running task');
+  assert.equal(manager.recreated.length, 0);
+
+  // A bootstrap runtime is not ours to replace.
+  const legacy = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Legacy', adapter: 'claude-code', runtime: { mode: 'attach', id: 'legacy-claude-code' } })
+  })).json()).agent;
+
+  const unmanaged = await fetch(`${controlUrl}/api/v1/agents/${legacy.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(unmanaged.status, 409);
+  assert.equal(manager.recreated.length, 0);
 });

@@ -103,6 +103,7 @@ const ui = {
   usagePolledAt: $('#usage-polled-at'),
   usageError: $('#usage-error'),
   refreshUsage: $('#refresh-usage'),
+  refreshRuntime: $('#refresh-runtime'),
   prompt: $('#prompt'),
   runButton: $('#run-button'),
   cancelButton: $('#cancel-button'),
@@ -850,6 +851,33 @@ async function deleteAgentRecord(agent) {
   return true;
 }
 
+// Replaces the runtime's container with one built from the current image. The
+// four private volumes are retained, so the agent does not have to authenticate
+// again — that is the whole reason this exists rather than delete-and-recreate.
+async function refreshRuntimeImage() {
+  if (!currentAgent?.runtime?.managed) return;
+  const confirmed = window.confirm(
+    "Replace this runtime's container with one built from the current image?\n\n"
+    + 'Its CLI, credentials, telemetry, and workspace volumes are kept, so the agent stays signed in. '
+    + 'The runtime restarts and is briefly unavailable.'
+  );
+  if (!confirmed) return;
+  const previous = ui.refreshRuntime.textContent;
+  ui.refreshRuntime.disabled = true;
+  ui.refreshRuntime.textContent = 'Refreshing…';
+  try {
+    const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
+    currentAgent.runtime = result.runtime;
+    setConnection('online', `Runtime refreshed onto ${result.runtime.image || 'the current image'}`);
+    await refreshStatus();
+  } catch (error) {
+    setConnection('offline', error.message);
+  } finally {
+    ui.refreshRuntime.textContent = previous;
+    ui.refreshRuntime.disabled = false;
+  }
+}
+
 async function deleteCurrentAgent() {
   try {
     if (!await deleteAgentRecord(currentAgent)) return;
@@ -1028,9 +1056,13 @@ function renderStatus(status) {
   ui.authState.textContent = authenticated ? 'connected' : localCredentiallessModel ? 'not required' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
   ui.jobState.textContent = active ? 'running' : 'idle';
   const inContainer = status.execution?.boundary === 'container';
+  const runtimeImage = currentAgent.runtime?.image;
   ui.runtimeLocation.textContent = inContainer
-    ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}`
+    ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}${runtimeImage ? ` · ${runtimeImage}` : ''}`
     : 'Worker-managed provider sandbox';
+  // Only a managed runtime has a container of ours to replace, and never while
+  // a task is running.
+  ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
     quotaWindows: Boolean(status.capabilities?.usage?.quotaWindows),
@@ -1360,6 +1392,7 @@ ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
 });
 $('#delete-agent').addEventListener('click', deleteCurrentAgent);
+ui.refreshRuntime.addEventListener('click', refreshRuntimeImage);
 ui.authButton.addEventListener('click', startAuth);
 ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);

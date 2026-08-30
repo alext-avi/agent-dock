@@ -78,6 +78,9 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
       workspace: isolated ? 'isolated' : 'shared'
     },
     attachmentCount,
+    // The image tag this runtime is actually running, so drift from the
+    // configured image is visible rather than silent. A local tag, not a secret.
+    image: runtime.image ?? null,
     createdAt: runtime.createdAt ?? null,
     updatedAt: runtime.updatedAt ?? null
   };
@@ -660,8 +663,41 @@ export function createControlPlane(options = {}) {
     return false;
   }
 
+  // Replace a managed runtime's container with one built from the current image,
+  // keeping its volumes so the agent stays authenticated. Without this the only
+  // way to get new worker code onto an agent is to destroy its credentials.
+  async function refreshAgentRuntime(req, res, agent) {
+    if (!runtimeManager) {
+      throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
+    }
+    const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+    if (!runtime?.managed) {
+      throw Object.assign(new Error('Only a managed runtime can be refreshed'), { status: 409 });
+    }
+    // Replacing the container kills whatever it is running, so never do it
+    // underneath a task.
+    let active = null;
+    try {
+      const { response } = await workerFetch(agent, '/v1/status', { timeout: 5_000 });
+      if (response.ok) active = (await response.json()).task?.active ?? null;
+    } catch {
+      // An unreachable worker is exactly the case a refresh is meant to fix.
+    }
+    if (active) {
+      throw Object.assign(new Error('Runtime has an active task; cancel it before refreshing'), { status: 409 });
+    }
+
+    const replaced = await runtimeManager.recreate(runtime, { agentId: agent.id });
+    Object.assign(runtime, replaced);
+    await persistAgents();
+    return json(res, 200, {
+      runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
+      refreshed: true
+    });
+  }
+
   async function handleAgentOperation(req, res, url) {
-    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
+    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
     const operation = match[2];
@@ -675,6 +711,7 @@ export function createControlPlane(options = {}) {
     if (req.method === 'POST' && operation === 'usage/refresh') return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);
     if (req.method === 'POST' && operation === 'tasks/cancel') return proxyJson(req, res, agent, '/v1/tasks/cancel');
     if (req.method === 'POST' && operation === 'tasks') return proxyTask(req, res, agent);
+    if (req.method === 'POST' && operation === 'runtime/refresh') return refreshAgentRuntime(req, res, agent);
     return false;
   }
 

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
+import { DockerRuntimeManager } from '../control-plane/docker-runtime.mjs';
 import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
 import { normalizeOpenCodeEvent } from '../worker/adapters/opencode.mjs';
 
@@ -728,4 +729,82 @@ test('a runtime refresh is refused while a task is running and for unmanaged run
   const unmanaged = await fetch(`${controlUrl}/api/v1/agents/${legacy.id}/runtime/refresh`, { method: 'POST' });
   assert.equal(unmanaged.status, 409);
   assert.equal(manager.recreated.length, 0);
+});
+
+
+// The container spec is shared by provisioning and refreshing, so it is the one
+// place where a silent omission changes every runtime the system creates. The
+// FakeRuntimeManager cannot catch that — it fabricates its own shape — so this
+// exercises the real manager with the network pinned so it needs no Docker.
+test('the shared container spec carries every setting a worker needs', async () => {
+  const manager = new DockerRuntimeManager({
+    network: 'test-net',
+    socketPath: '/nonexistent.sock',
+    images: { 'claude-code': 'agent-dock-worker-claude:test' },
+    mcpAllowedCommands: 'npx,uvx',
+    usagePollIntervalMs: 60_000,
+    allowUnsandboxed: '1'
+  });
+
+  const volumes = { auth: 'v-auth', binary: 'v-bin', telemetry: 'v-data', workspace: 'v-work' };
+  const { image, body } = await manager.containerSpec({
+    adapter: 'claude-code',
+    workerId: 'worker-abc',
+    workerToken: 'token-abc',
+    volumes,
+    labels: { 'com.agent-dock.managed': 'true' }
+  });
+
+  assert.equal(image, 'agent-dock-worker-claude:test');
+  const env = Object.fromEntries(body.Env.map((entry) => {
+    const index = entry.indexOf('=');
+    return [entry.slice(0, index), entry.slice(index + 1)];
+  }));
+
+  // Every variable the worker reads must be present. Dropping one during a
+  // refactor is invisible until the feature that depends on it stops working.
+  for (const key of [
+    'PORT',
+    'WORKER_TOKEN',
+    'AGENT_ID',
+    'ALLOW_UNSANDBOXED',
+    'AGENT_DATA_PATH',
+    'USAGE_POLL_INTERVAL_MS',
+    'MCP_ALLOWED_COMMANDS',
+    'AGENT_ADAPTER',
+    'CLAUDE_VERSION'
+  ]) {
+    assert.ok(key in env, `${key} is missing from the container environment`);
+  }
+  assert.equal(env.MCP_ALLOWED_COMMANDS, 'npx,uvx');
+  assert.equal(env.WORKER_TOKEN, 'token-abc');
+  assert.equal(env.AGENT_ID, 'worker-abc');
+
+  // All four private volumes are mounted, and nothing from the host is.
+  const mounts = body.HostConfig.Mounts;
+  assert.equal(mounts.length, 4);
+  assert.deepEqual(mounts.map((mount) => mount.Source).sort(), Object.values(volumes).sort());
+  assert.ok(mounts.every((mount) => mount.Type === 'volume'), 'a bind mount reached a managed runtime');
+  assert.equal(body.HostConfig.NetworkMode, 'test-net');
+  assert.ok(!body.HostConfig.Privileged);
+});
+
+test('destructive runtime operations cannot overlap', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+
+  // Docker recreates any named volume a container references but that does not
+  // exist, so a destroy landing inside a refresh would hand the replacement
+  // empty volumes and still look like it worked.
+  const release = manager.claimRuntime('runtime-1', 'refreshed');
+  assert.throws(() => manager.claimRuntime('runtime-1', 'destroyed'), (error) => {
+    assert.equal(error.status, 409);
+    assert.match(error.message, /already being refreshed/);
+    return true;
+  });
+
+  // A different runtime is unaffected, and releasing frees the claim.
+  const other = manager.claimRuntime('runtime-2', 'destroyed');
+  other();
+  release();
+  manager.claimRuntime('runtime-1', 'destroyed')();
 });

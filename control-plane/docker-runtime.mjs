@@ -95,7 +95,22 @@ export class DockerRuntimeManager {
     this.versionOverrides = options.versions ?? {};
     this.usagePollIntervalMs = String(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? '60000');
     this.allowUnsandboxed = String(options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED ?? '1');
+    this.busyRuntimes = new Map();
     this.mcpAllowedCommands = String(options.mcpAllowedCommands ?? process.env.MCP_ALLOWED_COMMANDS ?? '');
+  }
+
+  // Held for the whole of a destructive operation. Checked and set synchronously
+  // before the first await, so two callers cannot both win.
+  claimRuntime(runtimeId, operation) {
+    if (!runtimeId) return () => {};
+    if (this.busyRuntimes.has(runtimeId)) {
+      throw Object.assign(
+        new Error(`Runtime is already being ${this.busyRuntimes.get(runtimeId)}; wait for that to finish`),
+        { status: 409 }
+      );
+    }
+    this.busyRuntimes.set(runtimeId, operation);
+    return () => this.busyRuntimes.delete(runtimeId);
   }
 
   async request(method, path, body, accepted = [200, 201, 204]) {
@@ -156,6 +171,7 @@ export class DockerRuntimeManager {
       ALLOW_UNSANDBOXED: this.allowUnsandboxed,
       AGENT_DATA_PATH: '/agent-data/usage.json',
       USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
+      MCP_ALLOWED_COMMANDS: this.mcpAllowedCommands,
       [template.versionEnv]: version,
       ...template.environment
     };
@@ -250,6 +266,15 @@ export class DockerRuntimeManager {
     if (!runtime.containerName) {
       throw Object.assign(new Error('Runtime has no stable container name to replace'), { status: 409 });
     }
+    const release = this.claimRuntime(runtime.id, 'refreshed');
+    try {
+      return await this.#recreate(runtime, agentId);
+    } finally {
+      release();
+    }
+  }
+
+  async #recreate(runtime, agentId) {
     const volumes = runtime.volumes ?? runtimeVolumes(runtime.id);
     const labels = {
       'com.agent-dock.managed': 'true',
@@ -306,6 +331,15 @@ export class DockerRuntimeManager {
   }
 
   async destroy(runtime) {
+    const release = this.claimRuntime(runtime.id, 'destroyed');
+    try {
+      await this.#destroy(runtime);
+    } finally {
+      release();
+    }
+  }
+
+  async #destroy(runtime) {
     if (containerRef(runtime)) {
       await this.request('DELETE', `/containers/${encodeURIComponent(containerRef(runtime))}?force=true`, undefined, [204, 404]);
     }

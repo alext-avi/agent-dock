@@ -502,6 +502,7 @@ export function createControlPlane(options = {}) {
             const inspected = await runtimeManager.inspect(runtime);
             runtime.state = inspected.state;
             runtime.health = inspected.health;
+            runtime.image = inspected.image ?? runtime.image ?? null;
             runtime.updatedAt = new Date().toISOString();
           } catch {
             runtime.state = 'unknown';
@@ -676,15 +677,24 @@ export function createControlPlane(options = {}) {
     }
     // Replacing the container kills whatever it is running, so never do it
     // underneath a task.
-    let active = null;
+    let idle = false;
     try {
       const { response } = await workerFetch(agent, '/v1/status', { timeout: 5_000 });
-      if (response.ok) active = (await response.json()).task?.active ?? null;
+      if (response.ok) {
+        idle = !((await response.json()).task?.active ?? null);
+      }
+      // A reachable worker that answers with an error or unparseable body tells
+      // us nothing about whether it is busy, so it stays not-idle and refuses.
     } catch {
-      // An unreachable worker is exactly the case a refresh is meant to fix.
+      // Unreachable is different: that is the state a refresh exists to repair,
+      // and a worker that cannot be reached is not streaming a task either.
+      idle = true;
     }
-    if (active) {
-      throw Object.assign(new Error('Runtime has an active task; cancel it before refreshing'), { status: 409 });
+    if (!idle) {
+      throw Object.assign(
+        new Error('Runtime is busy or did not report a usable status; cancel any running task and retry'),
+        { status: 409 }
+      );
     }
 
     const replaced = await runtimeManager.recreate(runtime, { agentId: agent.id });

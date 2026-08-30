@@ -35,7 +35,7 @@ Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. 
 - `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded once to the waiting CLI process and is never logged or persisted.
 - `task.active`: the active task ID/status or `null`.
 - `execution`: the isolation boundary and workspace path.
-- `usage`: normalized request totals/history, `quotaWindows[]`, and an optional `account` activity summary.
+- `usage`: normalized request totals/history, `quotaWindows[]`, an optional `account` activity summary, and `pollErrorKind` classifying why an account-usage source last failed.
 
 Provider-specific fields belong inside a future explicitly versioned extension object; the control plane must not require them.
 
@@ -67,7 +67,19 @@ Stable event types:
 | `task.completed` | `status`, `exitCode` |
 | `provider.lifecycle` / `provider.event` | opaque provider event name only; the UI does not depend on it |
 
-Normalized request usage uses `inputTokens`, `cachedInputTokens`, `outputTokens`, and `totalTokens`. Quotas use flat `quotaWindows[]` entries with `label`, `scope`, `usedPercent`, `windowDurationMinutes`, and `resetsAt`. Account activity uses provider-neutral names such as `lifetimeTokens`, `peakDailyTokens`, and `dailyUsage`. Unsupported values are zero or absent; adapters must not invent provider data.
+Normalized request usage uses `inputTokens`, `cachedInputTokens`, `outputTokens`, and `totalTokens`. Quotas use flat `quotaWindows[]` entries with `id`, `label`, `scope`, `usedPercent`, `windowDurationMinutes`, `resetsAt` (epoch seconds), and `reached`. Account activity uses provider-neutral names such as `lifetimeTokens`, `peakDailyTokens`, and `dailyUsage`. Unsupported values are zero or absent; adapters must not invent provider data.
+
+Each adapter translates its own provider's usage envelope, exactly as it translates its own provider's events. The worker persists the raw envelope and normalizes it on read, so a change to a provider's usage format stays inside that adapter.
+
+## Telemetry-source failures
+
+An exhausted subscription is a *successful* reading — a quota window at 100% with `reached: true`. It is never an error. A failure to read the source at all is reported separately through `usage.pollError` and a `usage.pollErrorKind` drawn from a provider-neutral set: `unauthenticated` (the harness credential was rejected), `throttled` (the telemetry source is rate limiting), `network`, `http`, `malformed` (an unfamiliar credential or payload shape), or `provider` (an error the harness itself reported).
+
+Adapters keep the last successfully observed windows when a poll fails, and consumers must present the difference between "this provider exposes no such window", "the source failed", and "0% used" as three distinct states. Local per-request history is an independent source and continues to work when account telemetry does not.
+
+## Experimental usage sources
+
+A provider with no documented usage interface may expose one behind an explicit opt-in. Such a source must default to off, advertise `usage.quotaWindowSource` so consumers can label it, fail closed on any unfamiliar credential or response shape rather than guessing, and bound its polling. `capabilities.usage.quotaWindows` reflects what the running instance actually has enabled, not merely what the adapter could do. The Claude Code adapter's OAuth usage source is the current example; see `worker/adapters/claude-usage.mjs`.
 
 ## Adapter responsibilities
 

@@ -81,6 +81,7 @@ services:
       ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
       AGENT_DATA_PATH: /agent-data/usage.json
       USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
+      CLAUDE_OAUTH_USAGE: ${CLAUDE_OAUTH_USAGE:-0}
       DISABLE_AUTOUPDATER: "1"
       BROWSER: echo
     volumes:

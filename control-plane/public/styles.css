@@ -146,6 +146,11 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .quota-bar span { display: block; height: 100%; width: 0; background: var(--acid); border-radius: inherit; transition: width .25s ease; }
 .quota-bar span.warning { background: #ffca62; }
 .quota-bar span.danger { background: var(--danger); }
+/* An empty bar reads as "0% used". A hatched track reads as "no reading". */
+.quota-bar.unavailable {
+  background: repeating-linear-gradient(135deg, #252c28, #252c28 4px, #1b211e 4px, #1b211e 8px);
+  opacity: .7;
+}
 .quota-reset { grid-column: 2 / 4; color: var(--faint); margin-top: -7px; }
 .usage-metrics { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; border-top: 1px solid var(--line); padding-top: 13px; }
 .usage-metrics div { padding-right: 12px; min-width: 0; }

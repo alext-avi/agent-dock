@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
+let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -622,7 +623,27 @@ function renderQuotaRow(label, window) {
   return row;
 }
 
-function renderRuntimeQuota(scope, window, fallbackLabel) {
+// Why a window is missing, worst case first. An adapter that does not expose
+// quota windows is a different situation from a source that failed, and both are
+// different from 0% used — the UI must never let them look alike.
+const POLL_ERROR_COPY = {
+  unauthenticated: 'Sign in again — the provider rejected the worker credential.',
+  throttled: 'The provider is rate limiting usage polling. Retrying shortly.',
+  network: 'The usage source is unreachable.',
+  http: 'The usage source returned an error.',
+  malformed: 'The usage source returned an unrecognized response.'
+};
+
+function quotaUnavailableReason(usage = {}) {
+  const kind = usage.pollErrorKind;
+  if (kind && POLL_ERROR_COPY[kind]) return POLL_ERROR_COPY[kind];
+  if (kind) return 'The usage source is unavailable.';
+  if (!currentUsageCapability.quotaWindows) return `${currentHarnessName} does not expose subscription quota windows.`;
+  if (!usage.lastPollAt) return 'Quota windows have not been polled yet.';
+  return 'No quota window reported.';
+}
+
+function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = '') {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
   const label = ui[`${scope}QuotaLabel`];
   const summary = ui[`${scope}QuotaSummary`];
@@ -632,9 +653,11 @@ function renderRuntimeQuota(scope, window, fallbackLabel) {
   summary.textContent = window ? `${used.toFixed(0)}% used` : 'Unavailable';
   bar.style.width = window ? `${used}%` : '0%';
   bar.className = quotaFillClass(used);
+  // An empty bar reads as "0% used". Mark the track so unavailable looks unavailable.
+  bar.parentElement?.classList.toggle('unavailable', !window);
   reset.textContent = window
     ? (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable')
-    : `${currentHarnessName} does not currently expose this window`;
+    : unavailableReason;
 }
 
 function renderUsage(usage = {}) {
@@ -650,17 +673,24 @@ function renderUsage(usage = {}) {
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
+  const reason = quotaUnavailableReason(usage);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderRuntimeQuota('primary', primary, 'Quota window');
-  renderRuntimeQuota('secondary', secondary, 'Additional window');
+  renderRuntimeQuota('primary', primary, 'Quota window', reason);
+  renderRuntimeQuota('secondary', secondary, 'Additional window', reason);
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
     empty.className = 'empty';
-    empty.textContent = 'Quota windows have not been polled yet.';
+    empty.textContent = reason;
     ui.quotaWindows.append(empty);
     return;
+  }
+  if (currentUsageCapability.source === 'experimental-oauth') {
+    const note = document.createElement('p');
+    note.className = 'empty';
+    note.textContent = 'Experimental source: this provider publishes no supported usage API, so these windows may stop working without notice.';
+    ui.quotaWindows.append(note);
   }
   for (const window of windows) ui.quotaWindows.append(renderQuotaRow(quotaWindowLabel(window), window));
 }
@@ -685,6 +715,11 @@ function renderStatus(status) {
     ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}`
     : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !readyToRun || active;
+  currentUsageCapability = {
+    quotaWindows: Boolean(status.capabilities?.usage?.quotaWindows),
+    accountActivity: Boolean(status.capabilities?.usage?.accountActivity),
+    source: status.capabilities?.usage?.quotaWindowSource ?? null
+  };
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
   ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
   ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';

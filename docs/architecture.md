@@ -63,6 +63,7 @@ flowchart TB
 | Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
 | Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/token, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Concurrent runtime attachment is rejected. |
 | Persistence | Current: schema-v2 JSON definitions/runtime registry plus unique Docker named volumes per managed agent. Planned: SQLite locally behind a Postgres-ready repository boundary. |
+| Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default | 
 | Authentication | Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default |
 | Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |
 

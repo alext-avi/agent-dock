@@ -4,9 +4,10 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promi
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { codexAdapterManifest, normalizeCodexEvent } from './adapters/codex.mjs';
+import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows } from './adapters/codex.mjs';
 import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
 import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
+import { ClaudeUsageError, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
@@ -109,6 +110,11 @@ function initialUsage() {
     updatedAt: null,
     lastPollAt: null,
     pollError: null,
+    // Distinguishes a telemetry-source failure from an exhausted plan. An
+    // exhausted plan is a successful poll reporting 100% used, never an error.
+    pollErrorKind: null,
+    // Honours a 429 Retry-After from the usage endpoint.
+    retryAfterAt: null,
     rateLimits: null,
     accountUsage: null,
     totals: {
@@ -162,6 +168,11 @@ export function createWorkerServer(options = {}) {
   const normalizeProviderEvent = adapterId === 'claude-code'
     ? normalizeClaudeEvent
     : adapterId === 'opencode' ? normalizeOpenCodeEvent : normalizeCodexEvent;
+  // Each adapter owns the shape of its own provider's usage envelope, exactly as
+  // it owns the shape of its provider's events.
+  const normalizeProviderQuotaWindows = adapterId === 'claude-code'
+    ? normalizeClaudeQuotaWindows
+    : adapterId === 'codex-cli' ? normalizeCodexQuotaWindows : () => [];
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
     port: Number(options.port ?? process.env.PORT ?? 7777),
@@ -179,9 +190,26 @@ export function createWorkerServer(options = {}) {
     allowUnsandboxed: options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED === '1',
     demoMode,
     dataPath: options.dataPath === null ? null : (options.dataPath ?? process.env.AGENT_DATA_PATH ?? (demoMode ? null : '/agent-data/usage.json')),
-    usagePollIntervalMs: Number(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? 60_000)
+    usagePollIntervalMs: Number(options.usagePollIntervalMs ?? process.env.USAGE_POLL_INTERVAL_MS ?? 60_000),
+    // Experimental, off by default. Enables the undocumented Claude OAuth usage
+    // source described in worker/adapters/claude-usage.mjs.
+    claudeOAuthUsage: options.claudeOAuthUsage ?? process.env.CLAUDE_OAUTH_USAGE === '1',
+    claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
+    claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
+
+  // The manifest states what the adapter implements; this states what this
+  // instance actually has switched on. Claude Code has no supported quota
+  // endpoint, so the window source is only advertised when the operator opts in,
+  // and it is labelled experimental so the UI never presents it as supported.
+  const claudeUsageEnabled = config.adapterId === 'claude-code' && config.claudeOAuthUsage;
+  const capabilities = claudeUsageEnabled
+    ? {
+        ...adapterManifest.capabilities,
+        usage: { ...adapterManifest.capabilities.usage, quotaWindows: true, quotaWindowSource: 'experimental-oauth' }
+      }
+    : adapterManifest.capabilities;
 
   const state = {
     startedAt: new Date().toISOString(),
@@ -392,31 +420,6 @@ export function createWorkerServer(options = {}) {
     return { policy, model: policy.primary };
   }
 
-  function normalizedQuotaWindows(envelope) {
-    const bucketMap = envelope?.rateLimitsByLimitId;
-    const buckets = bucketMap && Object.keys(bucketMap).length
-      ? Object.values(bucketMap)
-      : envelope?.rateLimits ? [envelope.rateLimits] : [];
-    const windows = [];
-    for (const bucket of buckets) {
-      const baseLabel = bucket.limitName || bucket.limitId || 'Provider quota';
-      for (const scope of ['primary', 'secondary']) {
-        const window = bucket[scope];
-        if (!window) continue;
-        windows.push({
-          id: `${bucket.limitId || 'quota'}:${scope}`,
-          label: scope === 'primary' ? baseLabel : `${baseLabel} · secondary`,
-          scope,
-          usedPercent: Number(window.usedPercent ?? 0),
-          windowDurationMinutes: Number(window.windowDurationMins ?? 0) || null,
-          resetsAt: Number(window.resetsAt ?? 0) || null,
-          reached: bucket.rateLimitReachedType === scope
-        });
-      }
-    }
-    return windows;
-  }
-
   function normalizedAccountUsage(accountUsage, { includeDaily = false } = {}) {
     if (!accountUsage) return null;
     const summary = accountUsage.summary ?? {};
@@ -435,12 +438,13 @@ export function createWorkerServer(options = {}) {
   function publicUsage({ includeDaily = false, includeHistory = false } = {}) {
     const allHistory = state.usage.history.slice().reverse();
     const history = includeHistory ? allHistory : allHistory.slice(0, 10);
-    const supportsAccountUsage = adapterManifest.capabilities.usage.accountActivity || adapterManifest.capabilities.usage.quotaWindows;
+    const supportsAccountUsage = capabilities.usage.accountActivity || capabilities.usage.quotaWindows;
     return {
       updatedAt: state.usage.updatedAt,
       lastPollAt: supportsAccountUsage ? state.usage.lastPollAt : null,
       pollError: state.usage.pollError,
-      quotaWindows: normalizedQuotaWindows(state.usage.rateLimits),
+      pollErrorKind: state.usage.pollErrorKind ?? null,
+      quotaWindows: normalizeProviderQuotaWindows(state.usage.rateLimits),
       account: normalizedAccountUsage(state.usage.accountUsage, { includeDaily }),
       totals: state.usage.totals,
       lastRequest: history[0] ?? null,
@@ -482,7 +486,7 @@ export function createWorkerServer(options = {}) {
         storage: 'demo',
         credentialStored: true,
         hasRefreshToken: config.adapterId === 'codex-cli' ? true : null,
-        canForceRefresh: adapterManifest.capabilities.authentication.refresh,
+        canForceRefresh: capabilities.authentication.refresh,
         lastRefreshAt: state.demoAuthLastRefreshAt,
         accessTokenExpiresAt: config.adapterId === 'codex-cli'
           ? new Date(Date.parse(state.demoAuthLastRefreshAt) + 10 * 24 * 60 * 60 * 1000).toISOString()
@@ -643,23 +647,56 @@ export function createWorkerServer(options = {}) {
     });
   }
 
+  // Bounded polling against an undocumented endpoint: never more often than the
+  // configured interval even when a caller forces a refresh, and never before a
+  // 429's Retry-After has elapsed. On any failure the previously observed windows
+  // are kept and the failure is classified, so the UI can say why the source is
+  // stale instead of showing a confident zero.
+  async function pollClaudeUsage() {
+    if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) return;
+    try {
+      state.usage.rateLimits = await fetchClaudeUsage({
+        credentialPaths: claudeCredentialPaths(config.claudeHome, providerEnv.CLAUDE_CONFIG_DIR),
+        endpoint: config.claudeUsageEndpoint,
+        fetchImpl: config.claudeUsageFetch
+      });
+      state.usage.pollError = null;
+      state.usage.pollErrorKind = null;
+      state.usage.retryAfterAt = null;
+    } catch (error) {
+      const kind = error instanceof ClaudeUsageError ? error.kind : 'unknown';
+      state.usage.pollError = clean(error.message).slice(-1000);
+      state.usage.pollErrorKind = kind;
+      if (kind === 'throttled') {
+        const seconds = error.retryAfterSeconds ?? Math.ceil(config.usagePollIntervalMs / 1000);
+        state.usage.retryAfterAt = Date.now() + seconds * 1000;
+      }
+    }
+  }
+
   async function refreshAccountUsage({ force = false } = {}) {
     await usageReady;
     if (state.usagePollPromise) return state.usagePollPromise;
     const lastPoll = state.usage.lastPollAt ? Date.parse(state.usage.lastPollAt) : 0;
-    if (!force && lastPoll && Date.now() - lastPoll < config.usagePollIntervalMs) return publicUsage();
+    const bounded = !force || claudeUsageEnabled;
+    if (bounded && lastPoll && Date.now() - lastPoll < config.usagePollIntervalMs) return publicUsage();
 
     state.usagePollPromise = (async () => {
-      if (config.adapterId !== 'codex-cli') {
+      if (config.adapterId === 'codex-cli') {
+        try {
+          const snapshot = await queryCodexAccount();
+          if (snapshot.rateLimits) state.usage.rateLimits = snapshot.rateLimits;
+          if (snapshot.accountUsage) state.usage.accountUsage = snapshot.accountUsage;
+          state.usage.pollError = snapshot.errors.length ? snapshot.errors.join('; ') : null;
+          state.usage.pollErrorKind = snapshot.errors.length ? 'provider' : null;
+        } catch (error) {
+          state.usage.pollError = clean(error.message).slice(-1000);
+          state.usage.pollErrorKind = 'provider';
+        }
+      } else if (claudeUsageEnabled) {
+        await pollClaudeUsage();
+      } else {
         return publicUsage();
-      }
-      try {
-        const snapshot = await queryCodexAccount();
-        if (snapshot.rateLimits) state.usage.rateLimits = snapshot.rateLimits;
-        if (snapshot.accountUsage) state.usage.accountUsage = snapshot.accountUsage;
-        state.usage.pollError = snapshot.errors.length ? snapshot.errors.join('; ') : null;
-      } catch (error) {
-        state.usage.pollError = clean(error.message).slice(-1000);
       }
       state.usage.lastPollAt = new Date().toISOString();
       await persistUsage().catch((error) => { state.usage.pollError = `Could not persist usage: ${error.message}`; });
@@ -671,7 +708,7 @@ export function createWorkerServer(options = {}) {
   }
 
   async function forceAuthenticationRefresh() {
-    if (!adapterManifest.capabilities.authentication.refresh) {
+    if (!capabilities.authentication.refresh) {
       throw Object.assign(new Error(`${adapterManifest.displayName} does not expose an explicit session-refresh operation`), { status: 409 });
     }
     if (state.authRefreshPromise) return state.authRefreshPromise;
@@ -1069,7 +1106,7 @@ export function createWorkerServer(options = {}) {
             version: version.output,
             startedAt: state.startedAt
           },
-          capabilities: adapterManifest.capabilities,
+          capabilities,
           authentication: publicAuthentication({ login, session }),
           task: {
             active: state.activeJob

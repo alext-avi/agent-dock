@@ -12,6 +12,34 @@ export const codexAdapterManifest = Object.freeze({
   }
 });
 
+// Codex reports quotas as an app-server rate-limit envelope keyed by limit ID,
+// each with primary/secondary sub-windows. Translating it here keeps the shape
+// out of the shared worker, alongside every other Codex-specific format.
+export function normalizeCodexQuotaWindows(envelope) {
+  const bucketMap = envelope?.rateLimitsByLimitId;
+  const buckets = bucketMap && Object.keys(bucketMap).length
+    ? Object.values(bucketMap)
+    : envelope?.rateLimits ? [envelope.rateLimits] : [];
+  const windows = [];
+  for (const bucket of buckets) {
+    const baseLabel = bucket.limitName || bucket.limitId || 'Provider quota';
+    for (const scope of ['primary', 'secondary']) {
+      const window = bucket[scope];
+      if (!window) continue;
+      windows.push({
+        id: `${bucket.limitId || 'quota'}:${scope}`,
+        label: scope === 'primary' ? baseLabel : `${baseLabel} · secondary`,
+        scope,
+        usedPercent: Number(window.usedPercent ?? 0),
+        windowDurationMinutes: Number(window.windowDurationMins ?? 0) || null,
+        resetsAt: Number(window.resetsAt ?? 0) || null,
+        reached: bucket.rateLimitReachedType === scope
+      });
+    }
+  }
+  return windows;
+}
+
 function textFrom(value) {
   if (typeof value === 'string') return value;
   if (value === null || value === undefined) return null;

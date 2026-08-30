@@ -7,7 +7,12 @@
 //   OpenCode  - an adapter exposing no windows, i.e. the "unavailable" state
 //
 //   node .claude/skills/run-dock/demo-fleet.mjs
-//   CONTROL_PLANE_PORT=3100 node .claude/skills/run-dock/demo-fleet.mjs
+//   CONTROL_PLANE_PORT=8900 node .claude/skills/run-dock/demo-fleet.mjs
+//   CONTROL_PLANE_HOST=::1 node .claude/skills/run-dock/demo-fleet.mjs
+//
+// Both default to loopback. Set CONTROL_PLANE_HOST=::1 when `localhost` resolves
+// to IPv6 first and something else already holds the IPv6 wildcard on your port —
+// otherwise the browser reaches that process instead of this one.
 //
 // `npm run demo` is the lighter path when one Codex agent is enough.
 
@@ -20,8 +25,11 @@ import { createWorkerServer } from '../../../worker/server.mjs';
 
 const repo = fileURLToPath(new URL('../../../', import.meta.url));
 const uiPort = Number(process.env.CONTROL_PLANE_PORT ?? 3000);
+const host = process.env.CONTROL_PLANE_HOST ?? '127.0.0.1';
 // Workers sit above the UI port so overriding one override moves the whole set.
 const workerPort = (offset) => uiPort + 4777 + offset;
+// IPv6 literals need brackets in a URL.
+const authority = (port) => (host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`);
 const token = 'local-demo-worker';
 
 // The Claude worker reads a credential file before calling the usage endpoint.
@@ -64,8 +72,8 @@ for (const [index, worker] of workers.entries()) {
     workspace: join(repo, 'workspace'),
     ...worker.options
   });
-  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  urls[worker.name] = `http://127.0.0.1:${port}`;
+  await new Promise((resolve) => server.listen(port, host, resolve));
+  urls[worker.name] = `http://${authority(port)}`;
   console.log(`[worker:${worker.name}] ${urls[worker.name]}`);
 }
 
@@ -78,7 +86,7 @@ const control = createControlPlane({
   opencodeWorkerToken: token,
   dataPath: null
 });
-await new Promise((resolve) => control.listen(uiPort, '127.0.0.1', resolve));
+await new Promise((resolve) => control.listen(uiPort, host, resolve));
 
 // The registry seeds only the default Codex agent; attach one per adapter so the
 // fleet dashboard has something to compare.
@@ -86,7 +94,7 @@ for (const [name, adapter, runtimeId] of [
   ['Claude · experimental quota', 'claude-code', 'legacy-claude-code'],
   ['OpenCode · no quota source', 'opencode', 'legacy-opencode']
 ]) {
-  const response = await fetch(`http://127.0.0.1:${uiPort}/api/v1/agents`, {
+  const response = await fetch(`http://${authority(uiPort)}/api/v1/agents`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name, adapter, runtime: { mode: 'attach', id: runtimeId } })
@@ -95,7 +103,7 @@ for (const [name, adapter, runtimeId] of [
   console.log(`[agent] ${response.status} ${body.agent?.id ?? JSON.stringify(body)}`);
 }
 
-console.log(`\n[demo-ui] http://127.0.0.1:${uiPort}\n`);
+console.log(`\n[demo-ui] http://${authority(uiPort)}\n`);
 
 const shutdown = () => process.exit(0);
 process.on('SIGINT', shutdown);

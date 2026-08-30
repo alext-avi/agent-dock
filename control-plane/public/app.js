@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
+let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -14,7 +15,7 @@ const ui = {
   createDialog: $('#create-agent-dialog'),
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
-  createAdapter: $('#create-adapter'),
+  createAdapterRadios: $$('#create-adapter input[name="adapter"]'),
   attachRuntimeOption: $('#attach-runtime-option'),
   attachRuntimeRadio: $('#attach-runtime-radio'),
   attachRuntimeField: $('#attach-runtime-field'),
@@ -259,13 +260,19 @@ function selectTab(name, { updateHash = true, focus = false } = {}) {
 }
 
 function createAgentCard(agent) {
-  const card = document.createElement('article');
+  // The whole card is the link into the agent. Keep it free of nested
+  // interactive controls so it stays one predictable target.
+  const card = document.createElement('a');
   card.className = 'agent-card';
   card.dataset.agentId = agent.id;
+  card.href = `/agents/${encodeURIComponent(agent.id)}`;
   card.innerHTML = `
     <div class="agent-card-heading">
       <div><p class="kicker"></p><h2></h2></div>
-      <span class="pill neutral status-pill">checking</span>
+      <div class="agent-card-state">
+        <span class="pill neutral status-pill">checking</span>
+        <span class="card-update"></span>
+      </div>
     </div>
     <p class="agent-card-description"></p>
     <div class="card-quota-windows" aria-label="Subscription quota windows">
@@ -276,25 +283,11 @@ function createAgentCard(agent) {
       <div><dt>AUTH</dt><dd class="card-auth">—</dd></div>
       <div><dt>USAGE</dt><dd class="card-usage">—</dd></div>
       <div><dt>REQUESTS</dt><dd class="card-requests">—</dd></div>
-    </dl>
-    <div class="agent-card-footer"><span class="card-update"></span><div><a class="text-button configure-link">Open agent</a><button class="text-button card-delete">Delete</button></div></div>`;
+    </dl>`;
   card.querySelector('.kicker').textContent = `${adapterLabel(agent.adapter)} · ${runtimeLabel(agent.runtime)} · ${agent.id}`;
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
-  const configure = card.querySelector('.configure-link');
-  configure.href = `/agents/${encodeURIComponent(agent.id)}`;
-  card.querySelector('.card-delete').addEventListener('click', async () => {
-    try {
-      if (!await deleteAgentRecord(agent)) return;
-      card.remove();
-      const count = ui.agentGrid.children.length;
-      ui.agentCount.textContent = String(count).padStart(2, '0');
-      ui.emptyFleet.classList.toggle('hidden', count !== 0);
-    } catch (error) {
-      setConnection('offline', error.message);
-    }
-  });
   return card;
 }
 
@@ -315,13 +308,22 @@ function updateAgentCard(card, status) {
   pill.className = `pill status-pill ${active ? 'busy' : authenticated ? 'ready' : 'neutral'}`;
   card.querySelector('.card-auth').textContent = authenticated ? 'connected' : 'required';
   const windows = status.usage?.quotaWindows ?? [];
-  const highest = windows.length ? Math.max(...windows.map((window) => Number(window.usedPercent) || 0)) : null;
-  card.querySelector('.card-usage').textContent = highest === null ? '—' : `${highest.toFixed(0)}% used`;
+  const stale = Boolean(status.usage?.pollErrorKind);
+  // Name the window the headline number came from. The card only draws two bars,
+  // so a bare maximum taken across every window can report a percentage that
+  // nothing visible on the card accounts for.
+  const worst = windows.reduce(
+    (highest, window) => (highest && Number(highest.usedPercent) >= Number(window.usedPercent) ? highest : window),
+    null
+  );
+  card.querySelector('.card-usage').textContent = worst
+    ? `${Number(worst.usedPercent).toFixed(0)}% ${worst.label}${stale ? ' · stale' : ''}`
+    : '—';
   card.querySelector('.card-requests').textContent = formatTokens(status.usage?.totals?.requests ?? 0);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Quota window');
-  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Additional window');
+  renderCardQuota(card.querySelector('.card-quota-primary'), primary, 'Quota window', stale);
+  renderCardQuota(card.querySelector('.card-quota-secondary'), secondary, 'Additional window', stale);
   card.querySelector('.card-update').textContent = `live · ${relativeTime(new Date().toISOString())}`;
 }
 
@@ -331,9 +333,10 @@ function quotaFillClass(used) {
   return '';
 }
 
-function renderCardQuota(row, window, fallbackLabel) {
+function renderCardQuota(row, window, fallbackLabel, stale = false) {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
-  const refresh = quotaRefreshLabel(window?.resetsAt);
+  // A retained reading from before a failed poll has an untrustworthy countdown.
+  const refresh = stale ? 'last known' : quotaRefreshLabel(window?.resetsAt);
   row.querySelector('.card-quota-label').textContent = window
     ? `${quotaWindowLabel(window, fallbackLabel)}${refresh ? ` · ${refresh}` : ''}`
     : fallbackLabel;
@@ -342,6 +345,7 @@ function renderCardQuota(row, window, fallbackLabel) {
   fill.style.width = window ? `${used}%` : '0%';
   fill.className = quotaFillClass(used);
   row.classList.toggle('unavailable', !window);
+  row.classList.toggle('stale', Boolean(window) && stale);
 }
 
 function markAgentCardOffline(card, message) {
@@ -392,8 +396,14 @@ async function refreshDashboardStatuses() {
   }
 }
 
+// The harness is chosen with radio cards rather than a select, so read the
+// checked one rather than an element value.
+function selectedAdapter() {
+  return ui.createAdapterRadios.find((radio) => radio.checked)?.value ?? 'codex-cli';
+}
+
 function syncCreateRuntimeOptions() {
-  const adapter = ui.createAdapter.value;
+  const adapter = selectedAdapter();
   const available = retainedRuntimes.filter((runtime) => runtime.managed && runtime.binding === 'retained' && runtime.adapter === adapter && runtime.attachmentCount === 0);
   ui.attachRuntimeSelect.replaceChildren();
   for (const runtime of available) {
@@ -894,7 +904,7 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
   }
 }
 
-function renderQuotaRow(label, window) {
+function renderQuotaRow(label, window, stale = false) {
   const used = Math.max(0, Math.min(100, Number(window?.usedPercent ?? 0)));
   const row = document.createElement('div');
   row.className = 'quota-row';
@@ -910,29 +920,58 @@ function renderQuotaRow(label, window) {
   const value = document.createElement('span');
   value.className = 'quota-value';
   value.textContent = `${used.toFixed(0)}%`;
+  if (stale) row.classList.add('stale');
   const reset = document.createElement('small');
   reset.className = 'quota-reset';
   const resetDate = window?.resetsAt ? new Date(Number(window.resetsAt) * 1000) : null;
   const formattedDuration = formatQuotaDuration(window?.windowDurationMinutes);
   const duration = formattedDuration ? `${formattedDuration} window` : 'quota window';
-  reset.textContent = resetDate ? quotaRefreshLabel(window.resetsAt) : duration;
+  reset.textContent = stale ? 'last known reading' : resetDate ? quotaRefreshLabel(window.resetsAt) : duration;
   row.append(name, bar, value, reset);
   return row;
 }
 
-function renderRuntimeQuota(scope, window, fallbackLabel) {
+// Why a window is missing, worst case first. An adapter that does not expose
+// quota windows is a different situation from a source that failed, and both are
+// different from 0% used — the UI must never let them look alike.
+const POLL_ERROR_COPY = {
+  unauthenticated: 'Sign in again — the provider rejected the worker credential.',
+  throttled: 'The provider is rate limiting usage polling. Retrying shortly.',
+  network: 'The usage source is unreachable.',
+  http: 'The usage source returned an error.',
+  malformed: 'The usage source returned an unrecognized response.',
+  provider: 'The harness reported a usage error.'
+};
+
+function quotaUnavailableReason(usage = {}) {
+  const kind = usage.pollErrorKind;
+  if (kind && POLL_ERROR_COPY[kind]) return POLL_ERROR_COPY[kind];
+  if (kind) return 'The usage source is unavailable.';
+  if (!currentUsageCapability.quotaWindows) return `${currentHarnessName} does not expose subscription quota windows.`;
+  if (!usage.lastPollAt) return 'Quota windows have not been polled yet.';
+  return 'No quota window reported.';
+}
+
+function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = '', stale = false) {
   const used = window ? Math.max(0, Math.min(100, Number(window.usedPercent ?? 0))) : 0;
   const label = ui[`${scope}QuotaLabel`];
   const summary = ui[`${scope}QuotaSummary`];
   const bar = ui[`${scope}QuotaBar`];
   const reset = ui[`${scope}QuotaReset`];
   label.textContent = quotaWindowLabel(window, fallbackLabel);
-  summary.textContent = window ? `${used.toFixed(0)}% used` : 'Unavailable';
+  summary.textContent = window ? `${used.toFixed(0)}% used${stale ? ' · stale' : ''}` : 'Unavailable';
   bar.style.width = window ? `${used}%` : '0%';
   bar.className = quotaFillClass(used);
-  reset.textContent = window
-    ? (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable')
-    : `${currentHarnessName} does not currently expose this window`;
+  // An empty bar reads as "0% used". Mark the track so unavailable looks unavailable.
+  bar.parentElement?.classList.toggle('unavailable', !window);
+  // A retained window from before a failed poll is not a current reading, and its
+  // reset countdown is no longer trustworthy either.
+  bar.parentElement?.classList.toggle('stale', Boolean(window) && stale);
+  reset.textContent = !window
+    ? unavailableReason
+    : stale
+      ? `Last known reading · ${unavailableReason}`
+      : (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable');
 }
 
 function renderUsage(usage = {}) {
@@ -944,23 +983,33 @@ function renderUsage(usage = {}) {
   ui.agentTotalSummary.textContent = formatTokens(totals.totalTokens ?? 0);
   ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
   ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
-  ui.usagePolledAt.textContent = usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  ui.usagePolledAt.textContent = usage.pollErrorKind && usage.lastSuccessAt
+    ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
+    : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
+  const reason = quotaUnavailableReason(usage);
+  const stale = Boolean(usage.pollErrorKind);
   const primary = windows.find((window) => window.scope === 'primary') ?? windows[0];
   const secondary = windows.find((window) => window.scope === 'secondary') ?? windows[1];
-  renderRuntimeQuota('primary', primary, 'Quota window');
-  renderRuntimeQuota('secondary', secondary, 'Additional window');
+  renderRuntimeQuota('primary', primary, 'Quota window', reason, stale);
+  renderRuntimeQuota('secondary', secondary, 'Additional window', reason, stale);
   ui.quotaWindows.replaceChildren();
   if (!windows.length) {
     const empty = document.createElement('p');
     empty.className = 'empty';
-    empty.textContent = 'Quota windows have not been polled yet.';
+    empty.textContent = reason;
     ui.quotaWindows.append(empty);
     return;
   }
-  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(quotaWindowLabel(window), window));
+  if (currentUsageCapability.source === 'experimental-oauth') {
+    const note = document.createElement('p');
+    note.className = 'empty';
+    note.textContent = 'Experimental source: this provider publishes no supported usage API, so these windows may stop working without notice.';
+    ui.quotaWindows.append(note);
+  }
+  for (const window of windows) ui.quotaWindows.append(renderQuotaRow(window.label ?? quotaWindowLabel(window), window, stale));
 }
 
 function renderStatus(status) {
@@ -983,6 +1032,11 @@ function renderStatus(status) {
     ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}`
     : 'Worker-managed provider sandbox';
   ui.runButton.disabled = !readyToRun || active;
+  currentUsageCapability = {
+    quotaWindows: Boolean(status.capabilities?.usage?.quotaWindows),
+    accountActivity: Boolean(status.capabilities?.usage?.accountActivity),
+    source: status.capabilities?.usage?.quotaWindowSource ?? null
+  };
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
   ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
   ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
@@ -1287,7 +1341,7 @@ async function loadAgent(id) {
 }
 
 ui.createForm.addEventListener('submit', createAgent);
-ui.createAdapter.addEventListener('change', syncCreateRuntimeOptions);
+for (const radio of ui.createAdapterRadios) radio.addEventListener('change', syncCreateRuntimeOptions);
 for (const radio of $$('[name="runtimeMode"]')) radio.addEventListener('change', syncCreateRuntimeOptions);
 $('#new-agent').addEventListener('click', openCreateDialog);
 $('#empty-new-agent').addEventListener('click', openCreateDialog);

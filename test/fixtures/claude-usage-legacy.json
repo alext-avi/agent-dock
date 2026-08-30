@@ -1,0 +1,20 @@
+{
+  "_comment": "The older flat shape, before Anthropic began migrating buckets into limits[]. Kept so the fallback path stays exercised. Also carries a codenamed bucket that must be ignored.",
+  "five_hour": {
+    "utilization": 42.5,
+    "resets_at": "2026-08-30T18:00:00Z"
+  },
+  "seven_day": {
+    "utilization": 12,
+    "resets_at": "2026-09-02T08:59:59.500000+00:00"
+  },
+  "seven_day_opus": null,
+  "juniper_tide": {
+    "utilization": 90,
+    "resets_at": "2026-08-30T20:00:00Z"
+  },
+  "extra_usage": {
+    "is_enabled": false,
+    "currency": "USD"
+  }
+}

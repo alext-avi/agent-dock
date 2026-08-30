@@ -42,5 +42,6 @@ before writing another one.
 - Task output is NDJSON streamed from `/api/v1/agents/:id/tasks`; append events incrementally and keep the
   test conversation ephemeral — it is intentionally not persisted.
 
-Verify with `npm run demo`, which drives the whole UI against a deterministic fake worker without
-authenticating or spending subscription usage.
+Verify in the running app, not just by reading the diff — the `run-dock` skill covers the options.
+`npm run demo` is enough for most work; use its `demo-fleet.mjs` when the change depends on differences
+between adapters, since a single-worker demo hides them.

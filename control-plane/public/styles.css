@@ -98,9 +98,12 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 
 .fleet-heading { display: flex; justify-content: space-between; align-items: end; margin-bottom: 18px; }
 .agent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-.agent-card { background: linear-gradient(145deg, rgba(24,29,26,.96), rgba(16,20,18,.96)); border: 1px solid var(--line); border-radius: 4px; padding: 21px; min-width: 0; transition: border-color .18s ease, transform .18s ease; }
+.agent-card { display: block; color: inherit; text-decoration: none; background: linear-gradient(145deg, rgba(24,29,26,.96), rgba(16,20,18,.96)); border: 1px solid var(--line); border-radius: 4px; padding: 21px; min-width: 0; transition: border-color .18s ease, transform .18s ease; }
 .agent-card:hover { border-color: #455149; transform: translateY(-1px); }
+.agent-card:focus-visible { outline: 2px solid var(--acid); outline-offset: 2px; }
 .agent-card-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; }
+.agent-card-state { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
+.card-update { color: var(--faint); font: 9px ui-monospace, monospace; white-space: nowrap; }
 .agent-card-heading h2 { font-size: 20px; }
 .agent-card-heading .kicker { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card-description { color: var(--muted); min-height: 42px; margin: 15px 0 18px; font-size: 12px; line-height: 1.6; }
@@ -110,15 +113,10 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .card-quota-label { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-quota-value { flex: 0 0 auto; color: var(--ink); font-size: 9px; }
 .card-quota-row.unavailable { opacity: .62; }
-.card-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 13px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.card-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 13px 0 0; border-top: 1px solid var(--line); }
 .card-metrics div { min-width: 0; padding-right: 10px; }
 .card-metrics dt { color: var(--faint); font: 9px ui-monospace, monospace; letter-spacing: .12em; }
 .card-metrics dd { margin: 6px 0 0; font: 11px ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-card-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding-top: 15px; }
-.agent-card-footer > span { color: var(--faint); font: 9px ui-monospace, monospace; }
-.agent-card-footer > div { display: flex; gap: 8px; }
-.configure-link { display: inline-flex; align-items: center; text-decoration: none; }
-.card-delete:hover { color: var(--danger); border-color: #743f3f; }
 .empty-fleet { text-align: center; padding: 60px 24px; }
 .empty-fleet p:not(.eyebrow) { color: var(--muted); }
 
@@ -146,6 +144,14 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .quota-bar span { display: block; height: 100%; width: 0; background: var(--acid); border-radius: inherit; transition: width .25s ease; }
 .quota-bar span.warning { background: #ffca62; }
 .quota-bar span.danger { background: var(--danger); }
+/* A retained reading from before a failed poll is real but no longer current. */
+.quota-bar.stale span { opacity: .45; }
+.card-quota-row.stale, .quota-row.stale { opacity: .68; }
+/* An empty bar reads as "0% used". A hatched track reads as "no reading". */
+.quota-bar.unavailable {
+  background: repeating-linear-gradient(135deg, #252c28, #252c28 4px, #1b211e 4px, #1b211e 8px);
+  opacity: .7;
+}
 .quota-reset { grid-column: 2 / 4; color: var(--faint); margin-top: -7px; }
 .usage-metrics { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; border-top: 1px solid var(--line); padding-top: 13px; }
 .usage-metrics div { padding-right: 12px; min-width: 0; }

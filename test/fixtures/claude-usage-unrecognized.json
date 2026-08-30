@@ -1,0 +1,16 @@
+{
+  "_comment": "A response with no bucket Agent Dock recognizes — the shape Anthropic could ship tomorrow. The normalizer must return no windows so the worker reports the source as unavailable rather than inventing one.",
+  "limits": [
+    {
+      "kind": "monthly_credits",
+      "group": "monthly",
+      "percent": 31,
+      "severity": "normal",
+      "resets_at": "2026-09-30T00:00:00Z",
+      "scope": null,
+      "is_active": true
+    }
+  ],
+  "tangelo": { "utilization": 77, "resets_at": "2026-08-31T00:00:00Z" },
+  "member_dashboard_available": true
+}

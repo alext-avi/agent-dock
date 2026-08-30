@@ -27,6 +27,8 @@ const ADAPTERS = {
       HOME: '/claude-home',
       CLAUDE_HOME: '/claude-home',
       CLAUDE_CONFIG_DIR: '/claude-home/.claude',
+      CLAUDE_OAUTH_USAGE: process.env.CLAUDE_OAUTH_USAGE ?? '0',
+      CLAUDE_OAUTH_USAGE_INTERVAL_MS: process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS ?? '300000',
       DISABLE_AUTOUPDATER: '1',
       BROWSER: 'echo'
     }

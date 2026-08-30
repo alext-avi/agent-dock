@@ -254,11 +254,12 @@
         <p class="dialog-copy">A new managed agent receives an exclusive container and four private volumes: CLI installation, credentials, telemetry, and workspace. No writable agent state is shared.</p>
         <label class="field">Name<input name="name" required maxlength="120" placeholder="Research Agent"></label>
         <label class="field">Purpose<input name="description" maxlength="2000" placeholder="Research and briefing work"></label>
-        <label class="field">Harness<select id="create-adapter" name="adapter">
-          <option value="codex-cli">Codex CLI</option>
-          <option value="claude-code">Claude Code</option>
-          <option value="opencode">OpenCode</option>
-        </select></label>
+        <fieldset id="create-adapter" class="runtime-choice">
+          <legend>Harness</legend>
+          <label class="runtime-option selected"><input type="radio" name="adapter" value="codex-cli" checked><span><strong>Codex CLI</strong><small>OpenAI device flow. Reports subscription quota windows and account token activity.</small></span><span class="pill neutral">openai</span></label>
+          <label class="runtime-option"><input type="radio" name="adapter" value="claude-code"><span><strong>Claude Code</strong><small>Anthropic browser OAuth. Per-request tokens; quota windows only through the experimental source.</small></span><span class="pill neutral">anthropic</span></label>
+          <label class="runtime-option"><input type="radio" name="adapter" value="opencode"><span><strong>OpenCode</strong><small>Multi-provider harness. GitHub Copilot by default; can pin a local Ollama model.</small></span><span class="pill neutral">multi</span></label>
+        </fieldset>
         <fieldset class="runtime-choice">
           <legend>Runtime ownership</legend>
           <label class="runtime-option selected"><input type="radio" name="runtimeMode" value="provision" checked><span><strong>Provision an isolated runtime</strong><small>Creates a private container, worker identity, CLI binary volume, auth home, telemetry store, and workspace.</small></span><span class="pill ready">isolated</span></label>

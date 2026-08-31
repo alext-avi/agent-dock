@@ -157,7 +157,9 @@ async function listWorkspace(root, maxEntries = 250) {
     children.sort((a, b) => a.name.localeCompare(b.name));
     for (const child of children) {
       if (entries.length >= maxEntries) break;
-      if (child.name === '.git') continue;
+      // Neither is an agent artifact, and a dependency tree alone can exhaust
+      // the entry cap and push the agent's real output out of the listing.
+      if (child.name === '.git' || child.name === 'node_modules') continue;
       const childRelative = path.posix.join(relative, child.name);
       const full = path.join(directory, child.name);
       if (child.isDirectory()) {

@@ -157,6 +157,21 @@ The application has no third-party JavaScript dependencies. Run the contract tes
 npm test
 ```
 
+The browser client has its own suite, kept separate because it needs a real browser
+rather than staying hermetic:
+
+```bash
+npx playwright install chromium   # once
+npm run test:ui
+```
+
+Those tests cover what a person sees rather than what the API returns — that an
+unavailable reading is never drawn as a confident zero, that a retained reading from
+before a failed poll is marked stale rather than presented as current, that image
+drift appears only for a managed runtime that is behind, that the status poll cannot
+re-enable a runtime refresh mid-request, and that no worker endpoint or token reaches
+the DOM.
+
 To exercise the complete UI without authenticating or spending subscription usage, start the deterministic demo worker:
 
 ```bash

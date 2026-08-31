@@ -7,7 +7,7 @@ import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows } from './adapters/codex.mjs';
 import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
 import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
-import { ClaudeUsageError, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
+import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 import { createMcpManager } from './mcp/manager.mjs';
 
@@ -291,8 +291,14 @@ export function createWorkerServer(options = {}) {
     } catch (error) {
       if (error.code !== 'ENOENT') state.usage.pollError = `Could not load usage history: ${error.message}`;
     }
-    // A backoff deadline belongs to the process that received the 429.
-    state.usage.retryAfterAt = null;
+    // A provider asked us to wait; a restart is not permission to ignore that.
+    // But an absurd value must not outlive the process either, so honour the
+    // deadline only as far as the cap we would have accepted in the first place.
+    const stored = Number(state.usage.retryAfterAt);
+    const ceiling = Date.now() + MAX_RETRY_AFTER_SECONDS * 1000;
+    state.usage.retryAfterAt = Number.isFinite(stored) && stored > Date.now()
+      ? Math.min(stored, ceiling)
+      : null;
   }
 
   async function persistUsage() {

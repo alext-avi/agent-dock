@@ -480,6 +480,28 @@ export function createWorkerServer(options = {}) {
     };
   }
 
+  function usagePollFloorMs() {
+    return claudeUsageEnabled
+      ? Math.max(config.usagePollIntervalMs, config.claudeUsageIntervalMs)
+      : config.usagePollIntervalMs;
+  }
+
+  function nextUsageAttemptMs() {
+    const lastPoll = state.usage.lastPollAt ? Date.parse(state.usage.lastPollAt) : 0;
+    const floorEnds = lastPoll ? lastPoll + usagePollFloorMs() : 0;
+    return Math.max(state.usage.retryAfterAt ?? 0, floorEnds);
+  }
+
+  function nextUsageAttemptAt() {
+    const at = nextUsageAttemptMs();
+    return at > Date.now() ? new Date(at).toISOString() : null;
+  }
+
+  function nextUsageAttemptReason() {
+    if (nextUsageAttemptMs() <= Date.now()) return null;
+    return state.usage.retryAfterAt && state.usage.retryAfterAt > Date.now() ? 'provider-backoff' : 'poll-floor';
+  }
+
   function publicUsage({ includeDaily = false, includeHistory = false } = {}) {
     const allHistory = state.usage.history.slice().reverse();
     const history = includeHistory ? allHistory : allHistory.slice(0, 10);
@@ -488,6 +510,12 @@ export function createWorkerServer(options = {}) {
       updatedAt: state.usage.updatedAt,
       lastPollAt: supportsAccountUsage ? state.usage.lastPollAt : null,
       lastSuccessAt: supportsAccountUsage ? (state.usage.lastSuccessAt ?? null) : null,
+      // The earliest the source will actually be read again, whichever reason
+      // applies: a provider Retry-After, or our own poll floor. Null when a
+      // refresh would go through right now.
+      nextAttemptAt: nextUsageAttemptAt(),
+      // Which of the two is holding it, so a client can word it honestly.
+      nextAttemptReason: nextUsageAttemptReason(),
       pollError: state.usage.pollError,
       pollErrorKind: state.usage.pollErrorKind ?? null,
       quotaWindows: normalizeProviderQuotaWindows(state.usage.rateLimits),
@@ -699,7 +727,11 @@ export function createWorkerServer(options = {}) {
   // are kept and the failure is classified, so the UI can say why the source is
   // stale instead of showing a confident zero.
   async function pollClaudeUsage() {
-    if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) return;
+    if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) {
+      // Keep the existing classification and deadline visible instead of
+      // pretending the attempt happened.
+      return;
+    }
     // Demo mode must never reach a provider. queryCodexAccount stubs itself the
     // same way; without this a demo worker with an inherited credential would
     // make a real call to an undocumented endpoint.

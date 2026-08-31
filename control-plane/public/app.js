@@ -12,6 +12,10 @@ let runtimeDriftReadAt = 0;
 // a refresh is in flight the handler owns it, or the poll re-enables a button
 // mid-request and a second click fires a POST the server correctly rejects.
 let runtimeRefreshInFlight = false;
+// Neither a provider Retry-After nor our own poll floor is something a click can
+// skip, so the refresh control must not pretend otherwise.
+let usageBackingOff = false;
+let usageThrottled = false;
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -1011,7 +1015,7 @@ function renderQuotaRow(label, window, stale = false) {
 // different from 0% used — the UI must never let them look alike.
 const POLL_ERROR_COPY = {
   unauthenticated: 'Sign in again — the provider rejected the worker credential.',
-  throttled: 'The provider is rate limiting usage polling. Retrying shortly.',
+  throttled: 'The provider is rate limiting usage polling.',
   network: 'The usage source is unreachable.',
   http: 'The usage source returned an error.',
   malformed: 'The usage source returned an unrecognized response.',
@@ -1049,6 +1053,14 @@ function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = ''
       : (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable');
 }
 
+// Waiting on the floor after a clean read means the numbers are current; waiting
+// after a failure does not, and must not read as if it did.
+function waitingLabel(pollErrorKind, throttled) {
+  if (throttled || pollErrorKind === 'throttled') return 'Rate limited';
+  if (pollErrorKind) return 'Retrying';
+  return 'Up to date';
+}
+
 function renderUsage(usage = {}) {
   const last = usage.lastRequest;
   const totals = usage.totals ?? {};
@@ -1058,9 +1070,20 @@ function renderUsage(usage = {}) {
   ui.agentTotalSummary.textContent = formatTokens(totals.totalTokens ?? 0);
   ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
   ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
-  ui.usagePolledAt.textContent = usage.pollErrorKind && usage.lastSuccessAt
-    ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
-    : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  const waitingUntil = usage.nextAttemptAt ? Date.parse(usage.nextAttemptAt) : 0;
+  const waiting = waitingUntil > Date.now();
+  const throttled = usage.nextAttemptReason === 'provider-backoff';
+  ui.usagePolledAt.textContent = waiting
+    ? `${throttled ? 'rate limited by provider' : 'next read'} ${timeUntil(usage.nextAttemptAt)}`
+    : usage.pollErrorKind && usage.lastSuccessAt
+      ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
+      : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  usageBackingOff = waiting;
+  usageThrottled = throttled;
+  if (waiting) {
+    ui.refreshUsage.disabled = true;
+    ui.refreshUsage.textContent = waitingLabel(usage.pollErrorKind, throttled);
+  }
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
@@ -1118,8 +1141,14 @@ function renderStatus(status) {
     source: status.capabilities?.usage?.quotaWindowSource ?? null
   };
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
-  ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
-  ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
+  const nextAttempt = status.usage?.nextAttemptAt ? Date.parse(status.usage.nextAttemptAt) : 0;
+  usageBackingOff = nextAttempt > Date.now();
+  usageThrottled = status.usage?.nextAttemptReason === 'provider-backoff';
+  ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage || usageBackingOff;
+  ui.refreshUsage.textContent = !canRefreshAccountUsage
+    ? 'Not available'
+    : !usageBackingOff ? 'Refresh'
+      : waitingLabel(status.usage?.pollErrorKind, usageThrottled);
   // The harness's own auth check and the provider can disagree: a token the CLI
   // still considers present can be rejected upstream. When that happens the UI
   // asks the operator to sign in again, so the control has to allow it.
@@ -1257,7 +1286,7 @@ async function refreshUsage() {
     ui.usageError.textContent = error.message;
     ui.usageError.classList.remove('hidden');
   } finally {
-    ui.refreshUsage.disabled = false;
+    ui.refreshUsage.disabled = usageBackingOff;
   }
 }
 

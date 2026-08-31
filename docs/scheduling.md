@@ -61,7 +61,7 @@ Retries are intentionally fixed at one attempt in this slice. A later retry impl
 
 Open `/jobs` from the top navigation. The working surface keeps the scheduler state, active-job count, next occurrence, and recent success rate above the queue. Every job card shows its agent, timing rule, next run, current state, last result, duration, usage, task ID, and five most recent durable run records.
 
-The create/edit dialog supports one-off browser-local date selection and recurring cron plus IANA timezone input. Run-now, pause, resume, edit, and delete are available from the queue; completed one-off jobs can be manually rerun or deleted but their original timing is immutable. The page refreshes every three seconds while visible and preserves the same empty, error, and offline language as the fleet dashboard.
+The create/edit dialog keeps cron out of the operator experience. A person can choose **Run once later** with a browser-local date and time, or select an hourly, daily, weekday, weekly, or monthly cadence with contextual time/day controls and a plain-language summary. The UI translates recurring choices into the API's cron representation. An advanced expression created directly through the API is preserved without exposing its notation; choosing a standard cadence replaces it. Run-now, pause, resume, edit, and delete are available from the queue; completed one-off jobs can be manually rerun or deleted but their original timing is immutable. The page refreshes every three seconds while visible and preserves the same empty, error, and offline language as the fleet dashboard.
 
 ## Operator API
 

@@ -45,8 +45,20 @@ const ui = {
   jobOnceFields: $('#job-once-fields'),
   jobCronFields: $('#job-cron-fields'),
   jobRunAt: $('#job-run-at'),
+  jobOnceSummary: $('#job-once-summary'),
   jobCron: $('#job-cron'),
+  jobFrequency: $('#job-frequency'),
+  jobRepeatTimeField: $('#job-repeat-time-field'),
+  jobRepeatTime: $('#job-repeat-time'),
+  jobWeekdayField: $('#job-weekday-field'),
+  jobWeekday: $('#job-weekday'),
+  jobMonthDayField: $('#job-month-day-field'),
+  jobMonthDay: $('#job-month-day'),
+  jobHourMinuteField: $('#job-hour-minute-field'),
+  jobHourMinute: $('#job-hour-minute'),
   jobTimezone: $('#job-timezone'),
+  jobCustomSchedule: $('#job-custom-schedule'),
+  jobScheduleSummary: $('#job-schedule-summary'),
   jobTimeout: $('#job-timeout'),
   jobFormMessage: $('#job-form-message'),
   deleteJob: $('#delete-job'),
@@ -455,10 +467,64 @@ function scheduleCountdown(iso) {
   return `in ${days} day${days === 1 ? '' : 's'}`;
 }
 
+const JOB_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function friendlyTime(value) {
+  const [hour, minute] = String(value || '').split(':').map(Number);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return 'a selected time';
+  const date = new Date(2000, 0, 1, hour, minute);
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
+}
+
+function timezoneLabel(timezone) {
+  if (timezone === 'UTC') return 'UTC';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: timezone,
+      timeZoneName: 'longGeneric'
+    }).formatToParts(new Date()).find((part) => part.type === 'timeZoneName')?.value ?? timezone.replaceAll('_', ' ');
+  } catch {
+    return String(timezone || 'local time').replaceAll('_', ' ');
+  }
+}
+
+function parseRecurringExpression(expression) {
+  const fields = String(expression || '').trim().split(/\s+/);
+  if (fields.length !== 5) return { frequency: 'custom' };
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+  if (!/^\d+$/.test(minute) || month !== '*') return { frequency: 'custom' };
+  const minuteNumber = Number(minute);
+  if (hour === '*' && dayOfMonth === '*' && dayOfWeek === '*') {
+    return { frequency: 'hourly', minute: minuteNumber };
+  }
+  if (!/^\d+$/.test(hour)) return { frequency: 'custom' };
+  const time = `${String(Number(hour)).padStart(2, '0')}:${String(minuteNumber).padStart(2, '0')}`;
+  if (dayOfMonth === '*' && dayOfWeek === '1-5') return { frequency: 'weekdays', time };
+  if (dayOfMonth === '*' && dayOfWeek === '*') return { frequency: 'daily', time };
+  if (dayOfMonth === '*' && /^[0-6]$/.test(dayOfWeek)) return { frequency: 'weekly', time, weekday: dayOfWeek };
+  if (/^\d+$/.test(dayOfMonth) && dayOfWeek === '*') return { frequency: 'monthly', time, monthDay: Number(dayOfMonth) };
+  return { frequency: 'custom' };
+}
+
+function recurringDescription(timing) {
+  const parsed = parseRecurringExpression(timing.expression);
+  const zone = timezoneLabel(timing.timezone);
+  if (parsed.frequency === 'hourly') {
+    const minute = parsed.minute === 0 ? 'at the start of every hour' : `${parsed.minute} minutes past every hour`;
+    return `${minute} · ${zone}`;
+  }
+  const at = friendlyTime(parsed.time);
+  if (parsed.frequency === 'weekdays') return `Every weekday at ${at} · ${zone}`;
+  if (parsed.frequency === 'daily') return `Every day at ${at} · ${zone}`;
+  if (parsed.frequency === 'weekly') return `Every ${JOB_WEEKDAYS[Number(parsed.weekday)]} at ${at} · ${zone}`;
+  if (parsed.frequency === 'monthly') return `Day ${parsed.monthDay} of every month at ${at} · ${zone}`;
+  return `Recurring on a custom cadence · ${zone}`;
+}
+
 function scheduleTimingLabel(schedule) {
   return schedule.timing.kind === 'once'
-    ? `Once · ${scheduleDateTime(schedule.timing.at)}`
-    : `${schedule.timing.expression} · ${schedule.timing.timezone}`;
+    ? `Run once · ${scheduleDateTime(schedule.timing.at)}`
+    : recurringDescription(schedule.timing);
 }
 
 function runPresentation(status) {
@@ -759,17 +825,104 @@ function localDateTimeValue(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function ensureTimezoneOption(timezone) {
+  if (!timezone || [...ui.jobTimezone.options].some((option) => option.value === timezone)) return;
+  const option = document.createElement('option');
+  option.value = timezone;
+  option.textContent = timezoneLabel(timezone);
+  ui.jobTimezone.prepend(option);
+}
+
+function populateJobTimezones(selected) {
+  const local = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const common = ['UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
+  const zones = [...new Set([local, selected, ...common].filter(Boolean))];
+  ui.jobTimezone.replaceChildren();
+  for (const timezone of zones) {
+    const option = document.createElement('option');
+    option.value = timezone;
+    option.textContent = timezone === local ? `${timezoneLabel(timezone)} (current)` : timezoneLabel(timezone);
+    ui.jobTimezone.append(option);
+  }
+  ui.jobTimezone.value = selected || local;
+}
+
+function buildRecurringExpression() {
+  const [hour, minute] = ui.jobRepeatTime.value.split(':').map(Number);
+  switch (ui.jobFrequency.value) {
+    case 'hourly': return `${Number(ui.jobHourMinute.value)} * * * *`;
+    case 'daily': return `${minute} ${hour} * * *`;
+    case 'weekdays': return `${minute} ${hour} * * 1-5`;
+    case 'weekly': return `${minute} ${hour} * * ${ui.jobWeekday.value}`;
+    case 'monthly': return `${minute} ${hour} ${Number(ui.jobMonthDay.value)} * *`;
+    case 'custom': return ui.jobCron.value;
+    default: return '';
+  }
+}
+
+function updateJobScheduleSummary() {
+  const once = new Date(ui.jobRunAt.value);
+  ui.jobOnceSummary.textContent = Number.isFinite(once.valueOf())
+    ? `This job will run once on ${new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' }).format(once)}.`
+    : 'Choose when this job should run.';
+
+  const expression = buildRecurringExpression();
+  ui.jobScheduleSummary.textContent = expression
+    ? recurringDescription({ expression, timezone: ui.jobTimezone.value })
+    : 'Choose how often this job should repeat.';
+}
+
+function syncJobRecurrenceFields() {
+  const frequency = ui.jobFrequency.value;
+  const custom = frequency === 'custom';
+  ui.jobRepeatTimeField.classList.toggle('hidden', frequency === 'hourly' || custom);
+  ui.jobWeekdayField.classList.toggle('hidden', frequency !== 'weekly');
+  ui.jobMonthDayField.classList.toggle('hidden', frequency !== 'monthly');
+  ui.jobHourMinuteField.classList.toggle('hidden', frequency !== 'hourly');
+  ui.jobCustomSchedule.classList.toggle('hidden', !custom);
+  ui.jobRepeatTime.required = !custom && frequency !== 'hourly';
+  ui.jobMonthDay.required = frequency === 'monthly';
+  updateJobScheduleSummary();
+}
+
+function applyRecurringExpression(expression) {
+  const parsed = parseRecurringExpression(expression);
+  let customOption = ui.jobFrequency.querySelector('option[value="custom"]');
+  if (parsed.frequency === 'custom' && !customOption) {
+    customOption = document.createElement('option');
+    customOption.value = 'custom';
+    customOption.textContent = 'Advanced schedule (unchanged)';
+    ui.jobFrequency.append(customOption);
+  }
+  ui.jobFrequency.value = parsed.frequency;
+  if (parsed.time) ui.jobRepeatTime.value = parsed.time;
+  if (parsed.weekday !== undefined) ui.jobWeekday.value = String(parsed.weekday);
+  if (parsed.monthDay !== undefined) ui.jobMonthDay.value = String(parsed.monthDay);
+  if (parsed.minute !== undefined) {
+    const minute = String(parsed.minute);
+    if (![...ui.jobHourMinute.options].some((option) => option.value === minute)) {
+      const option = document.createElement('option');
+      option.value = minute;
+      option.textContent = `${minute} minutes past`;
+      ui.jobHourMinute.append(option);
+    }
+    ui.jobHourMinute.value = minute;
+  }
+  syncJobRecurrenceFields();
+}
+
 function syncJobTimingFields() {
   const timing = ui.jobForm.querySelector('[name="jobTiming"]:checked')?.value ?? 'once';
   const recurring = timing === 'cron';
   ui.jobOnceFields.classList.toggle('hidden', recurring);
   ui.jobCronFields.classList.toggle('hidden', !recurring);
   ui.jobRunAt.required = !recurring;
-  ui.jobCron.required = recurring;
+  ui.jobFrequency.required = recurring;
   ui.jobTimezone.required = recurring;
   for (const option of ui.jobForm.querySelectorAll('.timing-option')) {
     option.classList.toggle('selected', option.querySelector('input')?.checked === true);
   }
+  syncJobRecurrenceFields();
 }
 
 function populateJobAgents(selectedId = '') {
@@ -796,9 +949,15 @@ function openJobDialog(schedule = null) {
   const defaultRunAt = new Date(Date.now() + 60 * 60 * 1000);
   defaultRunAt.setSeconds(0, 0);
   defaultRunAt.setMinutes(Math.ceil(defaultRunAt.getMinutes() / 5) * 5);
+  ui.jobFrequency.querySelector('option[value="custom"]')?.remove();
   ui.jobRunAt.value = localDateTimeValue(defaultRunAt);
   ui.jobCron.value = '0 9 * * 1-5';
-  ui.jobTimezone.value = timezone;
+  ui.jobFrequency.value = 'weekdays';
+  ui.jobRepeatTime.value = '09:00';
+  ui.jobWeekday.value = '1';
+  ui.jobMonthDay.value = '1';
+  ui.jobHourMinute.value = '0';
+  populateJobTimezones(schedule?.timing.timezone || timezone);
   ui.jobTimeout.value = '60';
   if (schedule) {
     ui.jobName.value = schedule.name;
@@ -809,7 +968,9 @@ function openJobDialog(schedule = null) {
     if (schedule.timing.kind === 'once') ui.jobRunAt.value = localDateTimeValue(new Date(schedule.timing.at));
     else {
       ui.jobCron.value = schedule.timing.expression;
+      ensureTimezoneOption(schedule.timing.timezone);
       ui.jobTimezone.value = schedule.timing.timezone;
+      applyRecurringExpression(schedule.timing.expression);
     }
     ui.jobTimeout.value = String(Math.round((schedule.policies?.timeoutMs ?? 3_600_000) / 60_000));
   }
@@ -841,7 +1002,14 @@ async function saveJob(event) {
     }
     timing = { kind: 'once', at: at.toISOString() };
   } else {
-    timing = { kind: 'cron', expression: ui.jobCron.value.trim(), timezone: ui.jobTimezone.value.trim() };
+    const expression = buildRecurringExpression();
+    if (!expression || expression.includes('NaN')) {
+      ui.jobFormMessage.textContent = 'Choose a complete repeating schedule.';
+      ui.jobFormMessage.classList.remove('hidden');
+      return;
+    }
+    ui.jobCron.value = expression;
+    timing = { kind: 'cron', expression, timezone: ui.jobTimezone.value };
   }
   const existing = schedules.find((schedule) => schedule.id === ui.jobId.value);
   const body = {
@@ -1871,6 +2039,12 @@ async function loadAgent(id) {
 ui.createForm.addEventListener('submit', createAgent);
 ui.jobForm.addEventListener('submit', saveJob);
 for (const radio of ui.jobForm.querySelectorAll('[name="jobTiming"]')) radio.addEventListener('change', syncJobTimingFields);
+ui.jobFrequency.addEventListener('change', syncJobRecurrenceFields);
+ui.jobRunAt.addEventListener('input', updateJobScheduleSummary);
+for (const control of [ui.jobRepeatTime, ui.jobWeekday, ui.jobMonthDay, ui.jobHourMinute, ui.jobTimezone]) {
+  control.addEventListener('input', updateJobScheduleSummary);
+  control.addEventListener('change', updateJobScheduleSummary);
+}
 $('#new-job').addEventListener('click', () => openJobDialog());
 $('#empty-new-job').addEventListener('click', () => openJobDialog());
 $('#close-job-dialog').addEventListener('click', () => ui.jobDialog.close());

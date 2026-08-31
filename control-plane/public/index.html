@@ -77,7 +77,7 @@
         <section id="empty-jobs" class="panel empty-fleet hidden">
           <p class="eyebrow">NO SCHEDULED JOBS</p>
           <h2>Give an agent something to own.</h2>
-          <p>Set a one-off time or a recurring cron cadence. The control plane claims each occurrence before asking the agent to work.</p>
+          <p>Choose a future time or a simple repeating cadence. The control plane claims each occurrence before asking the agent to work.</p>
           <button id="empty-new-job" class="button primary" type="button">Create your first job</button>
         </section>
       </div>
@@ -320,18 +320,25 @@
         <label class="field">Task prompt <span>durable job input; the agent's saved instructions are added at run time</span><textarea id="job-prompt" rows="5" maxlength="100000" required placeholder="Review the latest workspace inputs and create an operating brief."></textarea></label>
         <fieldset class="timing-choice">
           <legend>Timing</legend>
-          <label class="timing-option selected"><input type="radio" name="jobTiming" value="once" checked><span><strong>Run once</strong><small>One future date and time</small></span></label>
-          <label class="timing-option"><input type="radio" name="jobTiming" value="cron"><span><strong>Recurring</strong><small>Five-field cron in an IANA timezone</small></span></label>
+          <label class="timing-option selected"><input type="radio" name="jobTiming" value="once" checked><span><strong>Run once later</strong><small>Start this job at one future date and time</small></span></label>
+          <label class="timing-option"><input type="radio" name="jobTiming" value="cron"><span><strong>Repeat on a schedule</strong><small>Choose a familiar cadence in plain language</small></span></label>
         </fieldset>
         <section id="job-once-fields" class="job-timing-fields">
-          <label class="field">Run at <span>shown in your browser's local time</span><input id="job-run-at" type="datetime-local" required></label>
+          <label class="field">Start on <span>shown in your current local time</span><input id="job-run-at" type="datetime-local" required></label>
+          <p id="job-once-summary" class="schedule-summary" aria-live="polite"></p>
         </section>
         <section id="job-cron-fields" class="job-timing-fields hidden">
-          <div class="form-grid">
-            <label class="field">Cron expression<input id="job-cron" inputmode="text" spellcheck="false" placeholder="0 9 * * 1-5"></label>
-            <label class="field">Timezone<input id="job-timezone" list="timezone-options" spellcheck="false" placeholder="America/New_York"><datalist id="timezone-options"><option value="America/New_York"><option value="America/Chicago"><option value="America/Denver"><option value="America/Los_Angeles"><option value="UTC"></datalist></label>
+          <input id="job-cron" type="hidden">
+          <div class="schedule-builder-grid">
+            <label class="field">Repeat<select id="job-frequency" required><option value="weekdays">Every weekday</option><option value="daily">Every day</option><option value="weekly">Every week</option><option value="monthly">Every month</option><option value="hourly">Every hour</option></select></label>
+            <label id="job-repeat-time-field" class="field">At<input id="job-repeat-time" type="time" value="09:00"></label>
+            <label id="job-weekday-field" class="field hidden">On<select id="job-weekday"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></label>
+            <label id="job-month-day-field" class="field hidden">On day<input id="job-month-day" type="number" min="1" max="31" value="1"></label>
+            <label id="job-hour-minute-field" class="field hidden">At<select id="job-hour-minute"><option value="0">the start of the hour</option><option value="15">15 minutes past</option><option value="30">30 minutes past</option><option value="45">45 minutes past</option></select></label>
+            <label class="field">Time zone<select id="job-timezone" required></select></label>
           </div>
-          <p class="cron-help"><code>minute hour day month weekday</code><span>Example: <code>0 9 * * 1-5</code> runs at 9:00 AM Monday–Friday.</span></p>
+          <p id="job-custom-schedule" class="schedule-note hidden">This job has an advanced cadence created through the API. Leave it unchanged, or choose a standard cadence above to replace it.</p>
+          <p id="job-schedule-summary" class="schedule-summary" aria-live="polite"></p>
         </section>
         <details class="job-advanced">
           <summary>Execution policy</summary>

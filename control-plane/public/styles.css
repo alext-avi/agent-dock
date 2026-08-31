@@ -175,8 +175,9 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .timing-option small { margin-top: 3px; color: var(--muted); font-weight: 400; }
 .job-timing-fields { padding: 14px; background: #0d110f; border: 1px solid var(--line); }
 .job-timing-fields .field { margin: 0; }
-.cron-help { display: flex; justify-content: space-between; gap: 14px; margin: 12px 0 0; color: var(--muted); font: 9px/1.4 ui-monospace, monospace; }
-.cron-help code { color: var(--aqua); }
+.schedule-builder-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 12px; }
+.schedule-summary { margin: 12px 0 0; padding: 10px 12px; color: var(--acid); background: #c7ff4a08; border-left: 2px solid #657d35; font-size: 11px; }
+.schedule-note { margin: 12px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .job-advanced { margin-top: 13px; border: 1px solid var(--line); }
 .job-advanced > summary { padding: 11px 13px; color: var(--muted); cursor: pointer; font: 10px ui-monospace, monospace; }
 .job-policy-grid { display: grid; grid-template-columns: .7fr 1fr 1fr; gap: 12px; padding: 13px; border-top: 1px solid var(--line); }
@@ -375,8 +376,7 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .job-run-meta { grid-column: 1 / -1; grid-row: 2; }
   .job-history-row { grid-template-columns: 1fr 1fr; }
   .job-history-row > :last-child { grid-column: 1 / -1; }
-  .timing-choice, .job-policy-grid { grid-template-columns: 1fr; }
-  .cron-help { flex-direction: column; }
+  .timing-choice, .job-policy-grid, .schedule-builder-grid { grid-template-columns: 1fr; }
   .card-quota-windows { grid-template-columns: 1fr; }
   .capability-grid, .data-grid { grid-template-columns: 1fr; }
   .mcp-toolbar { grid-template-columns: 1fr; }

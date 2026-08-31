@@ -3,6 +3,10 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
+// Image drift only changes when someone rebuilds, so it is read per page load
+// rather than in the three-second status poll, which would mean a Docker
+// inspection per agent per tick.
+let runtimeDrift = new Map();
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -57,6 +61,7 @@ const ui = {
   pageAgentDescription: $('#page-agent-description'),
   agentIdLabel: $('#agent-id-label'),
   workerState: $('#worker-state'),
+  runtimeDrift: $('#runtime-drift'),
   agentName: $('#agent-name'),
   runtimeIcon: $('#runtime-icon'),
   runtimeLocation: $('#runtime-location'),
@@ -147,6 +152,26 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
   return data;
+}
+
+async function loadRuntimeDrift() {
+  try {
+    const { runtimes } = await api(`${API_ROOT}/runtimes`);
+    runtimeDrift = new Map(runtimes.map((runtime) => [runtime.id, runtime]));
+  } catch {
+    // Drift is advisory. Failing to read it must not block the fleet.
+    runtimeDrift = new Map();
+  }
+}
+
+function renderRuntimeDrift() {
+  const outdated = runtimeIsOutdated(currentAgent?.runtime);
+  ui.runtimeDrift.classList.toggle('hidden', !outdated);
+  ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
+}
+
+function runtimeIsOutdated(runtime) {
+  return runtimeDrift.get(runtime?.id)?.outdated === true;
 }
 
 function agentApi(operation = '') {
@@ -273,6 +298,7 @@ function createAgentCard(agent) {
       <div class="agent-card-state">
         <span class="pill neutral status-pill">checking</span>
         <span class="card-update"></span>
+        <span class="card-outdated hidden">image update available</span>
       </div>
     </div>
     <p class="agent-card-description"></p>
@@ -289,6 +315,7 @@ function createAgentCard(agent) {
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
+  card.querySelector('.card-outdated').classList.toggle('hidden', !runtimeIsOutdated(agent.runtime));
   return card;
 }
 
@@ -361,7 +388,7 @@ async function loadDashboard() {
   ui.agentView.classList.add('hidden');
   document.title = 'Agent Dock — Fleet';
   try {
-    const { agents } = await api(`${API_ROOT}/agents`);
+    const [{ agents }] = await Promise.all([api(`${API_ROOT}/agents`), loadRuntimeDrift()]);
     setConnection('online', 'Control plane online');
     renderAgentGrid(agents);
     await refreshDashboardStatuses();
@@ -862,19 +889,19 @@ async function refreshRuntimeImage() {
     + 'The runtime restarts and is briefly unavailable.'
   );
   if (!confirmed) return;
-  const previous = ui.refreshRuntime.textContent;
   ui.refreshRuntime.disabled = true;
   ui.refreshRuntime.textContent = 'Refreshing…';
   try {
     const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
     currentAgent.runtime = result.runtime;
     setConnection('online', `Runtime refreshed onto ${result.runtime.image || 'the current image'}`);
+    await loadRuntimeDrift();
     await refreshStatus();
   } catch (error) {
     setConnection('offline', error.message);
   } finally {
-    ui.refreshRuntime.textContent = previous;
     ui.refreshRuntime.disabled = false;
+    renderRuntimeDrift();
   }
 }
 
@@ -1063,6 +1090,7 @@ function renderStatus(status) {
   // Only a managed runtime has a container of ours to replace, and never while
   // a task is running.
   ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
+  renderRuntimeDrift();
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
     quotaWindows: Boolean(status.capabilities?.usage?.quotaWindows),
@@ -1358,7 +1386,7 @@ async function loadAgent(id) {
   ui.agentView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
   try {
-    const result = await api(`${API_ROOT}/agents/${encodeURIComponent(id)}`);
+    const [result] = await Promise.all([api(`${API_ROOT}/agents/${encodeURIComponent(id)}`), loadRuntimeDrift()]);
     currentAgent = result.agent;
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;

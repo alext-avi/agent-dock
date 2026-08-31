@@ -710,6 +710,10 @@ export function createControlPlane(options = {}) {
 
     const replaced = await runtimeManager.recreate(runtime, { agentId: agent.id });
     Object.assign(runtime, replaced);
+    // outdated is computed during a fleet poll, so without this the response
+    // would still report the drift that was just resolved.
+    const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
+    runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
     await persistAgents();
     return json(res, 200, {
       runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),

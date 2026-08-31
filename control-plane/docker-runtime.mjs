@@ -277,6 +277,7 @@ export class DockerRuntimeManager {
       const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(containerName)}`, body);
       containerId = created.Id;
       await this.request('POST', `/containers/${encodeURIComponent(containerId)}/start`);
+      const inspected = await this.request('GET', `/containers/${encodeURIComponent(containerId)}/json`).catch(() => null);
       return {
         id: runtimeId,
         adapter,
@@ -289,6 +290,7 @@ export class DockerRuntimeManager {
         containerId,
         containerName,
         image,
+        imageId: inspected?.Image ?? null,
         volumes,
         state: 'starting',
         createdAt: new Date().toISOString(),
@@ -354,11 +356,13 @@ export class DockerRuntimeManager {
     }
     const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(runtime.containerName)}`, body);
     await this.request('POST', `/containers/${encodeURIComponent(created.Id)}/start`);
+    const inspected = await this.request('GET', `/containers/${encodeURIComponent(created.Id)}/json`).catch(() => null);
     return {
       containerId: created.Id,
       containerName: runtime.containerName,
       workerUrl: `http://${runtime.containerName}:7777`,
       image,
+      imageId: inspected?.Image ?? null,
       volumes,
       state: 'starting',
       updatedAt: new Date().toISOString()

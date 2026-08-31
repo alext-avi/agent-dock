@@ -69,6 +69,7 @@ class FakeRuntimeManager {
       containerId: `container-${suffix}`,
       containerName: `agent-dock-runtime-${suffix}`,
       image: this.image,
+      imageId: this.image,
       volumes: {
         auth: `auth-${suffix}`,
         binary: `binary-${suffix}`,
@@ -84,7 +85,13 @@ class FakeRuntimeManager {
     return runtime;
   }
 
-  async inspect(runtime) { return { state: runtime.state, health: 'healthy', image: runtime.image ?? null }; }
+  async inspect(runtime) {
+    return { state: runtime.state, health: 'healthy', image: runtime.image ?? null, imageId: runtime.imageId ?? null, containerId: runtime.containerId };
+  }
+
+  // The tag does not move on a rebuild; the image id does. Mirrors the real
+  // manager so drift can be exercised without Docker.
+  async currentImageId() { return this.image; }
 
   // Mirrors the real manager: a new container id, the same name and volumes, and
   // the currently configured image. Volumes are never touched.
@@ -95,6 +102,7 @@ class FakeRuntimeManager {
       containerName: runtime.containerName,
       workerUrl: runtime.workerUrl,
       image: this.image,
+      imageId: this.image,
       volumes: runtime.volumes,
       state: 'starting',
       updatedAt: new Date().toISOString()
@@ -657,6 +665,7 @@ test('refreshing a runtime replaces its container while retaining every volume',
 
   assert.equal(body.refreshed, true);
   assert.equal(body.runtime.image, 'agent-dock-worker:v2', 'the runtime did not move onto the current image');
+  assert.equal(body.runtime.outdated, false, 'the response still reported drift it had just resolved');
   assert.equal(body.runtime.id, before.id, 'refreshing must not change runtime identity');
   assert.equal(body.runtime.binding, 'dedicated', 'exclusivity must survive a refresh');
   assert.equal(body.runtime.attachmentCount, 1);

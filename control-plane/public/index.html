@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=6">
+    <link rel="stylesheet" href="/styles.css?v=7">
   </head>
   <body>
     <header class="topbar">
@@ -15,6 +15,7 @@
       </a>
       <div class="topbar-right">
         <a class="nav-link" href="/">Fleet</a>
+        <a class="nav-link" href="/jobs">Jobs</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
       </div>
     </header>
@@ -44,6 +45,40 @@
           <h2>Define your first agent.</h2>
           <p>Create an agent with its own container, CLI installation, credentials, telemetry, and workspace.</p>
           <button id="empty-new-agent" class="button primary">Create agent</button>
+        </section>
+      </div>
+
+      <div id="jobs-view" class="view hidden">
+        <section class="jobs-header">
+          <div>
+            <p class="eyebrow">CONTROL PLANE · SCHEDULER</p>
+            <h1>Scheduled <em>jobs.</em></h1>
+            <p class="hero-copy">Task an agent once or on a recurring cadence. Every occurrence, skip, failure, and usage reading remains visible here.</p>
+          </div>
+          <div class="jobs-header-actions">
+            <span id="scheduler-state" class="pill neutral">checking scheduler</span>
+            <button id="new-job" class="button primary" type="button">New job <span>＋</span></button>
+          </div>
+        </section>
+
+        <section class="job-summary-grid" aria-label="Schedule summary">
+          <article><span>ACTIVE</span><strong id="active-job-count">—</strong><small>eligible to run</small></article>
+          <article><span>NEXT OCCURRENCE</span><strong id="next-job-time">—</strong><small id="next-job-name">No active schedule</small></article>
+          <article><span>RECENT OUTCOMES</span><strong id="job-success-rate">—</strong><small id="job-outcome-count">No runs recorded</small></article>
+        </section>
+
+        <section class="fleet-heading jobs-heading">
+          <div><p class="kicker">JOBS</p><h2>Automation queue</h2></div>
+          <span id="jobs-refreshed" class="hint">Loading durable schedules…</span>
+        </section>
+        <section id="job-grid" class="job-grid" aria-live="polite">
+          <article class="panel job-loading"><span class="job-loading-line"></span><span class="job-loading-line short"></span></article>
+        </section>
+        <section id="empty-jobs" class="panel empty-fleet hidden">
+          <p class="eyebrow">NO SCHEDULED JOBS</p>
+          <h2>Give an agent something to own.</h2>
+          <p>Set a one-off time or a recurring cron cadence. The control plane claims each occurrence before asking the agent to work.</p>
+          <button id="empty-new-job" class="button primary" type="button">Create your first job</button>
         </section>
       </div>
 
@@ -271,6 +306,44 @@
       </form>
     </dialog>
 
+    <dialog id="job-dialog" class="job-dialog" aria-labelledby="job-dialog-title">
+      <form id="job-form" method="dialog">
+        <input id="job-id" type="hidden">
+        <div class="dialog-heading"><div><p class="kicker">DURABLE AUTOMATION</p><h2 id="job-dialog-title">New scheduled job</h2></div><button id="close-job-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
+        <p class="dialog-copy">The control plane stores the schedule and dispatches the prompt through the selected agent's normal wrapper.</p>
+        <div class="form-grid">
+          <label class="field">Name<input id="job-name" required maxlength="160" placeholder="Weekday operating brief"></label>
+          <label class="field">Agent<select id="job-agent" required></select></label>
+        </div>
+        <label class="field">Task prompt <span>durable job input; the agent's saved instructions are added at run time</span><textarea id="job-prompt" rows="5" maxlength="100000" required placeholder="Review the latest workspace inputs and create an operating brief."></textarea></label>
+        <fieldset class="timing-choice">
+          <legend>Timing</legend>
+          <label class="timing-option selected"><input type="radio" name="jobTiming" value="once" checked><span><strong>Run once</strong><small>One future date and time</small></span></label>
+          <label class="timing-option"><input type="radio" name="jobTiming" value="cron"><span><strong>Recurring</strong><small>Five-field cron in an IANA timezone</small></span></label>
+        </fieldset>
+        <section id="job-once-fields" class="job-timing-fields">
+          <label class="field">Run at <span>shown in your browser's local time</span><input id="job-run-at" type="datetime-local" required></label>
+        </section>
+        <section id="job-cron-fields" class="job-timing-fields hidden">
+          <div class="form-grid">
+            <label class="field">Cron expression<input id="job-cron" inputmode="text" spellcheck="false" placeholder="0 9 * * 1-5"></label>
+            <label class="field">Timezone<input id="job-timezone" list="timezone-options" spellcheck="false" placeholder="America/New_York"><datalist id="timezone-options"><option value="America/New_York"><option value="America/Chicago"><option value="America/Denver"><option value="America/Los_Angeles"><option value="UTC"></datalist></label>
+          </div>
+          <p class="cron-help"><code>minute hour day month weekday</code><span>Example: <code>0 9 * * 1-5</code> runs at 9:00 AM Monday–Friday.</span></p>
+        </section>
+        <details class="job-advanced">
+          <summary>Execution policy</summary>
+          <div class="job-policy-grid">
+            <label class="field">Timeout <span>minutes, 1–1440</span><input id="job-timeout" type="number" min="1" max="1440" value="60"></label>
+            <div><span>OVERLAP</span><strong>Skip if agent is busy</strong><small>Concurrent scheduled work is never started on the same agent.</small></div>
+            <div><span>RETRIES</span><strong>One attempt</strong><small>At-most-once delivery prevents duplicate work after a restart.</small></div>
+          </div>
+        </details>
+        <p id="job-form-message" class="usage-error hidden"></p>
+        <div class="actions dialog-actions"><button id="delete-job" class="button danger hidden" type="button">Delete job</button><span class="dialog-spacer"></span><button id="cancel-job" class="button secondary" type="button">Cancel</button><button id="save-job" class="button primary" type="submit">Create job</button></div>
+      </form>
+    </dialog>
+
     <dialog id="mcp-dialog">
       <form id="mcp-form" method="dialog">
         <input id="mcp-definition-id" type="hidden">
@@ -299,6 +372,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=7"></script>
+    <script type="module" src="/app.js?v=8"></script>
   </body>
 </html>

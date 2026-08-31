@@ -22,6 +22,8 @@ If port 3000 is already occupied, set `CONTROL_PLANE_PORT` in `.env` before star
 
 The first boot of each agent can take a minute because its worker installs its own CLI at runtime. Managed runtimes deliberately do not share writable binary caches or auth homes: each receives four uniquely named volumes for its CLI installation, credentials/config, telemetry, and workspace. The `control-data` volume stores schema-v3 agent definitions, runtime bindings, MCP definitions, and per-agent MCP bindings. Set `CODEX_VERSION`, `CLAUDE_VERSION`, or `OPENCODE_VERSION` in `.env` to pin a release.
 
+The control plane also stores scheduled jobs and their run history in SQLite on the `control-data` volume. Open **Jobs** from the top navigation to create one-off or timezone-aware five-field cron schedules, inspect the next occurrence and history, edit the cadence, pause/resume, or run a job immediately. Occurrence claiming is at-most-once, overlapping work is skipped for a busy agent, and each run retains duration, outcome, task ID, and normalized usage when the worker reports it. The contract and delivery semantics are documented in [`docs/scheduling.md`](./docs/scheduling.md).
+
 Use **Tools & MCP** on an agent page to create a remote HTTP or local stdio MCP definition, attach a reusable definition, validate it against the selected harness, and apply the complete desired state. The control plane and all three workers use the same canonical payload in both directions; only the isolated worker translates it into Codex, Claude Code, or OpenCode configuration. Connector credentials are referenced by worker environment-variable name and never returned to the control plane. Local stdio MCP is denied unless its exact executable appears in `MCP_ALLOWED_COMMANDS` (comma-separated in `.env`).
 
 Claude Code is always launched with a worker-owned strict MCP file, including an empty file before its first connector is configured. OpenCode resolves its merged configuration before task start and disables MCP entries introduced outside Agent Dock's managed set; an unreadable or invalid merged configuration prevents the task from starting.
@@ -76,6 +78,8 @@ flowchart LR
 - OpenCode discovers local Ollama models and can explicitly pin one as `ollama/<model>`. The effective model is included in task-start events and request history. Automatic cross-provider fallback is intentionally disabled.
 - The control plane depends only on the versioned wrapper contract; both provider workers use the same UI and API surface.
 - MCP definition CRUD and per-agent bindings persist in the control plane, while validation, vendor translation, activation, and health remain worker responsibilities. `GET` and `PUT /v1/mcp` round-trip the same `servers[]` DTO.
+- Durable one-off and recurring jobs are claimed in SQLite before dispatch. Restarted claims are marked interrupted rather than run twice; cron misfires and busy-agent skips remain visible in history.
+- The live Jobs screen provides scheduler health, next-run and outcome summaries, schedule CRUD, pause/resume, run-now, and five-entry per-job history without exposing worker routing credentials.
 
 The complete system model is available as [Markdown](./docs/architecture.md), [editable Mermaid](./docs/architecture.mmd), and a [standalone SVG](./docs/architecture.svg). The provider boundary is documented in [`docs/adapter-contract.md`](./docs/adapter-contract.md).
 
@@ -86,6 +90,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/health` | Control-plane and worker reachability |
+| `GET` | `/api/v1/scheduler` | Scheduler storage, tick health, and active execution status |
 | `GET`, `POST` | `/api/v1/agents` | List or create agent records |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/agents/:id` | Read, edit, or delete one agent record |
 | `GET` | `/api/v1/runtimes` | List safe runtime identities, lifecycle state, isolation mode, and attachment counts |
@@ -106,6 +111,12 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET` | `/api/v1/agents/:id/workspace` | List worker artifacts (not their contents) |
 | `GET` | `/api/v1/agents/:id/usage` | Read normalized request history, totals, quota windows, and account activity |
 | `POST` | `/api/v1/agents/:id/usage/refresh` | Ask the adapter to refresh its available usage sources |
+| `GET`, `POST` | `/api/v1/schedules` | List or create schedules; GET accepts agent filtering and batched run history |
+| `GET`, `PATCH`, `DELETE` | `/api/v1/schedules/:id` | Read, edit, or soft-delete one schedule |
+| `POST` | `/api/v1/schedules/:id/pause` | Pause future occurrences |
+| `POST` | `/api/v1/schedules/:id/resume` | Resume a paused schedule |
+| `POST` | `/api/v1/schedules/:id/run-now` | Dispatch a manual occurrence without changing the recurring cadence |
+| `GET` | `/api/v1/schedules/:id/runs` | Read durable outcome, duration, task, and usage history |
 
 The original unscoped runtime routes remain aliases for the default agent during the POC.
 
@@ -137,7 +148,7 @@ The included Compose file retains one bootstrap worker for each adapter so schem
 
 That floor is per worker process. Each agent has its own container and its own copy of the credential, so a fleet of agents signed in to one subscription still multiplies calls to that account by the number of agents; there is no shared cross-agent budget. Raise `CLAUDE_OAUTH_USAGE_INTERVAL_MS` before running many Claude agents against a single account.
 
-This prototype deliberately omits multi-tenancy, scheduling, webhooks, queue durability, automatic model fallback, usage-limit routing, TLS, user authentication for the web UI, remote secret management, egress controls, and container resource limits. The control-plane registry is currently a single JSON file and the browser is vanilla JavaScript; SQLite/Postgres-ready persistence and a React/TypeScript frontend are tracked architectural follow-ons. Usage telemetry and agent configuration are durable; jobs, event streams, and test conversations are not.
+This prototype deliberately omits multi-tenancy, webhooks, automatic model fallback, usage-limit routing, TLS, user authentication for the web UI, remote secret management, egress controls, and container resource limits. Scheduled jobs use a local SQLite database, but multi-replica leader election, retries beyond one attempt, webhook triggers, and an agent-facing MCP schedule surface remain follow-ons. The agent/runtime/MCP registry is still a single JSON file and the browser is vanilla JavaScript; migration of that registry behind the SQLite/Postgres-ready persistence boundary and a React/TypeScript frontend are separately tracked. Usage telemetry, agent configuration, schedules, and run history are durable; live event streams and test conversations are not.
 
 The experimental Claude usage source is the one place a provider credential is read by Agent Dock code rather than only by the vendor CLI. That read happens inside the worker, against the worker's own private auth volume; the token is never returned, logged, persisted, or sent to the control plane or browser, and only normalized quota windows cross the wrapper. The response is reduced to the quota fields before anything is written to the telemetry volume, so the account and billing state it also carries is not retained at rest. It targets an endpoint Anthropic does not document and for which no third-party OAuth flow or scoped usage-only token exists, so it may break without notice and is disabled unless you set `CLAUDE_OAUTH_USAGE=1`. The account-profile endpoint, which returns names, email addresses, and organization identifiers, is deliberately not called.
 

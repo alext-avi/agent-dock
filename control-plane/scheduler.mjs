@@ -624,16 +624,17 @@ export function createScheduler(options = {}) {
       activeAgents.add(claim.schedule.agentId);
       try {
         store.startRun(claim.run.id);
+        let result;
         try {
-          const result = await dispatch(claim.schedule, store.getRun(claim.run.id));
-          return store.finishRun(claim.run.id, result);
+          result = await dispatch(claim.schedule, store.getRun(claim.run.id));
         } catch (error) {
           const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
-          return store.finishRun(claim.run.id, {
+          result = {
             status: timedOut ? 'timed_out' : 'failed',
             error: error?.message ?? String(error)
-          });
+          };
         }
+        return store.finishRun(claim.run.id, result);
       } finally {
         activeAgents.delete(claim.schedule.agentId);
       }

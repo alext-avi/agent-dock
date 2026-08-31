@@ -135,6 +135,40 @@ test('scheduler contains persistence failures without leaking an unhandled execu
   scheduler.close();
 });
 
+test('a transient success persistence failure is not rewritten as a failed task', async () => {
+  const finishAttempts = [];
+  const store = {
+    path: ':memory:',
+    clock: () => new Date('2026-08-30T12:00:00Z'),
+    claimManual: () => ({
+      run: { id: 'run-1' },
+      schedule: { id: 'schedule-1', agentId: 'worker-01' }
+    }),
+    startRun() {},
+    getRun: () => ({ id: 'run-1' }),
+    finishRun(id, result) {
+      finishAttempts.push({ id, result });
+      if (finishAttempts.length === 1) throw new Error('transient sqlite failure');
+      return { id, ...result };
+    },
+    close() {}
+  };
+  const scheduler = createScheduler({
+    store,
+    dispatch: async () => ({ status: 'succeeded', taskId: 'task-1' })
+  });
+
+  scheduler.runNow('schedule-1');
+  await scheduler.whenIdle();
+
+  assert.deepEqual(finishAttempts, [{
+    id: 'run-1',
+    result: { status: 'succeeded', taskId: 'task-1' }
+  }]);
+  assert.match(scheduler.status().lastExecutionError, /transient sqlite failure/);
+  scheduler.close();
+});
+
 test('cron misfires are skipped once and advance directly to the next future occurrence', async () => {
   const time = mutableClock('2026-08-30T12:00:10Z');
   let dispatches = 0;

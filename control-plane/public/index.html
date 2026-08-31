@@ -17,6 +17,10 @@
         <a class="nav-link" href="/">Fleet</a>
         <a class="nav-link" href="/jobs">Jobs</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
+        <div id="operator-account" class="operator-account" aria-label="Signed-in operator">
+          <span><strong id="operator-name">Operator</strong><small id="operator-role">checking identity</small></span>
+          <button id="sign-out" class="operator-sign-out hidden" type="button">Sign out</button>
+        </div>
       </div>
     </header>
 
@@ -381,6 +385,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=8"></script>
+    <script type="module" src="/app.js?v=9"></script>
   </body>
 </html>

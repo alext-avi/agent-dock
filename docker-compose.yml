@@ -5,6 +5,7 @@ services:
       context: ./control-plane
     environment:
       PORT: "3000"
+      HOST: "0.0.0.0"
       WORKER_URL: http://worker:7777
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CLAUDE_WORKER_URL: http://claude-worker:7777
@@ -13,6 +14,23 @@ services:
       OPENCODE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CONTROL_PLANE_DATA_PATH: /control-data/agents.json
       SCHEDULER_DB_PATH: /control-data/scheduler.sqlite
+      AUTH_DB_PATH: /control-data/auth.sqlite
+      AUTH_MODE: ${AUTH_MODE:-trusted-local}
+      AUTH_PUBLIC_ORIGIN: ${AUTH_PUBLIC_ORIGIN:-http://127.0.0.1:3000}
+      AUTH_PROVIDER_NAME: ${AUTH_PROVIDER_NAME:-GitHub}
+      AUTH_OIDC_ISSUER: ${AUTH_OIDC_ISSUER:-}
+      AUTH_OIDC_CLIENT_ID: ${AUTH_OIDC_CLIENT_ID:-}
+      AUTH_OIDC_CLIENT_SECRET: ${AUTH_OIDC_CLIENT_SECRET:-}
+      AUTH_SESSION_SECRET: ${AUTH_SESSION_SECRET:-}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-28800}
+      AUTH_API_AUDIENCE: ${AUTH_API_AUDIENCE:-http://127.0.0.1:3000/api}
+      AUTH_OIDC_RESOURCE: ${AUTH_OIDC_RESOURCE:-}
+      AUTH_OIDC_SCOPES: ${AUTH_OIDC_SCOPES:-openid,profile,email}
+      AUTH_DEFAULT_ROLE: ${AUTH_DEFAULT_ROLE:-viewer}
+      AUTH_ADMIN_SUBJECTS: ${AUTH_ADMIN_SUBJECTS:-}
+      AUTH_ADMIN_EMAILS: ${AUTH_ADMIN_EMAILS:-}
+      AUTH_OPERATOR_SUBJECTS: ${AUTH_OPERATOR_SUBJECTS:-}
+      AUTH_OPERATOR_EMAILS: ${AUTH_OPERATOR_EMAILS:-}
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-1}
       SCHEDULER_INTERVAL_MS: ${SCHEDULER_INTERVAL_MS:-1000}
       RUNTIME_PROVISIONER: docker
@@ -29,7 +47,7 @@ services:
       CLAUDE_OAUTH_USAGE: ${CLAUDE_OAUTH_USAGE:-0}
       CLAUDE_OAUTH_USAGE_INTERVAL_MS: ${CLAUDE_OAUTH_USAGE_INTERVAL_MS:-1800000}
     ports:
-      - "${CONTROL_PLANE_PORT:-3000}:3000"
+      - "${CONTROL_PLANE_BIND:-127.0.0.1}:${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
       - control-data:/control-data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -49,6 +67,7 @@ services:
     environment:
       PORT: "7777"
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      WORKER_AUTH_MODE: ${WORKER_AUTH_MODE:-hybrid}
       CODEX_HOME: /codex-home
       CODEX_VERSION: ${CODEX_VERSION:-latest}
       ALLOW_UNSANDBOXED: ${ALLOW_UNSANDBOXED:-1}
@@ -79,6 +98,7 @@ services:
     environment:
       PORT: "7777"
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      WORKER_AUTH_MODE: ${WORKER_AUTH_MODE:-hybrid}
       AGENT_ID: claude-worker-01
       AGENT_ADAPTER: claude-code
       HOME: /claude-home
@@ -117,6 +137,7 @@ services:
     environment:
       PORT: "7777"
       WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
+      WORKER_AUTH_MODE: ${WORKER_AUTH_MODE:-hybrid}
       AGENT_ID: opencode-worker-01
       AGENT_ADAPTER: opencode
       HOME: /opencode-home

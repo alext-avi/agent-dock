@@ -214,6 +214,7 @@ export class DockerRuntimeManager {
     const environment = {
       PORT: '7777',
       WORKER_TOKEN: workerToken,
+      WORKER_AUTH_MODE: 'jwt',
       AGENT_ID: workerId,
       ALLOW_UNSANDBOXED: this.allowUnsandboxed,
       AGENT_DATA_PATH: '/agent-data/usage.json',
@@ -287,6 +288,7 @@ export class DockerRuntimeManager {
         workerId,
         workerUrl: `http://${containerName}:7777`,
         workerToken,
+        workerAuthMode: 'jwt',
         containerId,
         containerName,
         image,
@@ -363,6 +365,7 @@ export class DockerRuntimeManager {
       workerUrl: `http://${runtime.containerName}:7777`,
       image,
       imageId: inspected?.Image ?? null,
+      workerAuthMode: 'jwt',
       volumes,
       state: 'starting',
       updatedAt: new Date().toISOString()

@@ -6,6 +6,7 @@ import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
+import { createScheduler } from './scheduler.mjs';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const MIME = {
@@ -186,6 +187,7 @@ function normalizeRuntimeRequest(value, defaultMode) {
 
 export function createControlPlane(options = {}) {
   const primaryWorkerToken = options.workerToken ?? process.env.WORKER_TOKEN ?? '';
+  const dataPath = options.dataPath === null ? null : (options.dataPath ?? process.env.CONTROL_PLANE_DATA_PATH ?? null);
   const runtimeManager = options.runtimeManager !== undefined
     ? options.runtimeManager
     : process.env.RUNTIME_PROVISIONER === 'docker'
@@ -215,17 +217,28 @@ export function createControlPlane(options = {}) {
       }
     },
     publicDir: options.publicDir ?? join(moduleDir, 'public'),
-    dataPath: options.dataPath === null ? null : (options.dataPath ?? process.env.CONTROL_PLANE_DATA_PATH ?? null),
-    defaultAgentId: options.defaultAgentId ?? process.env.DEFAULT_AGENT_ID ?? 'worker-01'
+    dataPath,
+    defaultAgentId: options.defaultAgentId ?? process.env.DEFAULT_AGENT_ID ?? 'worker-01',
+    scheduleDbPath: options.scheduleDbPath ?? process.env.SCHEDULER_DB_PATH ?? (dataPath ? join(dirname(dataPath), 'scheduler.sqlite') : ':memory:'),
+    schedulerEnabled: options.schedulerEnabled ?? process.env.SCHEDULER_ENABLED !== '0',
+    schedulerIntervalMs: Number(options.schedulerIntervalMs ?? process.env.SCHEDULER_INTERVAL_MS ?? 1000)
   };
   if (!config.workerToken) throw new Error('WORKER_TOKEN is required');
+  if (!Number.isFinite(config.schedulerIntervalMs) || config.schedulerIntervalMs < 100) {
+    throw new Error('SCHEDULER_INTERVAL_MS must be at least 100');
+  }
 
   const agents = new Map();
+  const deletingAgents = new Set();
   const runtimes = new Map();
   const mcpServers = new Map();
   const mcpBindings = new Map();
   let persistQueue = Promise.resolve();
-  const defaultAgent = () => agents.get(config.defaultAgentId) ?? agents.values().next().value ?? null;
+  const defaultAgent = () => {
+    const preferred = agents.get(config.defaultAgentId);
+    if (preferred && !deletingAgents.has(preferred.id)) return preferred;
+    return [...agents.values()].find((agent) => !deletingAgents.has(agent.id)) ?? null;
+  };
   const attachmentCount = (runtimeId) => [...agents.values()].filter((agent) => agent.runtimeId === runtimeId).length;
   const agentPublic = (agent) => publicAgent(agent, agent.runtimeId ? runtimes.get(agent.runtimeId) : null, attachmentCount(agent.runtimeId));
 
@@ -373,7 +386,7 @@ export function createControlPlane(options = {}) {
 
   function requireAgent(id) {
     const agent = agents.get(id);
-    if (!agent) throw Object.assign(new Error('Agent not found'), { status: 404 });
+    if (!agent || deletingAgents.has(id)) throw Object.assign(new Error('Agent not found'), { status: 404 });
     return agent;
   }
 
@@ -476,6 +489,82 @@ export function createControlPlane(options = {}) {
     }
     res.end();
   }
+
+  async function dispatchScheduledTask(schedule) {
+    const agent = requireAgent(schedule.agentId);
+    const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
+    if (status.task?.active) {
+      return { status: 'skipped_busy', error: `Agent is busy with task ${status.task.active.id ?? 'unknown'}` };
+    }
+
+    try {
+      const { response } = await workerFetch(agent, '/v1/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: schedule.prompt,
+          instructions: agent.durablePrompt,
+          modelPolicy: agent.modelPolicy
+        }),
+        timeout: schedule.policies.timeoutMs
+      });
+      if (!response.ok || !response.body) {
+        const text = await response.text();
+        let value = {};
+        try { value = JSON.parse(text); } catch { value = { error: text }; }
+        return {
+          status: response.status === 409 ? 'skipped_busy' : 'failed',
+          error: value.error || `Worker returned HTTP ${response.status}`
+        };
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let taskId = null;
+      let usage = null;
+      let completion = null;
+      function consume(line) {
+        if (!line.trim()) return;
+        let event;
+        try { event = JSON.parse(line); } catch { return; }
+        if (event.taskId) taskId = event.taskId;
+        if (event.type === 'usage.updated' && event.data?.usage) usage = event.data.usage;
+        if (event.type === 'task.completed') completion = event.data ?? {};
+      }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) consume(line);
+      }
+      buffer += decoder.decode();
+      consume(buffer);
+      if (!completion) return { status: 'failed', taskId, usage, error: 'Worker stream ended without task.completed' };
+      const succeeded = completion.status === 'succeeded' && (completion.exitCode === undefined || completion.exitCode === 0);
+      return {
+        status: succeeded ? 'succeeded' : 'failed',
+        taskId,
+        usage,
+        error: succeeded ? null : `Worker task ended with status ${completion.status ?? 'unknown'}`
+      };
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        await workerRequest(agent, 'POST', '/v1/tasks/cancel', {}, 15_000).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  const scheduler = createScheduler({
+    path: config.scheduleDbPath,
+    clock: options.clock,
+    ownerId: options.schedulerOwnerId,
+    enabled: config.schedulerEnabled,
+    agentExists: (id) => agents.has(id) && !deletingAgents.has(id),
+    dispatch: options.scheduleDispatch ?? dispatchScheduledTask
+  });
 
   async function serveStatic(res, pathname) {
     const requested = pathname === '/' ? 'index.html' : pathname.slice(1);
@@ -598,37 +687,46 @@ export function createControlPlane(options = {}) {
     }
     if (req.method === 'DELETE') {
       const body = await readJson(req);
-      const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
-      const runtimeAction = body.runtimeAction ?? (runtime ? null : 'retain');
-      if (runtime && !['retain', 'destroy'].includes(runtimeAction)) {
-        throw Object.assign(new Error('runtimeAction must explicitly be retain or destroy'), { status: 400 });
+      const dependentSchedules = scheduler.list({ agentId: id });
+      if (dependentSchedules.length) {
+        throw Object.assign(new Error(`Delete or reassign ${dependentSchedules.length} scheduled job${dependentSchedules.length === 1 ? '' : 's'} before deleting this agent`), { status: 409 });
       }
-      if (runtimeAction === 'destroy') {
-        if (body.confirmation !== agent.id) {
-          throw Object.assign(new Error('confirmation must exactly match the agent id before destroying its runtime and credentials'), { status: 400 });
+      deletingAgents.add(id);
+      try {
+        const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+        const runtimeAction = body.runtimeAction ?? (runtime ? null : 'retain');
+        if (runtime && !['retain', 'destroy'].includes(runtimeAction)) {
+          throw Object.assign(new Error('runtimeAction must explicitly be retain or destroy'), { status: 400 });
         }
-        if (!runtime?.managed) {
-          throw Object.assign(new Error('Legacy or external runtimes cannot be destroyed by Agent Dock'), { status: 409 });
+        if (runtimeAction === 'destroy') {
+          if (body.confirmation !== agent.id) {
+            throw Object.assign(new Error('confirmation must exactly match the agent id before destroying its runtime and credentials'), { status: 400 });
+          }
+          if (!runtime?.managed) {
+            throw Object.assign(new Error('Legacy or external runtimes cannot be destroyed by Agent Dock'), { status: 409 });
+          }
+          if (attachmentCount(runtime.id) > 1) {
+            throw Object.assign(new Error('Runtime is still attached to another agent'), { status: 409 });
+          }
+          if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
+          await runtimeManager.destroy(runtime);
+          runtimes.delete(runtime.id);
+        } else if (runtime?.managed) {
+          if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
+          await runtimeManager.stop(runtime);
+          runtime.state = 'stopped';
+          runtime.updatedAt = new Date().toISOString();
         }
-        if (attachmentCount(runtime.id) > 1) {
-          throw Object.assign(new Error('Runtime is still attached to another agent'), { status: 409 });
+        agents.delete(id);
+        for (const [bindingId, binding] of mcpBindings) {
+          if (binding.agentId === id) mcpBindings.delete(bindingId);
         }
-        if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
-        await runtimeManager.destroy(runtime);
-        runtimes.delete(runtime.id);
-      } else if (runtime?.managed) {
-        if (!runtimeManager) throw Object.assign(new Error('The managed runtime provisioner is unavailable'), { status: 503 });
-        await runtimeManager.stop(runtime);
-        runtime.state = 'stopped';
-        runtime.updatedAt = new Date().toISOString();
+        await persistAgents();
+        res.writeHead(204, { 'cache-control': 'no-store' });
+        return res.end();
+      } finally {
+        deletingAgents.delete(id);
       }
-      agents.delete(id);
-      for (const [bindingId, binding] of mcpBindings) {
-        if (binding.agentId === id) mcpBindings.delete(bindingId);
-      }
-      await persistAgents();
-      res.writeHead(204, { 'cache-control': 'no-store' });
-      return res.end();
     }
     return false;
   }
@@ -671,6 +769,47 @@ export function createControlPlane(options = {}) {
     if (operation === 'bindings' && serverId && req.method === 'DELETE') {
       const result = await mcpService.unbind(agentId, serverId);
       return json(res, 200, result);
+    }
+    return false;
+  }
+
+  async function handleSchedules(req, res, url) {
+    if (url.pathname === '/api/v1/scheduler') {
+      if (req.method === 'GET') return json(res, 200, { scheduler: scheduler.status() });
+      return false;
+    }
+    if (url.pathname === '/api/v1/schedules') {
+      if (req.method === 'GET') {
+        const schedules = scheduler.list({ agentId: url.searchParams.get('agentId') });
+        const includeRuns = url.searchParams.get('includeRuns');
+        if (includeRuns === null) return json(res, 200, { schedules });
+        const limit = Number(includeRuns);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+          throw Object.assign(new Error('includeRuns must be an integer from 1 to 500'), { status: 400 });
+        }
+        const runs = Object.fromEntries(schedules.map((schedule) => [schedule.id, scheduler.runs(schedule.id, limit)]));
+        return json(res, 200, { schedules, runs });
+      }
+      if (req.method === 'POST') return json(res, 201, { schedule: scheduler.create(await readJson(req)) });
+      return false;
+    }
+
+    const match = url.pathname.match(/^\/api\/v1\/schedules\/([^/]+)(?:\/(pause|resume|run-now|runs))?$/);
+    if (!match) return false;
+    const scheduleId = decodeURIComponent(match[1]);
+    const operation = match[2] ?? null;
+    if (!operation && req.method === 'GET') return json(res, 200, { schedule: scheduler.get(scheduleId) });
+    if (!operation && req.method === 'PATCH') return json(res, 200, { schedule: scheduler.update(scheduleId, await readJson(req)) });
+    if (!operation && req.method === 'DELETE') {
+      scheduler.delete(scheduleId);
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
+    if (operation === 'pause' && req.method === 'POST') return json(res, 200, { schedule: scheduler.pause(scheduleId) });
+    if (operation === 'resume' && req.method === 'POST') return json(res, 200, { schedule: scheduler.resume(scheduleId) });
+    if (operation === 'run-now' && req.method === 'POST') return json(res, 202, { run: scheduler.runNow(scheduleId) });
+    if (operation === 'runs' && req.method === 'GET') {
+      return json(res, 200, { runs: scheduler.runs(scheduleId, url.searchParams.get('limit') ?? 100) });
     }
     return false;
   }
@@ -740,10 +879,12 @@ export function createControlPlane(options = {}) {
     return false;
   }
 
-  return createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     try {
       await registryReady;
       const url = new URL(req.url, 'http://control.local');
+      const scheduled = await handleSchedules(req, res, url);
+      if (scheduled !== false) return scheduled;
       const mcp = await handleMcp(req, res, url);
       if (mcp !== false) return mcp;
       const crud = await handleAgentCrud(req, res, url);
@@ -754,12 +895,12 @@ export function createControlPlane(options = {}) {
       const agent = defaultAgent();
       if (req.method === 'GET' && ['/api/v1/health', '/api/health'].includes(url.pathname)) {
         const runtime = agent?.runtimeId ? runtimes.get(agent.runtimeId) : null;
-        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured' });
+        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured', scheduler: scheduler.status() });
         try {
           const upstream = await fetch(`${runtime.workerUrl}/v1/health`, { signal: AbortSignal.timeout(2000) });
-          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy' });
+          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy', scheduler: scheduler.status() });
         } catch {
-          return json(res, 200, { ok: true, worker: 'offline' });
+          return json(res, 200, { ok: true, worker: 'offline', scheduler: scheduler.status() });
         }
       }
       if (!agent && url.pathname.startsWith('/api/')) return json(res, 404, { error: 'No agents configured' });
@@ -784,6 +925,23 @@ export function createControlPlane(options = {}) {
       }
     }
   });
+  let schedulerTimer = null;
+  let schedulerClosed = false;
+  if (config.schedulerEnabled) {
+    void registryReady.then(() => {
+      if (schedulerClosed) return;
+      schedulerTimer = setInterval(() => { void scheduler.tick().catch(() => {}); }, config.schedulerIntervalMs);
+      schedulerTimer.unref();
+      void scheduler.tick().catch(() => {});
+    }).catch(() => {});
+  }
+  server.scheduler = scheduler;
+  server.on('close', () => {
+    schedulerClosed = true;
+    if (schedulerTimer) clearInterval(schedulerTimer);
+    void scheduler.whenIdle().finally(() => scheduler.close());
+  });
+  return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -229,6 +229,70 @@ test('the harness picker keeps selection, highlight and submitted value in step'
   );
 });
 
+test('a deferred one-off job is configured without scheduling notation', async (t) => {
+  const page = await openPage('/jobs');
+  t.after(() => page.close());
+  await page.click('#new-job');
+  await page.waitForFunction(() => document.querySelector('#job-dialog')?.open === true);
+
+  const dialogText = await page.locator('#job-dialog').textContent();
+  assert.doesNotMatch(dialogText, /cron|five-field|expression/i);
+  assert.equal(await page.locator('#job-cron').getAttribute('type'), 'hidden');
+  assert.match(dialogText, /Run once later/);
+
+  const name = 'Deferred browser test';
+  t.after(async () => {
+    const result = await (await fetch(`${app.url}/api/v1/schedules`)).json();
+    await Promise.all(result.schedules.filter((schedule) => schedule.name === name)
+      .map((schedule) => fetch(`${app.url}/api/v1/schedules/${schedule.id}`, { method: 'DELETE' })));
+  });
+  await page.fill('#job-name', name);
+  await page.fill('#job-prompt', 'Run this task one time in the future.');
+  await page.fill('#job-run-at', '2099-01-02T10:15');
+  await page.click('#save-job');
+  await page.waitForFunction((expected) => [...document.querySelectorAll('.job-card h2')].some((heading) => heading.textContent === expected), name);
+
+  const result = await (await fetch(`${app.url}/api/v1/schedules`)).json();
+  const schedule = result.schedules.find((candidate) => candidate.name === name);
+  assert.equal(schedule.timing.kind, 'once');
+  assert.equal(schedule.timing.at, new Date('2099-01-02T10:15').toISOString());
+  assert.match(await page.locator(`.job-card[data-schedule-id="${schedule.id}"]`).textContent(), /Run once/);
+});
+
+test('a weekly job uses plain-language controls while the API receives cron internally', async (t) => {
+  const page = await openPage('/jobs');
+  t.after(() => page.close());
+  await page.click('#new-job');
+  await page.check('[name="jobTiming"][value="cron"]');
+  await page.selectOption('#job-frequency', 'weekly');
+  await page.selectOption('#job-weekday', '2');
+  await page.fill('#job-repeat-time', '14:30');
+  await page.selectOption('#job-timezone', 'UTC');
+
+  assert.match(await page.locator('#job-schedule-summary').textContent(), /Every Tuesday at 2:30 PM/);
+  const name = 'Tuesday browser test';
+  t.after(async () => {
+    const result = await (await fetch(`${app.url}/api/v1/schedules`)).json();
+    await Promise.all(result.schedules.filter((schedule) => schedule.name === name)
+      .map((schedule) => fetch(`${app.url}/api/v1/schedules/${schedule.id}`, { method: 'DELETE' })));
+  });
+  await page.fill('#job-name', name);
+  await page.fill('#job-prompt', 'Run this task every Tuesday.');
+  await page.click('#save-job');
+  await page.waitForFunction((expected) => [...document.querySelectorAll('.job-card h2')].some((heading) => heading.textContent === expected), name);
+
+  const result = await (await fetch(`${app.url}/api/v1/schedules`)).json();
+  const schedule = result.schedules.find((candidate) => candidate.name === name);
+  assert.deepEqual(schedule.timing, {
+    kind: 'cron',
+    expression: '30 14 * * 2',
+    timezone: 'UTC'
+  });
+  const cardText = await page.locator(`.job-card[data-schedule-id="${schedule.id}"]`).textContent();
+  assert.match(cardText, /Every Tuesday at 2:30 PM/);
+  assert.doesNotMatch(cardText, /30 14 \* \* 2/);
+});
+
 test('a provider with no quota windows renders unavailable, never zero', async (t) => {
   const page = await openPage(`/agents/${app.agents.opencode.id}`);
   t.after(() => page.close());

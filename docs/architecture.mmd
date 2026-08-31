@@ -1,12 +1,14 @@
 flowchart TB
   subgraph Client["Web client · HTML5 + CSS + vanilla JavaScript ES modules"]
-    UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware live polling"]
+    UI["Fleet dashboard · Jobs queue\nAgent config + test UI\nVisibility-aware live polling"]
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
-    API["REST/JSON + NDJSON proxy\nAgent + MCP lifecycle operations"]
+    API["REST/JSON + NDJSON proxy\nAgent + MCP + schedule lifecycle operations"]
     Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
+    Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
+    ScheduleDb[("SQLite\nSchedules · occurrence claims · run history")]
     Provisioner["Docker runtime manager\nExclusive ownership enforcement"]
   end
 
@@ -32,16 +34,20 @@ flowchart TB
   Guard["Never exposed as MCP tools\nMCP admin · storage/mount mutation"]
   Data["Future scoped data attachments"]
   React["Planned web client\nReact + TypeScript + Vite"]
-  Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
+  Database["Planned unified repository\nMigrate JSON registry · Postgres-ready boundary"]
 
   UI <-->|"Same-origin HTTP"| API
   API <--> Registry
   API <--> McpService
+  API <--> Scheduler
+  Scheduler <--> ScheduleDb
   API --> Provisioner --> Engine
   Engine --> RuntimeA
   Engine --> RuntimeB
   API -->|"Unique URL + bearer token"| WA
   API -->|"Unique URL + bearer token"| WB
+  Scheduler -->|"Claim then dispatch via wrapper"| WA
+  Scheduler -->|"Claim then dispatch via wrapper"| WB
   WA <--> Providers
   WB <--> Providers
   API -.-> Legacy

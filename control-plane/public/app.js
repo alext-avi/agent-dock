@@ -19,12 +19,50 @@ let usageThrottled = false;
 
 const ui = {
   dashboardView: $('#dashboard-view'),
+  jobsView: $('#jobs-view'),
   agentView: $('#agent-view'),
   connectionDot: $('#connection-dot'),
   connectionLabel: $('#connection-label'),
   agentGrid: $('#agent-grid'),
   emptyFleet: $('#empty-fleet'),
   agentCount: $('#agent-count'),
+  schedulerState: $('#scheduler-state'),
+  activeJobCount: $('#active-job-count'),
+  nextJobTime: $('#next-job-time'),
+  nextJobName: $('#next-job-name'),
+  jobSuccessRate: $('#job-success-rate'),
+  jobOutcomeCount: $('#job-outcome-count'),
+  jobsRefreshed: $('#jobs-refreshed'),
+  jobGrid: $('#job-grid'),
+  emptyJobs: $('#empty-jobs'),
+  jobDialog: $('#job-dialog'),
+  jobForm: $('#job-form'),
+  jobId: $('#job-id'),
+  jobDialogTitle: $('#job-dialog-title'),
+  jobName: $('#job-name'),
+  jobAgent: $('#job-agent'),
+  jobPrompt: $('#job-prompt'),
+  jobOnceFields: $('#job-once-fields'),
+  jobCronFields: $('#job-cron-fields'),
+  jobRunAt: $('#job-run-at'),
+  jobOnceSummary: $('#job-once-summary'),
+  jobCron: $('#job-cron'),
+  jobFrequency: $('#job-frequency'),
+  jobRepeatTimeField: $('#job-repeat-time-field'),
+  jobRepeatTime: $('#job-repeat-time'),
+  jobWeekdayField: $('#job-weekday-field'),
+  jobWeekday: $('#job-weekday'),
+  jobMonthDayField: $('#job-month-day-field'),
+  jobMonthDay: $('#job-month-day'),
+  jobHourMinuteField: $('#job-hour-minute-field'),
+  jobHourMinute: $('#job-hour-minute'),
+  jobTimezone: $('#job-timezone'),
+  jobCustomSchedule: $('#job-custom-schedule'),
+  jobScheduleSummary: $('#job-schedule-summary'),
+  jobTimeout: $('#job-timeout'),
+  jobFormMessage: $('#job-form-message'),
+  deleteJob: $('#delete-job'),
+  saveJob: $('#save-job'),
   createDialog: $('#create-agent-dialog'),
   createForm: $('#create-agent-form'),
   createMessage: $('#create-message'),
@@ -140,6 +178,10 @@ let currentHarnessName = 'Agent';
 let dashboardAgents = [];
 let dashboardFingerprint = '';
 let dashboardRefreshInFlight = false;
+let schedules = [];
+let scheduleAgents = [];
+let scheduleRuns = new Map();
+let jobsRefreshInFlight = false;
 let statusRefreshInFlight = false;
 let liveUpdateTimer = null;
 let retainedRuntimes = [];
@@ -402,8 +444,282 @@ function markAgentCardOffline(card, message) {
   card.querySelector('.card-auth').textContent = '—';
 }
 
+function scheduleDateTime(iso) {
+  if (!iso) return 'Not scheduled';
+  const date = new Date(iso);
+  if (Number.isNaN(date.valueOf())) return 'Invalid time';
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    ...(date.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {})
+  }).format(date);
+}
+
+function scheduleCountdown(iso) {
+  if (!iso) return 'No future occurrence';
+  const milliseconds = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(milliseconds)) return 'Time unavailable';
+  if (milliseconds <= 0) return 'due now';
+  const minutes = Math.ceil(milliseconds / 60_000);
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `in ${hours} hr`;
+  const days = Math.ceil(hours / 24);
+  return `in ${days} day${days === 1 ? '' : 's'}`;
+}
+
+const JOB_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function friendlyTime(value) {
+  const [hour, minute] = String(value || '').split(':').map(Number);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return 'a selected time';
+  const date = new Date(2000, 0, 1, hour, minute);
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
+}
+
+function timezoneLabel(timezone) {
+  if (timezone === 'UTC') return 'UTC';
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: timezone,
+      timeZoneName: 'longGeneric'
+    }).formatToParts(new Date()).find((part) => part.type === 'timeZoneName')?.value ?? timezone.replaceAll('_', ' ');
+  } catch {
+    return String(timezone || 'local time').replaceAll('_', ' ');
+  }
+}
+
+function parseRecurringExpression(expression) {
+  const fields = String(expression || '').trim().split(/\s+/);
+  if (fields.length !== 5) return { frequency: 'custom' };
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+  if (!/^\d+$/.test(minute) || month !== '*') return { frequency: 'custom' };
+  const minuteNumber = Number(minute);
+  if (hour === '*' && dayOfMonth === '*' && dayOfWeek === '*') {
+    return { frequency: 'hourly', minute: minuteNumber };
+  }
+  if (!/^\d+$/.test(hour)) return { frequency: 'custom' };
+  const time = `${String(Number(hour)).padStart(2, '0')}:${String(minuteNumber).padStart(2, '0')}`;
+  if (dayOfMonth === '*' && dayOfWeek === '1-5') return { frequency: 'weekdays', time };
+  if (dayOfMonth === '*' && dayOfWeek === '*') return { frequency: 'daily', time };
+  if (dayOfMonth === '*' && /^[0-6]$/.test(dayOfWeek)) return { frequency: 'weekly', time, weekday: dayOfWeek };
+  if (/^\d+$/.test(dayOfMonth) && dayOfWeek === '*') return { frequency: 'monthly', time, monthDay: Number(dayOfMonth) };
+  return { frequency: 'custom' };
+}
+
+function recurringDescription(timing) {
+  const parsed = parseRecurringExpression(timing.expression);
+  const zone = timezoneLabel(timing.timezone);
+  if (parsed.frequency === 'hourly') {
+    const minute = parsed.minute === 0 ? 'at the start of every hour' : `${parsed.minute} minutes past every hour`;
+    return `${minute} · ${zone}`;
+  }
+  const at = friendlyTime(parsed.time);
+  if (parsed.frequency === 'weekdays') return `Every weekday at ${at} · ${zone}`;
+  if (parsed.frequency === 'daily') return `Every day at ${at} · ${zone}`;
+  if (parsed.frequency === 'weekly') return `Every ${JOB_WEEKDAYS[Number(parsed.weekday)]} at ${at} · ${zone}`;
+  if (parsed.frequency === 'monthly') return `Day ${parsed.monthDay} of every month at ${at} · ${zone}`;
+  return `Recurring on a custom cadence · ${zone}`;
+}
+
+function scheduleTimingLabel(schedule) {
+  return schedule.timing.kind === 'once'
+    ? `Run once · ${scheduleDateTime(schedule.timing.at)}`
+    : recurringDescription(schedule.timing);
+}
+
+function runPresentation(status) {
+  if (status === 'succeeded') return { label: 'succeeded', className: 'ready' };
+  if (status === 'running' || status === 'claimed') return { label: status, className: 'busy' };
+  if (status?.startsWith('skipped')) return { label: status.replace('skipped_', 'skipped · '), className: 'neutral' };
+  if (status === 'failed' || status === 'timed_out' || status === 'interrupted') {
+    return { label: status.replace('_', ' '), className: 'error' };
+  }
+  return { label: status || 'unknown', className: 'neutral' };
+}
+
+function usageTotal(usage) {
+  const value = usage?.totalTokens ?? usage?.tokens?.total ?? usage?.totals?.totalTokens;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function makeButton(label, action, scheduleId, className = 'button secondary') {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.textContent = label;
+  button.dataset.jobAction = action;
+  button.dataset.scheduleId = scheduleId;
+  return button;
+}
+
+function makeJobHistory(runs) {
+  const details = document.createElement('details');
+  details.className = 'job-history';
+  const summary = document.createElement('summary');
+  summary.textContent = runs.length ? `History · ${runs.length}` : 'No run history';
+  details.append(summary);
+  if (!runs.length) return details;
+  const list = document.createElement('div');
+  list.className = 'job-history-list';
+  for (const run of runs) {
+    const row = document.createElement('div');
+    row.className = 'job-history-row';
+    const status = document.createElement('strong');
+    status.textContent = runPresentation(run.status).label;
+    const occurrence = document.createElement('span');
+    occurrence.textContent = scheduleDateTime(run.occurrenceAt);
+    const duration = document.createElement('span');
+    duration.textContent = formatDuration(run.durationMs);
+    const tokens = document.createElement('span');
+    const total = usageTotal(run.usage);
+    tokens.textContent = total === null ? '— tokens' : `${formatTokens(total)} tokens`;
+    const error = document.createElement('span');
+    error.className = run.error ? 'history-error' : '';
+    error.textContent = run.error || run.taskId || run.trigger;
+    row.append(status, occurrence, duration, tokens, error);
+    list.append(row);
+  }
+  details.append(list);
+  return details;
+}
+
+function createJobCard(schedule) {
+  const agent = scheduleAgents.find((candidate) => candidate.id === schedule.agentId);
+  const runs = scheduleRuns.get(schedule.id) ?? [];
+  const lastRun = runs[0] ?? null;
+  const article = document.createElement('article');
+  article.className = 'panel job-card';
+  article.dataset.scheduleId = schedule.id;
+
+  const main = document.createElement('div');
+  main.className = 'job-card-main';
+  const title = document.createElement('div');
+  title.className = 'job-card-title';
+  const kicker = document.createElement('p');
+  kicker.className = 'kicker';
+  kicker.textContent = `${agent?.name ?? schedule.agentId} · ${schedule.timing.kind === 'cron' ? 'recurring' : 'one-off'}`;
+  const heading = document.createElement('h2');
+  heading.textContent = schedule.name;
+  const timing = document.createElement('p');
+  timing.textContent = scheduleTimingLabel(schedule);
+  title.append(kicker, heading, timing);
+
+  const next = document.createElement('div');
+  next.className = 'job-next';
+  const nextLabel = document.createElement('span');
+  nextLabel.textContent = schedule.state === 'paused' ? 'PAUSED' : schedule.state === 'completed' ? 'COMPLETED' : 'NEXT RUN';
+  const nextTime = document.createElement('strong');
+  nextTime.textContent = schedule.nextRunAt ? scheduleDateTime(schedule.nextRunAt) : 'No future run';
+  const nextRelative = document.createElement('small');
+  nextRelative.textContent = schedule.state === 'paused'
+    ? 'held until resumed'
+    : schedule.nextRunAt ? scheduleCountdown(schedule.nextRunAt) : schedule.state;
+  next.append(nextLabel, nextTime, nextRelative);
+
+  const actions = document.createElement('div');
+  actions.className = 'job-card-actions';
+  actions.append(makeButton('Run now', 'run-now', schedule.id));
+  if (schedule.state === 'active') actions.append(makeButton('Pause', 'pause', schedule.id));
+  if (schedule.state === 'paused') actions.append(makeButton('Resume', 'resume', schedule.id));
+  const edit = makeButton(schedule.state === 'completed' ? 'Manage' : 'Edit', 'edit', schedule.id, 'text-button');
+  actions.append(edit);
+  main.append(title, next, actions);
+
+  const footer = document.createElement('div');
+  footer.className = 'job-card-footer';
+  const last = document.createElement('div');
+  last.className = 'job-last-run';
+  const runPill = document.createElement('span');
+  const presentation = runPresentation(lastRun?.status);
+  runPill.className = `pill ${lastRun ? presentation.className : 'neutral'}`;
+  runPill.textContent = lastRun ? presentation.label : 'never run';
+  const runTime = document.createElement('span');
+  runTime.textContent = lastRun ? `${relativeTime(lastRun.finishedAt ?? lastRun.startedAt ?? lastRun.createdAt)} · ${formatDuration(lastRun.durationMs)}` : 'No occurrences recorded';
+  last.append(runPill, runTime);
+  const metadata = document.createElement('span');
+  metadata.className = 'job-run-meta';
+  const total = usageTotal(lastRun?.usage);
+  metadata.textContent = lastRun
+    ? `${lastRun.trigger} · ${total === null ? 'usage unavailable' : `${formatTokens(total)} tokens`}${lastRun.taskId ? ` · ${lastRun.taskId}` : ''}`
+    : `id · ${schedule.id}`;
+  footer.append(last, metadata, makeJobHistory(runs));
+  article.append(main, footer);
+  return article;
+}
+
+function renderJobs(scheduler) {
+  const expandedHistory = new Set([...ui.jobGrid.querySelectorAll('.job-history[open]')]
+    .map((details) => details.closest('.job-card')?.dataset.scheduleId).filter(Boolean));
+  ui.jobGrid.replaceChildren();
+  ui.emptyJobs.classList.toggle('hidden', schedules.length !== 0);
+  ui.jobGrid.classList.toggle('hidden', schedules.length === 0);
+  for (const schedule of schedules) {
+    const card = createJobCard(schedule);
+    if (expandedHistory.has(schedule.id)) card.querySelector('.job-history').open = true;
+    ui.jobGrid.append(card);
+  }
+
+  const active = schedules.filter((schedule) => schedule.state === 'active');
+  ui.activeJobCount.textContent = String(active.length).padStart(2, '0');
+  const next = active.filter((schedule) => schedule.nextRunAt).sort((a, b) => Date.parse(a.nextRunAt) - Date.parse(b.nextRunAt))[0];
+  ui.nextJobTime.textContent = next ? scheduleDateTime(next.nextRunAt) : '—';
+  ui.nextJobName.textContent = next ? `${next.name} · ${scheduleCountdown(next.nextRunAt)}` : 'No active schedule';
+  const recent = [...scheduleRuns.values()].flat().sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 20);
+  const outcomes = recent.filter((run) => ['succeeded', 'failed', 'timed_out', 'interrupted'].includes(run.status));
+  const successes = outcomes.filter((run) => run.status === 'succeeded').length;
+  ui.jobSuccessRate.textContent = outcomes.length ? `${Math.round(successes / outcomes.length * 100)}%` : '—';
+  ui.jobOutcomeCount.textContent = recent.length ? `${successes} succeeded · ${recent.length - successes} other` : 'No runs recorded';
+  const schedulerError = scheduler.lastTickError || scheduler.lastExecutionError;
+  ui.schedulerState.textContent = scheduler.enabled ? (schedulerError ? 'scheduler error' : 'scheduler online') : 'scheduler paused';
+  ui.schedulerState.className = `pill ${schedulerError ? 'error' : scheduler.enabled ? 'ready' : 'neutral'}`;
+  ui.schedulerState.title = schedulerError || `${scheduler.database} · last tick ${scheduler.lastTickAt ? relativeTime(scheduler.lastTickAt) : 'pending'}`;
+  ui.jobsRefreshed.textContent = `Live · ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}`;
+}
+
+async function refreshJobs() {
+  if (jobsRefreshInFlight) return;
+  jobsRefreshInFlight = true;
+  try {
+    const [{ scheduler }, scheduleResult, agentResult] = await Promise.all([
+      api(`${API_ROOT}/scheduler`),
+      api(`${API_ROOT}/schedules?includeRuns=5`),
+      api(`${API_ROOT}/agents`)
+    ]);
+    schedules = scheduleResult.schedules ?? [];
+    scheduleAgents = agentResult.agents ?? [];
+    scheduleRuns = new Map(schedules.map((schedule) => [schedule.id, scheduleResult.runs?.[schedule.id] ?? []]));
+    renderJobs(scheduler);
+    setConnection('online', 'Scheduler live');
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.jobsRefreshed.textContent = error.message;
+    if (!schedules.length) {
+      ui.jobGrid.replaceChildren();
+      const panel = document.createElement('article');
+      panel.className = 'panel';
+      const message = document.createElement('p');
+      message.className = 'usage-error';
+      message.textContent = `Could not load scheduled jobs: ${error.message}`;
+      panel.append(message);
+      ui.jobGrid.append(panel);
+    }
+  } finally {
+    jobsRefreshInFlight = false;
+  }
+}
+
+async function loadJobs() {
+  ui.jobsView.classList.remove('hidden');
+  ui.dashboardView.classList.add('hidden');
+  ui.agentView.classList.add('hidden');
+  document.title = 'Scheduled Jobs — Agent Dock';
+  await refreshJobs();
+  startLiveUpdates(refreshJobs);
+}
+
 async function loadDashboard() {
   ui.dashboardView.classList.remove('hidden');
+  ui.jobsView.classList.add('hidden');
   ui.agentView.classList.add('hidden');
   document.title = 'Agent Dock — Fleet';
   try {
@@ -501,6 +817,261 @@ async function createAgent(event) {
     ui.createMessage.classList.remove('hidden');
     submit.disabled = false;
     submit.textContent = 'Create isolated agent';
+  }
+}
+
+function localDateTimeValue(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function ensureTimezoneOption(timezone) {
+  if (!timezone || [...ui.jobTimezone.options].some((option) => option.value === timezone)) return;
+  const option = document.createElement('option');
+  option.value = timezone;
+  option.textContent = timezoneLabel(timezone);
+  ui.jobTimezone.prepend(option);
+}
+
+function populateJobTimezones(selected) {
+  const local = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const common = ['UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'];
+  const zones = [...new Set([local, selected, ...common].filter(Boolean))];
+  ui.jobTimezone.replaceChildren();
+  for (const timezone of zones) {
+    const option = document.createElement('option');
+    option.value = timezone;
+    option.textContent = timezone === local ? `${timezoneLabel(timezone)} (current)` : timezoneLabel(timezone);
+    ui.jobTimezone.append(option);
+  }
+  ui.jobTimezone.value = selected || local;
+}
+
+function buildRecurringExpression() {
+  const [hour, minute] = ui.jobRepeatTime.value.split(':').map(Number);
+  switch (ui.jobFrequency.value) {
+    case 'hourly': return `${Number(ui.jobHourMinute.value)} * * * *`;
+    case 'daily': return `${minute} ${hour} * * *`;
+    case 'weekdays': return `${minute} ${hour} * * 1-5`;
+    case 'weekly': return `${minute} ${hour} * * ${ui.jobWeekday.value}`;
+    case 'monthly': return `${minute} ${hour} ${Number(ui.jobMonthDay.value)} * *`;
+    case 'custom': return ui.jobCron.value;
+    default: return '';
+  }
+}
+
+function updateJobScheduleSummary() {
+  const once = new Date(ui.jobRunAt.value);
+  ui.jobOnceSummary.textContent = Number.isFinite(once.valueOf())
+    ? `This job will run once on ${new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' }).format(once)}.`
+    : 'Choose when this job should run.';
+
+  const expression = buildRecurringExpression();
+  ui.jobScheduleSummary.textContent = expression
+    ? recurringDescription({ expression, timezone: ui.jobTimezone.value })
+    : 'Choose how often this job should repeat.';
+}
+
+function syncJobRecurrenceFields() {
+  const frequency = ui.jobFrequency.value;
+  const custom = frequency === 'custom';
+  ui.jobRepeatTimeField.classList.toggle('hidden', frequency === 'hourly' || custom);
+  ui.jobWeekdayField.classList.toggle('hidden', frequency !== 'weekly');
+  ui.jobMonthDayField.classList.toggle('hidden', frequency !== 'monthly');
+  ui.jobHourMinuteField.classList.toggle('hidden', frequency !== 'hourly');
+  ui.jobCustomSchedule.classList.toggle('hidden', !custom);
+  ui.jobRepeatTime.required = !custom && frequency !== 'hourly';
+  ui.jobMonthDay.required = frequency === 'monthly';
+  updateJobScheduleSummary();
+}
+
+function applyRecurringExpression(expression) {
+  const parsed = parseRecurringExpression(expression);
+  let customOption = ui.jobFrequency.querySelector('option[value="custom"]');
+  if (parsed.frequency === 'custom' && !customOption) {
+    customOption = document.createElement('option');
+    customOption.value = 'custom';
+    customOption.textContent = 'Advanced schedule (unchanged)';
+    ui.jobFrequency.append(customOption);
+  }
+  ui.jobFrequency.value = parsed.frequency;
+  if (parsed.time) ui.jobRepeatTime.value = parsed.time;
+  if (parsed.weekday !== undefined) ui.jobWeekday.value = String(parsed.weekday);
+  if (parsed.monthDay !== undefined) ui.jobMonthDay.value = String(parsed.monthDay);
+  if (parsed.minute !== undefined) {
+    const minute = String(parsed.minute);
+    if (![...ui.jobHourMinute.options].some((option) => option.value === minute)) {
+      const option = document.createElement('option');
+      option.value = minute;
+      option.textContent = `${minute} minutes past`;
+      ui.jobHourMinute.append(option);
+    }
+    ui.jobHourMinute.value = minute;
+  }
+  syncJobRecurrenceFields();
+}
+
+function syncJobTimingFields() {
+  const timing = ui.jobForm.querySelector('[name="jobTiming"]:checked')?.value ?? 'once';
+  const recurring = timing === 'cron';
+  ui.jobOnceFields.classList.toggle('hidden', recurring);
+  ui.jobCronFields.classList.toggle('hidden', !recurring);
+  ui.jobRunAt.required = !recurring;
+  ui.jobFrequency.required = recurring;
+  ui.jobTimezone.required = recurring;
+  for (const option of ui.jobForm.querySelectorAll('.timing-option')) {
+    option.classList.toggle('selected', option.querySelector('input')?.checked === true);
+  }
+  syncJobRecurrenceFields();
+}
+
+function populateJobAgents(selectedId = '') {
+  ui.jobAgent.replaceChildren();
+  for (const agent of scheduleAgents) {
+    const option = document.createElement('option');
+    option.value = agent.id;
+    option.textContent = `${agent.name} · ${adapterLabel(agent.adapter)}`;
+    option.selected = agent.id === selectedId;
+    ui.jobAgent.append(option);
+  }
+}
+
+function openJobDialog(schedule = null) {
+  ui.jobForm.reset();
+  ui.jobFormMessage.classList.add('hidden');
+  ui.jobFormMessage.textContent = '';
+  ui.jobId.value = schedule?.id ?? '';
+  ui.jobDialogTitle.textContent = schedule ? 'Edit scheduled job' : 'New scheduled job';
+  ui.saveJob.textContent = schedule ? 'Save changes' : 'Create job';
+  ui.deleteJob.classList.toggle('hidden', !schedule);
+  populateJobAgents(schedule?.agentId);
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const defaultRunAt = new Date(Date.now() + 60 * 60 * 1000);
+  defaultRunAt.setSeconds(0, 0);
+  defaultRunAt.setMinutes(Math.ceil(defaultRunAt.getMinutes() / 5) * 5);
+  ui.jobFrequency.querySelector('option[value="custom"]')?.remove();
+  ui.jobRunAt.value = localDateTimeValue(defaultRunAt);
+  ui.jobCron.value = '0 9 * * 1-5';
+  ui.jobFrequency.value = 'weekdays';
+  ui.jobRepeatTime.value = '09:00';
+  ui.jobWeekday.value = '1';
+  ui.jobMonthDay.value = '1';
+  ui.jobHourMinute.value = '0';
+  populateJobTimezones(schedule?.timing.timezone || timezone);
+  ui.jobTimeout.value = '60';
+  if (schedule) {
+    ui.jobName.value = schedule.name;
+    ui.jobPrompt.value = schedule.prompt;
+    ui.jobAgent.value = schedule.agentId;
+    const timingRadio = ui.jobForm.querySelector(`[name="jobTiming"][value="${schedule.timing.kind}"]`);
+    if (timingRadio) timingRadio.checked = true;
+    if (schedule.timing.kind === 'once') ui.jobRunAt.value = localDateTimeValue(new Date(schedule.timing.at));
+    else {
+      ui.jobCron.value = schedule.timing.expression;
+      ensureTimezoneOption(schedule.timing.timezone);
+      ui.jobTimezone.value = schedule.timing.timezone;
+      applyRecurringExpression(schedule.timing.expression);
+    }
+    ui.jobTimeout.value = String(Math.round((schedule.policies?.timeoutMs ?? 3_600_000) / 60_000));
+  }
+  syncJobTimingFields();
+  if (schedule?.state === 'completed') {
+    ui.jobFormMessage.textContent = 'This one-off job is complete. You can run it manually again or delete it, but its original schedule is immutable.';
+    ui.jobFormMessage.classList.remove('hidden');
+    ui.saveJob.disabled = true;
+  } else if (!scheduleAgents.length) {
+    ui.jobFormMessage.textContent = 'Create an agent before scheduling work.';
+    ui.jobFormMessage.classList.remove('hidden');
+    ui.saveJob.disabled = true;
+  } else ui.saveJob.disabled = false;
+  ui.jobDialog.showModal();
+  ui.jobName.focus();
+}
+
+async function saveJob(event) {
+  event.preventDefault();
+  ui.jobFormMessage.classList.add('hidden');
+  const timingKind = ui.jobForm.querySelector('[name="jobTiming"]:checked')?.value ?? 'once';
+  let timing;
+  if (timingKind === 'once') {
+    const at = new Date(ui.jobRunAt.value);
+    if (!Number.isFinite(at.valueOf()) || at.getTime() <= Date.now()) {
+      ui.jobFormMessage.textContent = 'Choose a future date and time.';
+      ui.jobFormMessage.classList.remove('hidden');
+      return;
+    }
+    timing = { kind: 'once', at: at.toISOString() };
+  } else {
+    const expression = buildRecurringExpression();
+    if (!expression || expression.includes('NaN')) {
+      ui.jobFormMessage.textContent = 'Choose a complete repeating schedule.';
+      ui.jobFormMessage.classList.remove('hidden');
+      return;
+    }
+    ui.jobCron.value = expression;
+    timing = { kind: 'cron', expression, timezone: ui.jobTimezone.value };
+  }
+  const existing = schedules.find((schedule) => schedule.id === ui.jobId.value);
+  const body = {
+    name: ui.jobName.value.trim(),
+    agentId: ui.jobAgent.value,
+    prompt: ui.jobPrompt.value.trim(),
+    timing,
+    policies: {
+      overlap: 'skip-if-busy',
+      misfire: 'skip',
+      misfireGraceMs: existing?.policies?.misfireGraceMs ?? 60_000,
+      timeoutMs: Number(ui.jobTimeout.value) * 60_000,
+      maxAttempts: 1
+    }
+  };
+  ui.saveJob.disabled = true;
+  ui.saveJob.textContent = existing ? 'Saving…' : 'Creating…';
+  try {
+    await api(existing ? `${API_ROOT}/schedules/${encodeURIComponent(existing.id)}` : `${API_ROOT}/schedules`, {
+      method: existing ? 'PATCH' : 'POST',
+      body: JSON.stringify(body)
+    });
+    ui.jobDialog.close();
+    await refreshJobs();
+  } catch (error) {
+    ui.jobFormMessage.textContent = error.message;
+    ui.jobFormMessage.classList.remove('hidden');
+  } finally {
+    ui.saveJob.disabled = false;
+    ui.saveJob.textContent = existing ? 'Save changes' : 'Create job';
+  }
+}
+
+async function deleteJob(id = ui.jobId.value) {
+  const schedule = schedules.find((candidate) => candidate.id === id);
+  if (!schedule || !window.confirm(`Delete “${schedule.name}”? Its audit rows stay in the scheduler database.`)) return;
+  try {
+    await api(`${API_ROOT}/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (ui.jobDialog.open) ui.jobDialog.close();
+    await refreshJobs();
+  } catch (error) {
+    ui.jobFormMessage.textContent = error.message;
+    ui.jobFormMessage.classList.remove('hidden');
+  }
+}
+
+async function handleJobAction(event) {
+  const button = event.target.closest('[data-job-action]');
+  if (!button) return;
+  const schedule = schedules.find((candidate) => candidate.id === button.dataset.scheduleId);
+  if (!schedule) return;
+  if (button.dataset.jobAction === 'edit') return openJobDialog(schedule);
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = button.dataset.jobAction === 'run-now' ? 'Queueing…' : 'Updating…';
+  try {
+    await api(`${API_ROOT}/schedules/${encodeURIComponent(schedule.id)}/${button.dataset.jobAction}`, { method: 'POST' });
+    await refreshJobs();
+  } catch (error) {
+    ui.jobsRefreshed.textContent = error.message;
+    button.disabled = false;
+    button.textContent = original;
   }
 }
 
@@ -1449,6 +2020,7 @@ async function cancelRun() {
 async function loadAgent(id) {
   ui.agentView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
+  ui.jobsView.classList.add('hidden');
   try {
     const [result] = await Promise.all([api(`${API_ROOT}/agents/${encodeURIComponent(id)}`), loadRuntimeDrift()]);
     currentAgent = result.agent;
@@ -1465,6 +2037,20 @@ async function loadAgent(id) {
 }
 
 ui.createForm.addEventListener('submit', createAgent);
+ui.jobForm.addEventListener('submit', saveJob);
+for (const radio of ui.jobForm.querySelectorAll('[name="jobTiming"]')) radio.addEventListener('change', syncJobTimingFields);
+ui.jobFrequency.addEventListener('change', syncJobRecurrenceFields);
+ui.jobRunAt.addEventListener('input', updateJobScheduleSummary);
+for (const control of [ui.jobRepeatTime, ui.jobWeekday, ui.jobMonthDay, ui.jobHourMinute, ui.jobTimezone]) {
+  control.addEventListener('input', updateJobScheduleSummary);
+  control.addEventListener('change', updateJobScheduleSummary);
+}
+$('#new-job').addEventListener('click', () => openJobDialog());
+$('#empty-new-job').addEventListener('click', () => openJobDialog());
+$('#close-job-dialog').addEventListener('click', () => ui.jobDialog.close());
+$('#cancel-job').addEventListener('click', () => ui.jobDialog.close());
+ui.deleteJob.addEventListener('click', () => deleteJob());
+ui.jobGrid.addEventListener('click', handleJobAction);
 for (const radio of ui.createAdapterRadios) radio.addEventListener('change', syncCreateRuntimeOptions);
 for (const radio of $$('[name="runtimeMode"]')) radio.addEventListener('change', syncCreateRuntimeOptions);
 $('#new-agent').addEventListener('click', openCreateDialog);
@@ -1508,5 +2094,7 @@ ui.testAgentButton.addEventListener('click', () => {
 window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
+const jobsRoute = /^\/(?:jobs|schedules)\/?$/.test(window.location.pathname);
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
+else if (jobsRoute) loadJobs();
 else loadDashboard();

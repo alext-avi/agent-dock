@@ -13,7 +13,7 @@
     "test:ui": "node --test test/browser/*.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "devDependencies": {
     "playwright": "^1.62.1"

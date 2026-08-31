@@ -1,7 +1,7 @@
 FROM node:22-bookworm-slim
 
 WORKDIR /app
-COPY server.mjs docker-runtime.mjs mcp-service.mjs ./
+COPY server.mjs docker-runtime.mjs mcp-service.mjs scheduler.mjs ./
 COPY public ./public
 
 EXPOSE 3000

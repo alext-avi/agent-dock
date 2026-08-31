@@ -12,6 +12,9 @@ services:
       OPENCODE_WORKER_URL: http://opencode-worker:7777
       OPENCODE_WORKER_TOKEN: ${WORKER_TOKEN:-local-dev-change-me}
       CONTROL_PLANE_DATA_PATH: /control-data/agents.json
+      SCHEDULER_DB_PATH: /control-data/scheduler.sqlite
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-1}
+      SCHEDULER_INTERVAL_MS: ${SCHEDULER_INTERVAL_MS:-1000}
       RUNTIME_PROVISIONER: docker
       DOCKER_SOCKET_PATH: /var/run/docker.sock
       CODEX_WORKER_IMAGE: agent-dock-worker-codex:${AGENT_DOCK_IMAGE_TAG:-local}

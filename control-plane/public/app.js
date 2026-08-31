@@ -7,6 +7,11 @@ let currentUsageCapability = { quotaWindows: false, accountActivity: false, sour
 // rather than in the three-second status poll, which would mean a Docker
 // inspection per agent per tick.
 let runtimeDrift = new Map();
+let runtimeDriftReadAt = 0;
+// The status poll and the refresh handler both write the refresh control. While
+// a refresh is in flight the handler owns it, or the poll re-enables a button
+// mid-request and a second click fires a POST the server correctly rejects.
+let runtimeRefreshInFlight = false;
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -154,17 +159,25 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function loadRuntimeDrift() {
+// maxAgeMs lets the live poll resync cheaply: drift only changes when someone
+// rebuilds, so re-reading it every minute keeps an open tab honest without
+// putting a Docker inspection behind every three-second tick.
+async function loadRuntimeDrift({ maxAgeMs = 0 } = {}) {
+  if (maxAgeMs && Date.now() - runtimeDriftReadAt < maxAgeMs) return;
   try {
     const { runtimes } = await api(`${API_ROOT}/runtimes`);
     runtimeDrift = new Map(runtimes.map((runtime) => [runtime.id, runtime]));
+    runtimeDriftReadAt = Date.now();
   } catch {
     // Drift is advisory. Failing to read it must not block the fleet.
-    runtimeDrift = new Map();
   }
 }
 
+const DRIFT_RESYNC_MS = 60_000;
+
 function renderRuntimeDrift() {
+  // The refresh handler owns the control until its request settles.
+  if (runtimeRefreshInFlight) return;
   const outdated = runtimeIsOutdated(currentAgent?.runtime);
   ui.runtimeDrift.classList.toggle('hidden', !outdated);
   ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
@@ -404,6 +417,7 @@ async function refreshDashboardStatuses() {
   dashboardRefreshInFlight = true;
   try {
     const { agents } = await api(`${API_ROOT}/agents`);
+    await loadRuntimeDrift({ maxAgeMs: DRIFT_RESYNC_MS });
     const nextFingerprint = JSON.stringify(agents.map((agent) => [agent.id, agent.updatedAt]));
     if (nextFingerprint !== dashboardFingerprint) renderAgentGrid(agents);
     await Promise.allSettled(dashboardAgents.map(async (agent) => {
@@ -888,7 +902,8 @@ async function refreshRuntimeImage() {
     + 'Its CLI, credentials, telemetry, and workspace volumes are kept, so the agent stays signed in. '
     + 'The runtime restarts and is briefly unavailable.'
   );
-  if (!confirmed) return;
+  if (!confirmed || runtimeRefreshInFlight) return;
+  runtimeRefreshInFlight = true;
   ui.refreshRuntime.disabled = true;
   ui.refreshRuntime.textContent = 'Refreshing…';
   try {
@@ -900,6 +915,7 @@ async function refreshRuntimeImage() {
   } catch (error) {
     setConnection('offline', error.message);
   } finally {
+    runtimeRefreshInFlight = false;
     ui.refreshRuntime.disabled = false;
     renderRuntimeDrift();
   }
@@ -1089,7 +1105,7 @@ function renderStatus(status) {
     : 'Worker-managed provider sandbox';
   // Only a managed runtime has a container of ours to replace, and never while
   // a task is running.
-  ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
+  if (!runtimeRefreshInFlight) ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
   renderRuntimeDrift();
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
@@ -1176,6 +1192,7 @@ async function refreshStatus() {
 }
 
 async function refreshAgentLive() {
+  await loadRuntimeDrift({ maxAgeMs: DRIFT_RESYNC_MS });
   await refreshStatus();
   if (location.hash === '#tools') await refreshMcp();
 }

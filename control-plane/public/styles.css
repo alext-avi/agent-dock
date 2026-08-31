@@ -88,6 +88,9 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .agent-menu summary::-webkit-details-marker { display: none; }
 .agent-menu-popover { position: absolute; right: 0; top: 40px; z-index: 20; width: 170px; padding: 6px; background: #171c19; border: 1px solid #3a433e; box-shadow: 0 16px 45px #0008; }
 .agent-menu-popover button { width: 100%; padding: 10px 11px; color: var(--danger); background: transparent; border: 0; text-align: left; font-size: 12px; }
+.agent-menu-popover button.menu-neutral { color: var(--ink); }
+.agent-menu-popover button.menu-neutral:hover { background: #ffffff08; }
+.agent-menu-popover button:disabled { color: var(--faint); cursor: default; background: transparent; }
 .agent-menu-popover button:hover { background: #ff6b6b10; }
 
 .tab-list { position: sticky; top: 72px; z-index: 8; display: flex; gap: 2px; margin: 28px 0 18px; padding: 5px; overflow-x: auto; background: rgba(11,14,13,.92); border: 1px solid var(--line); backdrop-filter: blur(12px); }
@@ -208,6 +211,13 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .quota-bar span.warning { background: #ffca62; }
 .quota-bar span.danger { background: var(--danger); }
 /* A retained reading from before a failed poll is real but no longer current. */
+.pill.warn { color: #ffca62; border-color: #6a5626; background: #ffca6212; }
+/* The harness reports a login the provider has rejected: not healthy. */
+.auth-box.rejected { border-color: #6a5626; }
+button.pill.warn { font: inherit; font-size: 10px; letter-spacing: .04em; }
+button.pill.warn:hover { background: #ffca6222; border-color: #8a7233; }
+button.pill.warn:disabled { opacity: .6; cursor: default; }
+.card-outdated { color: #ffca62; font: 9px ui-monospace, monospace; white-space: nowrap; }
 .quota-bar.stale span { opacity: .45; }
 .card-quota-row.stale, .quota-row.stale { opacity: .68; }
 /* An empty bar reads as "0% used". A hatched track reads as "no reading". */

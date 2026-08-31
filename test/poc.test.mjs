@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
+import { DockerRuntimeManager } from '../control-plane/docker-runtime.mjs';
 import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
 import { normalizeOpenCodeEvent } from '../worker/adapters/opencode.mjs';
 
@@ -48,6 +49,8 @@ class FakeRuntimeManager {
     this.started = [];
     this.stopped = [];
     this.destroyed = [];
+    this.recreated = [];
+    this.image = 'agent-dock-worker:v1';
   }
 
   async provision({ agentId, adapter }) {
@@ -64,6 +67,9 @@ class FakeRuntimeManager {
       workerUrl: definition.workerUrl,
       workerToken: definition.token,
       containerId: `container-${suffix}`,
+      containerName: `agent-dock-runtime-${suffix}`,
+      image: this.image,
+      imageId: this.image,
       volumes: {
         auth: `auth-${suffix}`,
         binary: `binary-${suffix}`,
@@ -79,7 +85,29 @@ class FakeRuntimeManager {
     return runtime;
   }
 
-  async inspect(runtime) { return { state: runtime.state, health: 'healthy' }; }
+  async inspect(runtime) {
+    return { state: runtime.state, health: 'healthy', image: runtime.image ?? null, imageId: runtime.imageId ?? null, containerId: runtime.containerId };
+  }
+
+  // The tag does not move on a rebuild; the image id does. Mirrors the real
+  // manager so drift can be exercised without Docker.
+  async currentImageId() { return this.image; }
+
+  // Mirrors the real manager: a new container id, the same name and volumes, and
+  // the currently configured image. Volumes are never touched.
+  async recreate(runtime, { agentId = null } = {}) {
+    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes });
+    return {
+      containerId: `container-${runtime.id}-${this.recreated.length}`,
+      containerName: runtime.containerName,
+      workerUrl: runtime.workerUrl,
+      image: this.image,
+      imageId: this.image,
+      volumes: runtime.volumes,
+      state: 'starting',
+      updatedAt: new Date().toISOString()
+    };
+  }
   async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
   async stop(runtime) { runtime.state = 'stopped'; this.stopped.push(runtime.id); }
   async destroy(runtime) { this.destroyed.push(runtime.id); }
@@ -599,4 +627,256 @@ test('OpenCode discovers Ollama and executes a durable pinned model policy', asy
     totalTokens: 207
   });
   assert.equal(normalizeOpenCodeEvent({ type: 'text', part: { type: 'text', text: 'hello' } }).data.text, 'hello');
+});
+
+
+test('refreshing a runtime replaces its container while retaining every volume', async (t) => {
+  const token = 'refresh-worker-secret';
+  const worker = createStatusWorker({ workerId: 'refresh-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'refresh-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const created = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Refreshable', adapter: 'claude-code', runtime: { mode: 'provision' } })
+  })).json()).agent;
+
+  const before = created.runtime;
+  assert.equal(before.managed, true);
+
+  // A newer image is configured, exactly as it would be after a rebuild.
+  manager.image = 'agent-dock-worker:v2';
+
+  const response = await fetch(`${controlUrl}/api/v1/agents/${created.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+
+  assert.equal(body.refreshed, true);
+  assert.equal(body.runtime.image, 'agent-dock-worker:v2', 'the runtime did not move onto the current image');
+  assert.equal(body.runtime.outdated, false, 'the response still reported drift it had just resolved');
+  assert.equal(body.runtime.id, before.id, 'refreshing must not change runtime identity');
+  assert.equal(body.runtime.binding, 'dedicated', 'exclusivity must survive a refresh');
+  assert.equal(body.runtime.attachmentCount, 1);
+
+  // The credential lives in the auth volume. Retaining it is the entire point:
+  // a refresh that dropped it would force a fresh provider login.
+  assert.equal(manager.recreated.length, 1);
+  assert.deepEqual(manager.recreated[0].volumes, manager.provisioned[0].volumes);
+  assert.equal(manager.destroyed.length, 0, 'a refresh must never destroy volumes');
+  assert.equal(manager.recreated[0].agentId, created.id);
+
+  const serialized = JSON.stringify(body);
+  assert.ok(!serialized.includes(token), 'refresh response disclosed the worker token');
+  assert.ok(!serialized.includes(workerUrl), 'refresh response disclosed the worker URL');
+});
+
+test('a runtime refresh is refused while a task is running and for unmanaged runtimes', async (t) => {
+  const token = 'busy-worker-secret';
+  const busy = createServer((req, res) => {
+    if (req.url === '/v1/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'unauthorized' }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      apiVersion: 'agent-wrapper/v1',
+      agent: { id: 'busy-worker', adapter: { id: 'claude-code', provider: 'anthropic', displayName: 'Claude Code' } },
+      authentication: { authenticated: true, phase: 'authenticated' },
+      task: { active: { id: 'task-1', status: 'running' } },
+      usage: { totals: { requests: 0 }, quotaWindows: [] }
+    }));
+  });
+  const workerUrl = await listen(busy);
+  const manager = new FakeRuntimeManager([{ workerId: 'busy-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    claudeWorkerUrl: workerUrl,
+    claudeWorkerToken: token,
+    runtimeManager: manager,
+    dataPath: null
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => busy.close(resolve))
+  ]));
+
+  const managed = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Busy', adapter: 'claude-code', runtime: { mode: 'provision' } })
+  })).json()).agent;
+
+  const refused = await fetch(`${controlUrl}/api/v1/agents/${managed.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(refused.status, 409, 'a refresh must not interrupt a running task');
+  assert.equal(manager.recreated.length, 0);
+
+  // A bootstrap runtime is not ours to replace.
+  const legacy = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Legacy', adapter: 'claude-code', runtime: { mode: 'attach', id: 'legacy-claude-code' } })
+  })).json()).agent;
+
+  const unmanaged = await fetch(`${controlUrl}/api/v1/agents/${legacy.id}/runtime/refresh`, { method: 'POST' });
+  assert.equal(unmanaged.status, 409);
+  assert.equal(manager.recreated.length, 0);
+});
+
+
+// The container spec is shared by provisioning and refreshing, so it is the one
+// place where a silent omission changes every runtime the system creates. The
+// FakeRuntimeManager cannot catch that — it fabricates its own shape — so this
+// exercises the real manager with the network pinned so it needs no Docker.
+test('the shared container spec carries every setting a worker needs', async () => {
+  const manager = new DockerRuntimeManager({
+    network: 'test-net',
+    socketPath: '/nonexistent.sock',
+    images: { 'claude-code': 'agent-dock-worker-claude:test' },
+    mcpAllowedCommands: 'npx,uvx',
+    usagePollIntervalMs: 60_000,
+    allowUnsandboxed: '1'
+  });
+
+  const volumes = { auth: 'v-auth', binary: 'v-bin', telemetry: 'v-data', workspace: 'v-work' };
+  const { image, body } = await manager.containerSpec({
+    adapter: 'claude-code',
+    workerId: 'worker-abc',
+    workerToken: 'token-abc',
+    volumes,
+    labels: { 'com.agent-dock.managed': 'true' }
+  });
+
+  assert.equal(image, 'agent-dock-worker-claude:test');
+  const env = Object.fromEntries(body.Env.map((entry) => {
+    const index = entry.indexOf('=');
+    return [entry.slice(0, index), entry.slice(index + 1)];
+  }));
+
+  // Every variable the worker reads must be present. Dropping one during a
+  // refactor is invisible until the feature that depends on it stops working.
+  for (const key of [
+    'PORT',
+    'WORKER_TOKEN',
+    'AGENT_ID',
+    'ALLOW_UNSANDBOXED',
+    'AGENT_DATA_PATH',
+    'USAGE_POLL_INTERVAL_MS',
+    'MCP_ALLOWED_COMMANDS',
+    'AGENT_ADAPTER',
+    'CLAUDE_VERSION'
+  ]) {
+    assert.ok(key in env, `${key} is missing from the container environment`);
+  }
+  assert.equal(env.MCP_ALLOWED_COMMANDS, 'npx,uvx');
+  assert.equal(env.WORKER_TOKEN, 'token-abc');
+  assert.equal(env.AGENT_ID, 'worker-abc');
+
+  // All four private volumes are mounted, and nothing from the host is.
+  const mounts = body.HostConfig.Mounts;
+  assert.equal(mounts.length, 4);
+  assert.deepEqual(mounts.map((mount) => mount.Source).sort(), Object.values(volumes).sort());
+  assert.ok(mounts.every((mount) => mount.Type === 'volume'), 'a bind mount reached a managed runtime');
+  assert.equal(body.HostConfig.NetworkMode, 'test-net');
+  assert.ok(!body.HostConfig.Privileged);
+});
+
+test('destructive runtime operations cannot overlap', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+
+  // Docker recreates any named volume a container references but that does not
+  // exist, so a destroy landing inside a refresh would hand the replacement
+  // empty volumes and still look like it worked.
+  const release = manager.claimRuntime('runtime-1', 'refreshed');
+  assert.throws(() => manager.claimRuntime('runtime-1', 'destroyed'), (error) => {
+    assert.equal(error.status, 409);
+    assert.match(error.message, /already being refreshed/);
+    return true;
+  });
+
+  // A different runtime is unaffected, and releasing frees the claim.
+  const other = manager.claimRuntime('runtime-2', 'destroyed');
+  other();
+  release();
+  manager.claimRuntime('runtime-1', 'destroyed')();
+});
+
+
+// Container identity has two keys with opposite failure modes: an id that is
+// unambiguous but goes stale, and a name that survives replacement but can be
+// reused by an unrelated container. These pin the resolution rules.
+function stubDocker(manager, containers) {
+  manager.request = async (method, path) => {
+    const match = path.match(/^\/containers\/([^/]+)\/json$/);
+    if (!match) throw new Error(`unexpected docker call ${method} ${path}`);
+    const found = containers[decodeURIComponent(match[1])];
+    if (!found) throw Object.assign(new Error('Docker API 404 for ' + path), { status: 409 });
+    return found;
+  };
+}
+
+test('a runtime resolves by id first and falls back to its stable name', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const runtime = { id: 'rt-1', containerId: 'id-old', containerName: 'agent-dock-rt-1' };
+  const ours = { Id: 'id-new', Config: { Labels: { 'com.agent-dock.runtime-id': 'rt-1' } }, State: { Running: true } };
+
+  // Both present: the immutable id wins.
+  stubDocker(manager, { 'id-old': { ...ours, Id: 'id-old' }, 'agent-dock-rt-1': ours });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-old');
+
+  // The id has gone stale — a replaced container — so the name carries it.
+  stubDocker(manager, { 'agent-dock-rt-1': ours });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-new');
+
+  // Neither resolves.
+  stubDocker(manager, {});
+  assert.equal(await manager.resolveContainer(runtime), null);
+});
+
+test('a container holding the name but not the identity is never acted on', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const runtime = { id: 'rt-1', containerId: 'id-gone', containerName: 'agent-dock-rt-1' };
+
+  // Something unrelated has taken the name. Destructive calls resolve to
+  // nothing rather than to the impostor.
+  stubDocker(manager, {
+    'agent-dock-rt-1': { Id: 'id-someone-else', Config: { Labels: { 'com.agent-dock.runtime-id': 'rt-other' } }, State: { Running: true } }
+  });
+  assert.equal(await manager.resolveContainer(runtime, { requireIdentity: true }), null);
+  assert.equal(await manager.resolveContainer(runtime), null, 'a mismatched label is never ours, read or write');
+
+  // An unlabelled container answering to the name is not provably ours either,
+  // so it is readable but never destroyable.
+  stubDocker(manager, {
+    'agent-dock-rt-1': { Id: 'id-unlabelled', Config: { Labels: {} }, State: { Running: true } }
+  });
+  assert.equal((await manager.resolveContainer(runtime)).id, 'id-unlabelled');
+  assert.equal(await manager.resolveContainer(runtime, { requireIdentity: true }), null);
+
+  // stop() must not touch anything it could not verify.
+  let stopped = false;
+  manager.request = async (method, path) => {
+    if (path.endsWith('/json')) throw Object.assign(new Error('Docker API 404'), { status: 409 });
+    stopped = true;
+    return null;
+  };
+  await manager.stop(runtime);
+  assert.equal(stopped, false, 'stop acted on a container it could not verify');
 });

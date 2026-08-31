@@ -56,6 +56,7 @@ flowchart LR
 - The browser never receives the Docker socket, worker routing secrets, or provider credentials. In this local POC, the server-side control-plane container uses the Docker socket to provision runtimes; this is a privileged host boundary and must become a constrained provisioner service before multi-user deployment.
 - The fleet dashboard supports create, read, update, and lifecycle-aware delete for agent records, then reports each reachable runtime's auth, activity, usage, and request count.
 - Newly managed agents cannot share a runtime. The API rejects attaching a runtime that already has an owner.
+- A managed runtime can be moved onto a rebuilt worker image without losing its credentials. Refreshing replaces the container from the currently configured image and reattaches the same CLI, auth, telemetry, and workspace volumes, so the agent stays signed in; a refresh is refused while a task is running, and never touches a bootstrap runtime.
 - Deleting a managed agent explicitly chooses between stopping and retaining all isolated state for later exclusive reattachment, or destroying the container and every private volume after exact-ID confirmation.
 - Fleet and agent runtime status refresh every three seconds while the browser tab is visible, with overlapping requests deduplicated.
 - Each agent has a durable prompt stored by the control plane and a separate, intentionally ephemeral test conversation.
@@ -117,6 +118,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `POST` | `/api/v1/schedules/:id/resume` | Resume a paused schedule |
 | `POST` | `/api/v1/schedules/:id/run-now` | Dispatch a manual occurrence without changing the recurring cadence |
 | `GET` | `/api/v1/schedules/:id/runs` | Read durable outcome, duration, task, and usage history |
+| `POST` | `/api/v1/agents/:id/runtime/refresh` | Replace a managed runtime's container with one built from the current image, retaining its volumes |
 
 The original unscoped runtime routes remain aliases for the default agent during the POC.
 
@@ -146,7 +148,7 @@ The worker invokes `codex exec --dangerously-bypass-approvals-and-sandbox` by de
 
 The included Compose file retains one bootstrap worker for each adapter so schema-v1 installations can migrate without losing logins. Those bindings are labeled `shared-legacy`, and the control plane prevents newly created agents from attaching to an already-bound bootstrap runtime. All new managed agents provision an exclusive container and complete private volume set. One-time remote-worker pairing, connector-secret injection, tool installation, and arbitrary data mounts remain distinct next capabilities.
 
-That floor is per worker process. Each agent has its own container and its own copy of the credential, so a fleet of agents signed in to one subscription still multiplies calls to that account by the number of agents; there is no shared cross-agent budget. Raise `CLAUDE_OAUTH_USAGE_INTERVAL_MS` before running many Claude agents against a single account.
+That floor defaults to thirty minutes and is per worker process. Each agent has its own container and its own copy of the credential, so a fleet of agents signed in to one subscription still multiplies calls to that account by the number of agents; there is no shared cross-agent budget. The endpoint does throttle in practice — a fifty-four-minute `Retry-After` was observed while the floor was five minutes — so raise `CLAUDE_OAUTH_USAGE_INTERVAL_MS` further before running many Claude agents against a single account. When a backoff or the floor is in force, the agent page reports when the source will next be read rather than offering a refresh that cannot run.
 
 This prototype deliberately omits multi-tenancy, webhooks, automatic model fallback, usage-limit routing, TLS, user authentication for the web UI, remote secret management, egress controls, and container resource limits. Scheduled jobs use a local SQLite database, but multi-replica leader election, retries beyond one attempt, webhook triggers, and an agent-facing MCP schedule surface remain follow-ons. The agent/runtime/MCP registry is still a single JSON file and the browser is vanilla JavaScript; migration of that registry behind the SQLite/Postgres-ready persistence boundary and a React/TypeScript frontend are separately tracked. Usage telemetry, agent configuration, schedules, and run history are durable; live event streams and test conversations are not.
 
@@ -165,6 +167,21 @@ The application has no third-party JavaScript dependencies. Run the contract tes
 ```bash
 npm test
 ```
+
+The browser client has its own suite, kept separate because it needs a real browser
+rather than staying hermetic:
+
+```bash
+npx playwright install chromium   # once
+npm run test:ui
+```
+
+Those tests cover what a person sees rather than what the API returns — that an
+unavailable reading is never drawn as a confident zero, that a retained reading from
+before a failed poll is marked stale rather than presented as current, that image
+drift appears only for a managed runtime that is behind, that the status poll cannot
+re-enable a runtime refresh mid-request, and that no worker endpoint or token reaches
+the DOM.
 
 To exercise the complete UI without authenticating or spending subscription usage, start the deterministic demo worker:
 

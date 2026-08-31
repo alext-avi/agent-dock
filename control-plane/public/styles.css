@@ -149,6 +149,11 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .quota-bar span.danger { background: var(--danger); }
 /* A retained reading from before a failed poll is real but no longer current. */
 .pill.warn { color: #ffca62; border-color: #6a5626; background: #ffca6212; }
+/* The harness reports a login the provider has rejected: not healthy. */
+.auth-box.rejected { border-color: #6a5626; }
+button.pill.warn { font: inherit; font-size: 10px; letter-spacing: .04em; }
+button.pill.warn:hover { background: #ffca6222; border-color: #8a7233; }
+button.pill.warn:disabled { opacity: .6; cursor: default; }
 .card-outdated { color: #ffca62; font: 9px ui-monospace, monospace; white-space: nowrap; }
 .quota-bar.stale span { opacity: .45; }
 .card-quota-row.stale, .quota-row.stale { opacity: .68; }

@@ -270,6 +270,33 @@ test('a failed poll marks retained windows stale instead of showing them as curr
   app.claude.healthy = true;
 });
 
+test('a credential the provider rejects offers a way to sign in again', async (t) => {
+  // Its own instance: a rejected credential puts the worker into an auth backoff
+  // that outlives the test, so sharing one would make this depend on ordering.
+  const isolated = await startApp();
+  const page = await browser.newPage();
+  t.after(async () => {
+    await page.close();
+    await isolated.close();
+  });
+  await page.goto(`${isolated.url}/agents/${isolated.agents['claude-code'].id}`);
+
+  // Healthy: the harness holds a login and there is nothing to act on.
+  await page.waitForFunction(() => document.querySelector('#auth-button')?.textContent === 'Connected');
+  assert.equal(await page.locator('#auth-button').isDisabled(), true);
+
+  // The provider rejects the token while the harness still reports a login.
+  // Telling someone to sign in again with every control disabled is a dead end.
+  isolated.claude.healthy = false;
+  await page.waitForFunction(
+    () => document.querySelector('#auth-button')?.textContent === 'Sign in again',
+    null,
+    { timeout: 15_000 }
+  );
+  assert.equal(await page.locator('#auth-button').isDisabled(), false, 'the only offered remedy was not clickable');
+  assert.match(await page.locator('#auth-copy').textContent(), /rejected it/);
+});
+
 test('image drift is shown only for a managed runtime that is behind', async (t) => {
   // The tag does not move when an image is rebuilt, so drift is decided by the
   // image id. Bumping it is what a rebuild looks like to the control plane.

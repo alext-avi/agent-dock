@@ -176,10 +176,12 @@ async function loadRuntimeDrift({ maxAgeMs = 0 } = {}) {
 const DRIFT_RESYNC_MS = 60_000;
 
 function renderRuntimeDrift() {
-  // The refresh handler owns the control until its request settles.
+  // The refresh handler owns both controls until its request settles.
   if (runtimeRefreshInFlight) return;
   const outdated = runtimeIsOutdated(currentAgent?.runtime);
   ui.runtimeDrift.classList.toggle('hidden', !outdated);
+  ui.runtimeDrift.disabled = false;
+  ui.runtimeDrift.textContent = 'image update available · refresh';
   ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
 }
 
@@ -906,6 +908,8 @@ async function refreshRuntimeImage() {
   runtimeRefreshInFlight = true;
   ui.refreshRuntime.disabled = true;
   ui.refreshRuntime.textContent = 'Refreshing…';
+  ui.runtimeDrift.disabled = true;
+  ui.runtimeDrift.textContent = 'refreshing…';
   try {
     const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
     currentAgent.runtime = result.runtime;
@@ -1116,16 +1120,30 @@ function renderStatus(status) {
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
   ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
   ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
-  ui.authBox.classList.toggle('authenticated', authenticated);
+  // The harness's own auth check and the provider can disagree: a token the CLI
+  // still considers present can be rejected upstream. When that happens the UI
+  // asks the operator to sign in again, so the control has to allow it.
+  const credentialRejected = status.usage?.pollErrorKind === 'unauthenticated';
+  ui.authBox.classList.toggle('authenticated', authenticated && !credentialRejected);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   const browserOAuth = status.authentication?.method === 'browser_oauth';
-  ui.authCopy.textContent = authenticated
+  ui.authCopy.textContent = credentialRejected
+    ? `${currentHarnessName} still reports a stored login, but the provider rejected it. Usage telemetry is stale until you sign in again; the agent may also fail to run tasks.`
+    : authenticated
     ? `The worker holds a CLI-managed ${currentHarnessName} login. Safe session metadata is surfaced; credentials never leave the worker.`
     : browserOAuth
       ? `The worker starts ${currentHarnessName}'s browser OAuth flow. Agent Dock forwards only the provider's one-time completion code and never stores it.`
       : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
-  ui.authButton.textContent = authenticated ? 'Connected' : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
-  ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
+  const waiting = status.authentication?.phase === 'waiting_for_user';
+  ui.authButton.textContent = waiting
+    ? 'Waiting for sign-in'
+    : credentialRejected
+      ? 'Sign in again'
+      : authenticated
+        ? 'Connected'
+        : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
+  ui.authButton.disabled = waiting || (authenticated && !credentialRejected);
+  ui.authBox.classList.toggle('rejected', credentialRejected);
   if (!authenticated) {
     ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user'
       ? (browserOAuth ? 'Waiting for browser authentication' : 'Waiting for device authentication')
@@ -1438,6 +1456,7 @@ ui.modelSelect.addEventListener('change', () => {
 });
 $('#delete-agent').addEventListener('click', deleteCurrentAgent);
 ui.refreshRuntime.addEventListener('click', refreshRuntimeImage);
+ui.runtimeDrift.addEventListener('click', refreshRuntimeImage);
 ui.authButton.addEventListener('click', startAuth);
 ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);

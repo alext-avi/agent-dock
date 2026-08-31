@@ -216,10 +216,13 @@ export function createWorkerServer(options = {}) {
     // Experimental, off by default. Enables the undocumented Claude OAuth usage
     // source described in worker/adapters/claude-usage.mjs.
     claudeOAuthUsage: options.claudeOAuthUsage ?? process.env.CLAUDE_OAUTH_USAGE === '1',
-    // Deliberately slower than USAGE_POLL_INTERVAL_MS. That interval governs
+    // Deliberately far slower than USAGE_POLL_INTERVAL_MS. That interval governs
     // Codex's local app-server call, which is free; this one governs an
-    // undocumented remote endpoint that is known to rate limit.
-    claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 300_000),
+    // undocumented remote endpoint that does rate limit in practice — a 54-minute
+    // Retry-After was observed at five minutes. Thirty minutes still samples a
+    // five-hour quota window ten times over, and the floor is per worker process,
+    // so agents sharing one account multiply it.
+    claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 1_800_000),
     claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
     claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };

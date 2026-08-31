@@ -326,6 +326,43 @@ test('the Claude worker reports experimental quota windows without disclosing th
   assert.equal(calls, 1, 'the usage endpoint was polled more than once inside the poll interval');
 });
 
+test('the experimental source defaults to a thirty-minute floor', async (t) => {
+  const token = 'claude-usage-default-floor';
+  const home = await claudeHomeWithCredential(t);
+  const payload = await fixture('claude-usage-limits');
+  let calls = 0;
+
+  // No interval given: this pins the shipped default, which exists because the
+  // endpoint throttles and the floor is per worker process.
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse(payload);
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  const first = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(calls, 1);
+
+  const waitMs = Date.parse(first.usage.nextAttemptAt) - Date.parse(first.usage.lastPollAt);
+  assert.equal(waitMs, 1_800_000, `expected a thirty-minute default floor, got ${waitMs}ms`);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+  }
+  assert.equal(calls, 1, `the default floor did not hold: ${calls} calls`);
+});
+
 test('the experimental source is polled no harder than its own floor', async (t) => {
   const token = 'claude-usage-floor';
   const home = await claudeHomeWithCredential(t);

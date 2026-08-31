@@ -6,6 +6,7 @@ Open the rendered [SVG architecture diagram](./architecture.svg), or edit the st
 flowchart TB
   subgraph Client["Web client · HTML5 + CSS + vanilla JavaScript ES modules"]
     UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware live polling"]
+    Workshop["MCP registry + workshop\nHarness draft · operator review"]
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
@@ -40,6 +41,8 @@ flowchart TB
   Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
+  Workshop <-->|"Registry CRUD + task stream"| API
+  Workshop -->|"Credential-free proposal"| UI
   API <--> Registry
   API <--> McpService
   API --> Provisioner --> Engine
@@ -75,4 +78,4 @@ flowchart TB
 | Authentication | Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default |
 | Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |
 
-The control plane never parses provider credential files or vendor MCP configuration. Provider-specific commands, auth behavior, event formats, MCP rendering, and supported usage telemetry stop at the adapter boundary. The future control-plane MCP server will intentionally omit MCP administration and storage/mount mutation tools from its code-level tool registry. The local POC mounts the Docker socket into the server-side control plane; production deployment requires a constrained provisioner boundary instead of exposing host-level Docker authority to the web service.
+The control plane never parses provider credential files or vendor MCP configuration. Provider-specific commands, auth behavior, event formats, MCP rendering, and supported usage telemetry stop at the adapter boundary. The MCP workshop uses an existing agent task stream for connector research, accepts only a credential-free canonical proposal, and leaves save/attach/apply actions behind explicit operator review. The future control-plane MCP server will intentionally omit MCP administration and storage/mount mutation tools from its code-level tool registry. The local POC mounts the Docker socket into the server-side control plane; production deployment requires a constrained provisioner boundary instead of exposing host-level Docker authority to the web service.

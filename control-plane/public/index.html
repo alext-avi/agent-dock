@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=6">
+    <link rel="stylesheet" href="/styles.css?v=7">
   </head>
   <body>
     <header class="topbar">
@@ -15,6 +15,7 @@
       </a>
       <div class="topbar-right">
         <a class="nav-link" href="/">Fleet</a>
+        <a class="nav-link" href="/mcp">MCP Registry</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
       </div>
     </header>
@@ -44,6 +45,55 @@
           <h2>Define your first agent.</h2>
           <p>Create an agent with its own container, CLI installation, credentials, telemetry, and workspace.</p>
           <button id="empty-new-agent" class="button primary">Create agent</button>
+        </section>
+      </div>
+
+      <div id="registry-view" class="view hidden">
+        <section class="hero registry-hero">
+          <div>
+            <p class="eyebrow">CONTROL PLANE · MCP REGISTRY</p>
+            <h1>Prove once.<br><em>Reuse deliberately.</em></h1>
+            <p class="hero-copy">Keep operator-approved MCP definitions in one place, then attach the same canonical connector to any compatible agent without rediscovering its configuration.</p>
+          </div>
+          <div class="boundary-card">
+            <span>Registry definitions</span>
+            <strong id="registry-count">—</strong>
+            <small>Harnesses can propose configurations. Only an operator can save, attach, or delete them.</small>
+          </div>
+        </section>
+
+        <section class="registry-layout">
+          <article class="panel registry-panel">
+            <div class="panel-heading">
+              <div><p class="kicker">REUSABLE CONNECTIONS</p><h2>MCP definitions</h2></div>
+              <button id="new-registry-mcp" class="button primary" type="button">New definition <span>＋</span></button>
+            </div>
+            <p class="capability-copy">Definitions contain connection shape and worker-local secret references, never credential values. Attaching and applying happen from an individual agent page.</p>
+            <div id="registry-list" class="registry-list" aria-live="polite"><p class="empty">Loading the registry…</p></div>
+            <p id="registry-message" class="run-message" role="status"></p>
+          </article>
+
+          <article class="panel workshop-panel">
+            <div class="panel-heading">
+              <div><p class="kicker">HARNESS-ASSISTED SETUP</p><h2>MCP workshop</h2></div>
+              <span class="pill neutral">approval required</span>
+            </div>
+            <p class="capability-copy">Choose an existing harness to investigate a connector and draft the canonical payload. Its durable instructions still apply; it may test inside its own workspace, but cannot write to this registry.</p>
+            <label class="field">Assistant harness<select id="workshop-agent"><option value="">Loading agents…</option></select></label>
+            <label class="field">Connector objective <span>service, package, documentation URL, and intended tools</span><textarea id="workshop-objective" rows="6" maxlength="12000" placeholder="Configure the official GitHub MCP server for repository issues and pull requests. Use a worker-local token reference named GITHUB_TOKEN."></textarea></label>
+            <div class="workshop-actions">
+              <button id="run-workshop" class="button primary" type="button">Ask harness</button>
+              <button id="cancel-workshop" class="button secondary hidden" type="button">Cancel</button>
+              <span id="workshop-status" class="run-message" role="status"></span>
+            </div>
+            <div id="workshop-conversation" class="conversation workshop-conversation" aria-live="polite">
+              <div class="welcome-line"><span>system</span> The harness will return a credential-free proposal for operator review.</div>
+            </div>
+            <div id="workshop-proposal" class="workshop-proposal hidden">
+              <div><strong>Proposal ready</strong><small id="workshop-validation">Waiting for harness validation.</small></div>
+              <button id="review-workshop-proposal" class="button secondary" type="button">Review definition</button>
+            </div>
+          </article>
         </section>
       </div>
 
@@ -277,7 +327,7 @@
       <form id="mcp-form" method="dialog">
         <input id="mcp-definition-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">WORKER CONNECTION</p><h2 id="mcp-dialog-title">New MCP server</h2></div><button id="close-mcp-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
-        <p class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
+        <p id="mcp-dialog-copy" class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
         <div class="form-grid">
           <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="company_docs"></label>
           <label class="field">Transport<select id="mcp-transport"><option value="http">Remote HTTP</option><option value="stdio">Local stdio process</option></select></label>
@@ -295,12 +345,17 @@
           </div>
         </section>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>
+        <details id="mcp-canonical-details" class="mcp-canonical-details">
+          <summary>Complete canonical payload <span>review preserved and advanced fields</span></summary>
+          <p>Every field below will be saved. Advanced values that are not represented by the quick editor are preserved rather than discarded.</p>
+          <pre id="mcp-canonical-preview" class="raw-output"></pre>
+        </details>
         <p id="mcp-form-message" class="usage-error hidden"></p>
         <div class="actions dialog-actions"><button id="delete-mcp-definition" class="button danger hidden" type="button">Delete definition</button><span class="dialog-spacer"></span><button id="cancel-mcp" class="button secondary" type="button">Cancel</button><button id="save-mcp" class="button primary" type="submit">Save and attach</button></div>
       </form>
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=7"></script>
+    <script type="module" src="/app.js?v=9"></script>
   </body>
 </html>

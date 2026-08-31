@@ -46,6 +46,14 @@ Each provider starts a fresh CLI process per task, so successful changes activat
 
 Local MCP commands are code execution inside the agent container. They are denied by default and must exactly match the worker's `MCP_ALLOWED_COMMANDS` allowlist. Remote definitions reject embedded URL credentials. Connector secrets must be injected into that one agent container by a separate secret-provisioning path.
 
+## Registry and harness workshop
+
+The standalone `/mcp` view is the operator-facing registry for reusable definitions. It lists the same canonical objects returned by `/api/v1/mcp/servers`; it does not introduce a second configuration format or provider-specific registry records.
+
+The MCP workshop delegates connector research to one selected agent through the normal `/api/v1/agents/:id/tasks` stream. The task asks the harness to investigate documentation, optionally test inside its isolated workspace, and return a canonical proposal. The browser extracts only the bounded MCP fields, drops all literal environment variables and headers, retains valid worker-environment secret references, and submits the result to that agent's existing `/mcp/validate` endpoint.
+
+Validation proves payload and adapter-policy compatibility, not connectivity or correct credentials. A proposal is accepted only after a matching `task.completed` event reports `succeeded`; failed, cancelled, errored, or incomplete streams cannot reach review. The proposal remains an unsaved browser draft until an operator reviews the complete canonical payload and explicitly saves it. Fields outside the compact editor are displayed and preserved losslessly. The harness is never given a registry mutation endpoint, and attaching or applying the saved definition remains a separate operator action on an agent page. The selected agent's durable instructions still apply to the workshop task, so the operator should choose a suitable harness and never place secret values in the objective.
+
 ## Control-plane MCP privilege boundary
 
 The future control-plane MCP server will call selected internal control-plane services rather than the browser routes. Its tool registry is an explicit allowlist and will not register tools that create, update, delete, bind, unbind, or apply MCP definitions. It will also omit storage, volume, and mount mutation tools. Those administrative capabilities remain available only through the authenticated operator REST/UI surface. This is a code-level capability boundary, not a prompt instruction.

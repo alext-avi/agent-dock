@@ -1,6 +1,7 @@
 flowchart TB
   subgraph Client["Web client · HTML5 + CSS + vanilla JavaScript ES modules"]
     UI["Fleet dashboard\nAgent config + test UI\nVisibility-aware live polling"]
+    Workshop["MCP registry + workshop\nHarness draft · operator review"]
   end
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
@@ -35,6 +36,8 @@ flowchart TB
   Database["Planned transactional persistence\nSQLite local · Postgres-ready repository"]
 
   UI <-->|"Same-origin HTTP"| API
+  Workshop <-->|"Registry CRUD + task stream"| API
+  Workshop -->|"Credential-free proposal"| UI
   API <--> Registry
   API <--> McpService
   API --> Provisioner --> Engine

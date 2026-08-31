@@ -326,6 +326,105 @@ test('the Claude worker reports experimental quota windows without disclosing th
   assert.equal(calls, 1, 'the usage endpoint was polled more than once inside the poll interval');
 });
 
+test('a provider backoff survives a restart but cannot outlive its cap', async (t) => {
+  const home = await claudeHomeWithCredential(t);
+  const dir = await mkdtemp(join(tmpdir(), 'agent-dock-usage-state-'));
+  const dataPath = join(dir, 'usage.json');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const options = {
+    token: 'claude-usage-restart',
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 0
+  };
+  const headers = { authorization: `Bearer ${options.token}` };
+
+  // A long, legitimate Retry-After.
+  let calls = 0;
+  const first = createWorkerServer({
+    ...options,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse({ error: 'slow down' }, { status: 429, headers: { 'retry-after': '1800' } });
+    }
+  });
+  const firstUrl = await listen(first);
+  const throttled = await (await fetch(`${firstUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(throttled.usage.pollErrorKind, 'throttled');
+  await new Promise((resolve) => first.close(resolve));
+  assert.equal(calls, 1);
+
+  // Restarting the worker must not be a way to ignore that instruction.
+  let callsAfter = 0;
+  const second = createWorkerServer({
+    ...options,
+    claudeUsageFetch: () => {
+      callsAfter += 1;
+      return jsonResponse({ error: 'slow down' }, { status: 429 });
+    }
+  });
+  const secondUrl = await listen(second);
+  t.after(() => new Promise((resolve) => second.close(resolve)));
+  const resumed = await (await fetch(`${secondUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(callsAfter, 0, 'the restart re-polled an endpoint that had asked us to wait');
+  assert.equal(resumed.usage.nextAttemptReason, 'provider-backoff');
+
+  // An absurd stored deadline is clamped rather than wedging polling forever.
+  await writeFile(dataPath, JSON.stringify({
+    ...JSON.parse(await readFile(dataPath, 'utf8')),
+    retryAfterAt: Date.now() + 400 * 24 * 3600 * 1000
+  }));
+  const third = createWorkerServer({ ...options, claudeUsageFetch: () => jsonResponse({ error: 'slow' }, { status: 429 }) });
+  const thirdUrl = await listen(third);
+  t.after(() => new Promise((resolve) => third.close(resolve)));
+  const clamped = await (await fetch(`${thirdUrl}/v1/usage`, { headers })).json();
+  const waitMs = Date.parse(clamped.usage.nextAttemptAt) - Date.now();
+  assert.ok(waitMs <= MAX_RETRY_AFTER_SECONDS * 1000 + 5_000, `a stored deadline outlived its cap by ${waitMs}ms`);
+});
+
+test('the experimental source defaults to a thirty-minute floor', async (t) => {
+  const token = 'claude-usage-default-floor';
+  const home = await claudeHomeWithCredential(t);
+  const payload = await fixture('claude-usage-limits');
+  let calls = 0;
+
+  // No interval given: this pins the shipped default, which exists because the
+  // endpoint throttles and the floor is per worker process.
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse(payload);
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  const first = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(calls, 1);
+
+  const waitMs = Date.parse(first.usage.nextAttemptAt) - Date.parse(first.usage.lastPollAt);
+  assert.equal(waitMs, 1_800_000, `expected a thirty-minute default floor, got ${waitMs}ms`);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+  }
+  assert.equal(calls, 1, `the default floor did not hold: ${calls} calls`);
+});
+
 test('the experimental source is polled no harder than its own floor', async (t) => {
   const token = 'claude-usage-floor';
   const home = await claudeHomeWithCredential(t);
@@ -392,6 +491,62 @@ test('the worker honours a 429 backoff instead of retrying immediately', async (
     await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
   }
   assert.equal(calls, 1, `the endpoint was called ${calls} times while backing off`);
+});
+
+test('a refusal to poll yet says when it will, and why', async (t) => {
+  const token = 'claude-usage-next';
+  const home = await claudeHomeWithCredential(t);
+  const payload = await fixture('claude-usage-limits');
+  let throttle = false;
+
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 120_000,
+    claudeUsageFetch: () => (throttle
+      ? jsonResponse({ error: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } })
+      : jsonResponse(payload))
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}` };
+  const first = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+
+  // A successful read leaves the interval floor holding the next one. Reporting
+  // that as an unexplained no-op is what made the control look broken.
+  assert.equal(first.usage.nextAttemptReason, 'poll-floor');
+  assert.ok(Date.parse(first.usage.nextAttemptAt) > Date.now(), 'no deadline for the floor');
+
+  // A provider 429 outranks our own floor, and is named differently because it
+  // is a different situation for whoever is looking at it.
+  throttle = true;
+  const worker2 = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 0,
+    claudeUsageFetch: () => jsonResponse({ error: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } })
+  });
+  const url2 = await listen(worker2);
+  t.after(() => new Promise((resolve) => worker2.close(resolve)));
+
+  const throttled = await (await fetch(`${url2}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(throttled.usage.pollErrorKind, 'throttled');
+  assert.equal(throttled.usage.nextAttemptReason, 'provider-backoff');
+  const waitMs = Date.parse(throttled.usage.nextAttemptAt) - Date.now();
+  assert.ok(waitMs > 500_000 && waitMs <= 600_000, `expected the Retry-After to drive the deadline, got ${waitMs}ms`);
 });
 
 test('a failed poll keeps the last good windows and marks them stale', async (t) => {

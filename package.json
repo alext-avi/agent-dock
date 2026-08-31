@@ -7,11 +7,15 @@
   "scripts": {
     "dev": "node control-plane/server.mjs",
     "demo": "node demo.mjs",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "compose:up": "docker compose up --build",
-    "compose:down": "docker compose down"
+    "compose:down": "docker compose down",
+    "test:ui": "node --test test/browser/*.test.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1"
   }
 }

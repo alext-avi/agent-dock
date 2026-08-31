@@ -7,7 +7,7 @@ import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows } from './adapters/codex.mjs';
 import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
 import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
-import { ClaudeUsageError, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
+import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 import { createMcpManager } from './mcp/manager.mjs';
 
@@ -157,7 +157,9 @@ async function listWorkspace(root, maxEntries = 250) {
     children.sort((a, b) => a.name.localeCompare(b.name));
     for (const child of children) {
       if (entries.length >= maxEntries) break;
-      if (child.name === '.git') continue;
+      // Neither is an agent artifact, and a dependency tree alone can exhaust
+      // the entry cap and push the agent's real output out of the listing.
+      if (child.name === '.git' || child.name === 'node_modules') continue;
       const childRelative = path.posix.join(relative, child.name);
       const full = path.join(directory, child.name);
       if (child.isDirectory()) {
@@ -214,10 +216,13 @@ export function createWorkerServer(options = {}) {
     // Experimental, off by default. Enables the undocumented Claude OAuth usage
     // source described in worker/adapters/claude-usage.mjs.
     claudeOAuthUsage: options.claudeOAuthUsage ?? process.env.CLAUDE_OAUTH_USAGE === '1',
-    // Deliberately slower than USAGE_POLL_INTERVAL_MS. That interval governs
+    // Deliberately far slower than USAGE_POLL_INTERVAL_MS. That interval governs
     // Codex's local app-server call, which is free; this one governs an
-    // undocumented remote endpoint that is known to rate limit.
-    claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 300_000),
+    // undocumented remote endpoint that does rate limit in practice — a 54-minute
+    // Retry-After was observed at five minutes. Thirty minutes still samples a
+    // five-hour quota window ten times over, and the floor is per worker process,
+    // so agents sharing one account multiply it.
+    claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 1_800_000),
     claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
     claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };
@@ -286,8 +291,14 @@ export function createWorkerServer(options = {}) {
     } catch (error) {
       if (error.code !== 'ENOENT') state.usage.pollError = `Could not load usage history: ${error.message}`;
     }
-    // A backoff deadline belongs to the process that received the 429.
-    state.usage.retryAfterAt = null;
+    // A provider asked us to wait; a restart is not permission to ignore that.
+    // But an absurd value must not outlive the process either, so honour the
+    // deadline only as far as the cap we would have accepted in the first place.
+    const stored = Number(state.usage.retryAfterAt);
+    const ceiling = Date.now() + MAX_RETRY_AFTER_SECONDS * 1000;
+    state.usage.retryAfterAt = Number.isFinite(stored) && stored > Date.now()
+      ? Math.min(stored, ceiling)
+      : null;
   }
 
   async function persistUsage() {
@@ -478,6 +489,28 @@ export function createWorkerServer(options = {}) {
     };
   }
 
+  function usagePollFloorMs() {
+    return claudeUsageEnabled
+      ? Math.max(config.usagePollIntervalMs, config.claudeUsageIntervalMs)
+      : config.usagePollIntervalMs;
+  }
+
+  function nextUsageAttemptMs() {
+    const lastPoll = state.usage.lastPollAt ? Date.parse(state.usage.lastPollAt) : 0;
+    const floorEnds = lastPoll ? lastPoll + usagePollFloorMs() : 0;
+    return Math.max(state.usage.retryAfterAt ?? 0, floorEnds);
+  }
+
+  function nextUsageAttemptAt() {
+    const at = nextUsageAttemptMs();
+    return at > Date.now() ? new Date(at).toISOString() : null;
+  }
+
+  function nextUsageAttemptReason() {
+    if (nextUsageAttemptMs() <= Date.now()) return null;
+    return state.usage.retryAfterAt && state.usage.retryAfterAt > Date.now() ? 'provider-backoff' : 'poll-floor';
+  }
+
   function publicUsage({ includeDaily = false, includeHistory = false } = {}) {
     const allHistory = state.usage.history.slice().reverse();
     const history = includeHistory ? allHistory : allHistory.slice(0, 10);
@@ -486,6 +519,12 @@ export function createWorkerServer(options = {}) {
       updatedAt: state.usage.updatedAt,
       lastPollAt: supportsAccountUsage ? state.usage.lastPollAt : null,
       lastSuccessAt: supportsAccountUsage ? (state.usage.lastSuccessAt ?? null) : null,
+      // The earliest the source will actually be read again, whichever reason
+      // applies: a provider Retry-After, or our own poll floor. Null when a
+      // refresh would go through right now.
+      nextAttemptAt: nextUsageAttemptAt(),
+      // Which of the two is holding it, so a client can word it honestly.
+      nextAttemptReason: nextUsageAttemptReason(),
       pollError: state.usage.pollError,
       pollErrorKind: state.usage.pollErrorKind ?? null,
       quotaWindows: normalizeProviderQuotaWindows(state.usage.rateLimits),
@@ -697,7 +736,11 @@ export function createWorkerServer(options = {}) {
   // are kept and the failure is classified, so the UI can say why the source is
   // stale instead of showing a confident zero.
   async function pollClaudeUsage() {
-    if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) return;
+    if (state.usage.retryAfterAt && Date.now() < state.usage.retryAfterAt) {
+      // Keep the existing classification and deadline visible instead of
+      // pretending the attempt happened.
+      return;
+    }
     // Demo mode must never reach a provider. queryCodexAccount stubs itself the
     // same way; without this a demo worker with an inherited credential would
     // make a real call to an undocumented endpoint.

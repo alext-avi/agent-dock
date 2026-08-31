@@ -78,6 +78,12 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
       workspace: isolated ? 'isolated' : 'shared'
     },
     attachmentCount,
+    // The image tag this runtime is actually running, so drift from the
+    // configured image is visible rather than silent. A local tag, not a secret.
+    image: runtime.image ?? null,
+    // True when the configured image has been rebuilt since this container was
+    // created, null when either side is unknown. Refreshing clears it.
+    outdated: runtime.outdated ?? null,
     createdAt: runtime.createdAt ?? null,
     updatedAt: runtime.updatedAt ?? null
   };
@@ -499,6 +505,15 @@ export function createControlPlane(options = {}) {
             const inspected = await runtimeManager.inspect(runtime);
             runtime.state = inspected.state;
             runtime.health = inspected.health;
+            runtime.image = inspected.image ?? runtime.image ?? null;
+            // Keep the cached id current. A container replaced out of band moves
+            // its id, and a stale one costs a needless name lookup every time.
+            if (inspected.containerId) runtime.containerId = inspected.containerId;
+            runtime.imageId = inspected.imageId ?? runtime.imageId ?? null;
+            const current = await runtimeManager.currentImageId(runtime.adapter);
+            // Only claim staleness when both sides are known. An unknown image
+            // is reported as unknown rather than guessed either way.
+            runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
             runtime.updatedAt = new Date().toISOString();
           } catch {
             runtime.state = 'unknown';
@@ -660,8 +675,54 @@ export function createControlPlane(options = {}) {
     return false;
   }
 
+  // Replace a managed runtime's container with one built from the current image,
+  // keeping its volumes so the agent stays authenticated. Without this the only
+  // way to get new worker code onto an agent is to destroy its credentials.
+  async function refreshAgentRuntime(req, res, agent) {
+    if (!runtimeManager) {
+      throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
+    }
+    const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+    if (!runtime?.managed) {
+      throw Object.assign(new Error('Only a managed runtime can be refreshed'), { status: 409 });
+    }
+    // Replacing the container kills whatever it is running, so never do it
+    // underneath a task.
+    let idle = false;
+    try {
+      const { response } = await workerFetch(agent, '/v1/status', { timeout: 5_000 });
+      if (response.ok) {
+        idle = !((await response.json()).task?.active ?? null);
+      }
+      // A reachable worker that answers with an error or unparseable body tells
+      // us nothing about whether it is busy, so it stays not-idle and refuses.
+    } catch {
+      // Unreachable is different: that is the state a refresh exists to repair,
+      // and a worker that cannot be reached is not streaming a task either.
+      idle = true;
+    }
+    if (!idle) {
+      throw Object.assign(
+        new Error('Runtime is busy or did not report a usable status; cancel any running task and retry'),
+        { status: 409 }
+      );
+    }
+
+    const replaced = await runtimeManager.recreate(runtime, { agentId: agent.id });
+    Object.assign(runtime, replaced);
+    // outdated is computed during a fleet poll, so without this the response
+    // would still report the drift that was just resolved.
+    const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
+    runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
+    await persistAgents();
+    return json(res, 200, {
+      runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
+      refreshed: true
+    });
+  }
+
   async function handleAgentOperation(req, res, url) {
-    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel)$/);
+    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
     const operation = match[2];
@@ -675,6 +736,7 @@ export function createControlPlane(options = {}) {
     if (req.method === 'POST' && operation === 'usage/refresh') return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);
     if (req.method === 'POST' && operation === 'tasks/cancel') return proxyJson(req, res, agent, '/v1/tasks/cancel');
     if (req.method === 'POST' && operation === 'tasks') return proxyTask(req, res, agent);
+    if (req.method === 'POST' && operation === 'runtime/refresh') return refreshAgentRuntime(req, res, agent);
     return false;
   }
 

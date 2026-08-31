@@ -3,6 +3,19 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
+// Image drift only changes when someone rebuilds, so it is read per page load
+// rather than in the three-second status poll, which would mean a Docker
+// inspection per agent per tick.
+let runtimeDrift = new Map();
+let runtimeDriftReadAt = 0;
+// The status poll and the refresh handler both write the refresh control. While
+// a refresh is in flight the handler owns it, or the poll re-enables a button
+// mid-request and a second click fires a POST the server correctly rejects.
+let runtimeRefreshInFlight = false;
+// Neither a provider Retry-After nor our own poll floor is something a click can
+// skip, so the refresh control must not pretend otherwise.
+let usageBackingOff = false;
+let usageThrottled = false;
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -57,6 +70,7 @@ const ui = {
   pageAgentDescription: $('#page-agent-description'),
   agentIdLabel: $('#agent-id-label'),
   workerState: $('#worker-state'),
+  runtimeDrift: $('#runtime-drift'),
   agentName: $('#agent-name'),
   runtimeIcon: $('#runtime-icon'),
   runtimeLocation: $('#runtime-location'),
@@ -103,6 +117,7 @@ const ui = {
   usagePolledAt: $('#usage-polled-at'),
   usageError: $('#usage-error'),
   refreshUsage: $('#refresh-usage'),
+  refreshRuntime: $('#refresh-runtime'),
   prompt: $('#prompt'),
   runButton: $('#run-button'),
   cancelButton: $('#cancel-button'),
@@ -146,6 +161,36 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
   return data;
+}
+
+// maxAgeMs lets the live poll resync cheaply: drift only changes when someone
+// rebuilds, so re-reading it every minute keeps an open tab honest without
+// putting a Docker inspection behind every three-second tick.
+async function loadRuntimeDrift({ maxAgeMs = 0 } = {}) {
+  if (maxAgeMs && Date.now() - runtimeDriftReadAt < maxAgeMs) return;
+  try {
+    const { runtimes } = await api(`${API_ROOT}/runtimes`);
+    runtimeDrift = new Map(runtimes.map((runtime) => [runtime.id, runtime]));
+    runtimeDriftReadAt = Date.now();
+  } catch {
+    // Drift is advisory. Failing to read it must not block the fleet.
+  }
+}
+
+const DRIFT_RESYNC_MS = 60_000;
+
+function renderRuntimeDrift() {
+  // The refresh handler owns both controls until its request settles.
+  if (runtimeRefreshInFlight) return;
+  const outdated = runtimeIsOutdated(currentAgent?.runtime);
+  ui.runtimeDrift.classList.toggle('hidden', !outdated);
+  ui.runtimeDrift.disabled = false;
+  ui.runtimeDrift.textContent = 'image update available · refresh';
+  ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
+}
+
+function runtimeIsOutdated(runtime) {
+  return runtimeDrift.get(runtime?.id)?.outdated === true;
 }
 
 function agentApi(operation = '') {
@@ -272,6 +317,7 @@ function createAgentCard(agent) {
       <div class="agent-card-state">
         <span class="pill neutral status-pill">checking</span>
         <span class="card-update"></span>
+        <span class="card-outdated hidden">image update available</span>
       </div>
     </div>
     <p class="agent-card-description"></p>
@@ -288,6 +334,7 @@ function createAgentCard(agent) {
   card.querySelector('h2').textContent = agent.name;
   card.querySelector('.agent-card-description').textContent = agent.description || 'No purpose defined yet.';
   card.querySelector('.card-update').textContent = `updated ${relativeTime(agent.updatedAt)}`;
+  card.querySelector('.card-outdated').classList.toggle('hidden', !runtimeIsOutdated(agent.runtime));
   return card;
 }
 
@@ -360,7 +407,7 @@ async function loadDashboard() {
   ui.agentView.classList.add('hidden');
   document.title = 'Agent Dock — Fleet';
   try {
-    const { agents } = await api(`${API_ROOT}/agents`);
+    const [{ agents }] = await Promise.all([api(`${API_ROOT}/agents`), loadRuntimeDrift()]);
     setConnection('online', 'Control plane online');
     renderAgentGrid(agents);
     await refreshDashboardStatuses();
@@ -376,6 +423,7 @@ async function refreshDashboardStatuses() {
   dashboardRefreshInFlight = true;
   try {
     const { agents } = await api(`${API_ROOT}/agents`);
+    await loadRuntimeDrift({ maxAgeMs: DRIFT_RESYNC_MS });
     const nextFingerprint = JSON.stringify(agents.map((agent) => [agent.id, agent.updatedAt]));
     if (nextFingerprint !== dashboardFingerprint) renderAgentGrid(agents);
     await Promise.allSettled(dashboardAgents.map(async (agent) => {
@@ -850,6 +898,37 @@ async function deleteAgentRecord(agent) {
   return true;
 }
 
+// Replaces the runtime's container with one built from the current image. The
+// four private volumes are retained, so the agent does not have to authenticate
+// again — that is the whole reason this exists rather than delete-and-recreate.
+async function refreshRuntimeImage() {
+  if (!currentAgent?.runtime?.managed) return;
+  const confirmed = window.confirm(
+    "Replace this runtime's container with one built from the current image?\n\n"
+    + 'Its CLI, credentials, telemetry, and workspace volumes are kept, so the agent stays signed in. '
+    + 'The runtime restarts and is briefly unavailable.'
+  );
+  if (!confirmed || runtimeRefreshInFlight) return;
+  runtimeRefreshInFlight = true;
+  ui.refreshRuntime.disabled = true;
+  ui.refreshRuntime.textContent = 'Refreshing…';
+  ui.runtimeDrift.disabled = true;
+  ui.runtimeDrift.textContent = 'refreshing…';
+  try {
+    const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
+    currentAgent.runtime = result.runtime;
+    setConnection('online', `Runtime refreshed onto ${result.runtime.image || 'the current image'}`);
+    await loadRuntimeDrift();
+    await refreshStatus();
+  } catch (error) {
+    setConnection('offline', error.message);
+  } finally {
+    runtimeRefreshInFlight = false;
+    ui.refreshRuntime.disabled = false;
+    renderRuntimeDrift();
+  }
+}
+
 async function deleteCurrentAgent() {
   try {
     if (!await deleteAgentRecord(currentAgent)) return;
@@ -936,7 +1015,7 @@ function renderQuotaRow(label, window, stale = false) {
 // different from 0% used — the UI must never let them look alike.
 const POLL_ERROR_COPY = {
   unauthenticated: 'Sign in again — the provider rejected the worker credential.',
-  throttled: 'The provider is rate limiting usage polling. Retrying shortly.',
+  throttled: 'The provider is rate limiting usage polling.',
   network: 'The usage source is unreachable.',
   http: 'The usage source returned an error.',
   malformed: 'The usage source returned an unrecognized response.',
@@ -974,6 +1053,14 @@ function renderRuntimeQuota(scope, window, fallbackLabel, unavailableReason = ''
       : (quotaRefreshLabel(window.resetsAt) || 'Refresh time unavailable');
 }
 
+// Waiting on the floor after a clean read means the numbers are current; waiting
+// after a failure does not, and must not read as if it did.
+function waitingLabel(pollErrorKind, throttled) {
+  if (throttled || pollErrorKind === 'throttled') return 'Rate limited';
+  if (pollErrorKind) return 'Retrying';
+  return 'Up to date';
+}
+
 function renderUsage(usage = {}) {
   const last = usage.lastRequest;
   const totals = usage.totals ?? {};
@@ -983,9 +1070,20 @@ function renderUsage(usage = {}) {
   ui.agentTotalSummary.textContent = formatTokens(totals.totalTokens ?? 0);
   ui.agentRequestCount.textContent = `${totals.requests ?? 0} request${totals.requests === 1 ? '' : 's'}`;
   ui.lifetimeTokens.textContent = formatTokens(usage.account?.lifetimeTokens);
-  ui.usagePolledAt.textContent = usage.pollErrorKind && usage.lastSuccessAt
-    ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
-    : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  const waitingUntil = usage.nextAttemptAt ? Date.parse(usage.nextAttemptAt) : 0;
+  const waiting = waitingUntil > Date.now();
+  const throttled = usage.nextAttemptReason === 'provider-backoff';
+  ui.usagePolledAt.textContent = waiting
+    ? `${throttled ? 'rate limited by provider' : 'next read'} ${timeUntil(usage.nextAttemptAt)}`
+    : usage.pollErrorKind && usage.lastSuccessAt
+      ? `last good reading ${relativeTime(usage.lastSuccessAt)}`
+      : usage.lastPollAt ? `polled ${relativeTime(usage.lastPollAt)}` : 'Not polled';
+  usageBackingOff = waiting;
+  usageThrottled = throttled;
+  if (waiting) {
+    ui.refreshUsage.disabled = true;
+    ui.refreshUsage.textContent = waitingLabel(usage.pollErrorKind, throttled);
+  }
   ui.usageError.textContent = usage.pollError || '';
   ui.usageError.classList.toggle('hidden', !usage.pollError);
   const windows = Array.isArray(usage.quotaWindows) ? usage.quotaWindows : [];
@@ -1028,9 +1126,14 @@ function renderStatus(status) {
   ui.authState.textContent = authenticated ? 'connected' : localCredentiallessModel ? 'not required' : status.authentication?.phase?.replaceAll('_', ' ') || 'required';
   ui.jobState.textContent = active ? 'running' : 'idle';
   const inContainer = status.execution?.boundary === 'container';
+  const runtimeImage = currentAgent.runtime?.image;
   ui.runtimeLocation.textContent = inContainer
-    ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}`
+    ? `${runtimeLabel(currentAgent.runtime)} · ${currentAgent.runtime?.workerId || 'worker identity unavailable'}${runtimeImage ? ` · ${runtimeImage}` : ''}`
     : 'Worker-managed provider sandbox';
+  // Only a managed runtime has a container of ours to replace, and never while
+  // a task is running.
+  if (!runtimeRefreshInFlight) ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
+  renderRuntimeDrift();
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
     quotaWindows: Boolean(status.capabilities?.usage?.quotaWindows),
@@ -1038,18 +1141,38 @@ function renderStatus(status) {
     source: status.capabilities?.usage?.quotaWindowSource ?? null
   };
   const canRefreshAccountUsage = Boolean(status.capabilities?.usage?.quotaWindows || status.capabilities?.usage?.accountActivity);
-  ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage;
-  ui.refreshUsage.textContent = canRefreshAccountUsage ? 'Refresh' : 'Not available';
-  ui.authBox.classList.toggle('authenticated', authenticated);
+  const nextAttempt = status.usage?.nextAttemptAt ? Date.parse(status.usage.nextAttemptAt) : 0;
+  usageBackingOff = nextAttempt > Date.now();
+  usageThrottled = status.usage?.nextAttemptReason === 'provider-backoff';
+  ui.refreshUsage.disabled = !authenticated || !canRefreshAccountUsage || usageBackingOff;
+  ui.refreshUsage.textContent = !canRefreshAccountUsage
+    ? 'Not available'
+    : !usageBackingOff ? 'Refresh'
+      : waitingLabel(status.usage?.pollErrorKind, usageThrottled);
+  // The harness's own auth check and the provider can disagree: a token the CLI
+  // still considers present can be rejected upstream. When that happens the UI
+  // asks the operator to sign in again, so the control has to allow it.
+  const credentialRejected = status.usage?.pollErrorKind === 'unauthenticated';
+  ui.authBox.classList.toggle('authenticated', authenticated && !credentialRejected);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   const browserOAuth = status.authentication?.method === 'browser_oauth';
-  ui.authCopy.textContent = authenticated
+  ui.authCopy.textContent = credentialRejected
+    ? `${currentHarnessName} still reports a stored login, but the provider rejected it. Usage telemetry is stale until you sign in again; the agent may also fail to run tasks.`
+    : authenticated
     ? `The worker holds a CLI-managed ${currentHarnessName} login. Safe session metadata is surfaced; credentials never leave the worker.`
     : browserOAuth
       ? `The worker starts ${currentHarnessName}'s browser OAuth flow. Agent Dock forwards only the provider's one-time completion code and never stores it.`
       : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
-  ui.authButton.textContent = authenticated ? 'Connected' : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
-  ui.authButton.disabled = authenticated || status.authentication?.phase === 'waiting_for_user';
+  const waiting = status.authentication?.phase === 'waiting_for_user';
+  ui.authButton.textContent = waiting
+    ? 'Waiting for sign-in'
+    : credentialRejected
+      ? 'Sign in again'
+      : authenticated
+        ? 'Connected'
+        : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
+  ui.authButton.disabled = waiting || (authenticated && !credentialRejected);
+  ui.authBox.classList.toggle('rejected', credentialRejected);
   if (!authenticated) {
     ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user'
       ? (browserOAuth ? 'Waiting for browser authentication' : 'Waiting for device authentication')
@@ -1116,6 +1239,7 @@ async function refreshStatus() {
 }
 
 async function refreshAgentLive() {
+  await loadRuntimeDrift({ maxAgeMs: DRIFT_RESYNC_MS });
   await refreshStatus();
   if (location.hash === '#tools') await refreshMcp();
 }
@@ -1162,7 +1286,7 @@ async function refreshUsage() {
     ui.usageError.textContent = error.message;
     ui.usageError.classList.remove('hidden');
   } finally {
-    ui.refreshUsage.disabled = false;
+    ui.refreshUsage.disabled = usageBackingOff;
   }
 }
 
@@ -1326,7 +1450,7 @@ async function loadAgent(id) {
   ui.agentView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
   try {
-    const result = await api(`${API_ROOT}/agents/${encodeURIComponent(id)}`);
+    const [result] = await Promise.all([api(`${API_ROOT}/agents/${encodeURIComponent(id)}`), loadRuntimeDrift()]);
     currentAgent = result.agent;
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;
@@ -1360,6 +1484,8 @@ ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
 });
 $('#delete-agent').addEventListener('click', deleteCurrentAgent);
+ui.refreshRuntime.addEventListener('click', refreshRuntimeImage);
+ui.runtimeDrift.addEventListener('click', refreshRuntimeImage);
 ui.authButton.addEventListener('click', startAuth);
 ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);

@@ -69,7 +69,7 @@ flowchart TB
 | Worker wrapper | Node.js 22, built-in `http`, `child_process`, filesystem persistence |
 | Provider harnesses | Official `@openai/codex`, `@anthropic-ai/claude-code`, and `opencode-ai` CLI distributions |
 | Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
-| Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/token, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Concurrent runtime attachment is rejected. |
+| Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/token, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Concurrent runtime attachment is rejected. A runtime's container can be replaced from the current image while retaining all four volumes, so new worker code does not cost a provider login. Containers are addressed by their stable name rather than their id, which changes on replacement. |
 | Persistence | Current: schema-v3 JSON agent/runtime/MCP registry plus unique Docker named volumes per managed agent. Planned: SQLite locally behind a Postgres-ready repository boundary. |
 | Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default |
 | Authentication | Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default |

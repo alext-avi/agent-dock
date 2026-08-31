@@ -31,10 +31,33 @@ async function atomicJson(file, value) {
   await rename(temporary, file);
 }
 
-function missingSecret(pathname) {
-  const error = new Error(`Worker secret ${pathname} is not configured in this agent container`);
+function missingSecret(name) {
+  const error = new Error(
+    `Connector secret ${name} is not configured in this agent container. `
+    + `Provide it as ${CONNECTOR_SECRET_PREFIX}${name}; only that namespace is resolvable.`
+  );
   error.status = 409;
   return error;
+}
+
+// Connector secrets live in their own namespace, separate from the worker's own
+// control variables. A definition names the logical secret; the worker resolves
+// it from CONNECTOR_SECRET_PREFIX + that name and can see nothing else. This is
+// why a definition cannot name WORKER_TOKEN, HOME, or OLLAMA_BASE_URL: they are
+// not in the map at all, so there is nothing to validate against and nothing to
+// get wrong.
+export const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
+
+// Reduce a process environment to the connector secrets it carries, keyed by the
+// logical name a definition uses.
+export function connectorSecrets(environment = {}) {
+  const secrets = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (!key.startsWith(CONNECTOR_SECRET_PREFIX)) continue;
+    const name = key.slice(CONNECTOR_SECRET_PREFIX.length);
+    if (name) secrets[name] = value;
+  }
+  return secrets;
 }
 
 function resolveServers(servers, environment, { requireSecrets }) {

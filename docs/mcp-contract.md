@@ -26,7 +26,9 @@ Agent Dock stores one provider-neutral MCP server definition and sends the same 
 }
 ```
 
-`transport` is `stdio` or `http`. A stdio definition uses `command`, `args`, optional `/workspace` `cwd`, `environment`, and `secretEnvironment`; an HTTP definition uses `url`, `headers`, and `secretHeaders`. Secret maps contain worker-environment references only. Resolved credential values exist only in the isolated worker while it renders provider configuration and are never persisted in the control-plane registry or returned by either API.
+`transport` is `stdio` or `http`. A stdio definition uses `command`, `args`, optional `/workspace` `cwd`, `environment`, and `secretEnvironment`; an HTTP definition uses `url`, `headers`, and `secretHeaders`. Secret maps contain references only. Resolved credential values exist only in the isolated worker while it renders provider configuration and are never persisted in the control-plane registry or returned by either API.
+
+A `sourceEnv` is a **logical connector-secret name, not a worker environment variable**. The worker resolves it from the `MCP_SECRET_` namespace: a definition referencing `COMPANY_MCP_TOKEN` reads `MCP_SECRET_COMPANY_MCP_TOKEN`. Nothing outside that prefix is visible to the resolver, so a definition cannot name the runtime's own `WORKER_TOKEN`, a provider home directory, or `OLLAMA_BASE_URL` — those variables are absent from the map rather than merely rejected by a rule. An unresolvable reference fails the definition rather than applying it with the secret silently absent.
 
 ## Lifecycle
 
@@ -44,7 +46,9 @@ Each provider starts a fresh CLI process per task, so successful changes activat
 - Claude Code receives a worker-owned `--mcp-config` file plus `--strict-mcp-config`; the wrapper re-renders that file at every task start (including an empty first-run file), and its startup event supplies connection health.
 - OpenCode receives a managed JSON configuration and high-precedence task configuration. Before each task, the wrapper resolves OpenCode's merged configuration and explicitly disables MCP names introduced by lower-precedence project or user files; if that inspection fails, the task fails closed. Its `mcp list` output is parsed through a redacting allowlist.
 
-Local MCP commands are code execution inside the agent container. They are denied by default and must exactly match the worker's `MCP_ALLOWED_COMMANDS` allowlist. Remote definitions reject embedded URL credentials. Connector secrets must be injected into that one agent container by a separate secret-provisioning path.
+Local MCP commands are code execution inside the agent container. They are denied by default and must exactly match the worker's `MCP_ALLOWED_COMMANDS` allowlist. Allowlisting an interpreter such as `node`, `python`, or `bash` is equivalent to permitting arbitrary execution, because a definition's arguments are unconstrained — the allowlist bounds which binary runs, not what it does. Remote definitions reject embedded URL credentials.
+
+Connector secrets are provisioned into that one agent container under the `MCP_SECRET_` namespace, separately from the variables the worker uses to run. They are readable by the agent in that container: this design keeps a credential scoped to a single agent and revocable, but it is not confidentiality against the harness itself.
 
 ## Control-plane MCP privilege boundary
 

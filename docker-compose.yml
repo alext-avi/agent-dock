@@ -3,6 +3,12 @@ services:
     image: agent-dock-control-plane:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./control-plane
+    # Connector secrets are named MCP_SECRET_<NAME> and cannot be enumerated here,
+    # so the env file is read wholesale. The provisioner forwards only that prefix
+    # into a runtime; nothing else from this file crosses.
+    env_file:
+      - path: .env
+        required: false
     environment:
       PORT: "3000"
       WORKER_URL: http://worker:7777

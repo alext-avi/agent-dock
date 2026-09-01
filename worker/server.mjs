@@ -9,7 +9,7 @@ import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.m
 import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
 import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
-import { createMcpManager } from './mcp/manager.mjs';
+import { connectorSecrets, createMcpManager } from './mcp/manager.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
@@ -267,7 +267,15 @@ export function createWorkerServer(options = {}) {
 
   const mcpManager = createMcpManager({
     adapterId: config.adapterId,
-    environment: providerEnv,
+    // Deliberately not providerEnv. That is the whole process environment, which
+    // includes this runtime's own WORKER_TOKEN, its provider home directories,
+    // and OLLAMA_BASE_URL — none of which a connector definition has any business
+    // naming, and all of which it could name when the full environment was passed.
+    environment: connectorSecrets(process.env),
+    // The full environment a spawned harness command needs. Kept separate from
+    // the resolver's map on purpose: merging them back is how the vulnerability
+    // returns, and passing the narrow one here is how apply stops working.
+    execEnvironment: providerEnv,
     workspace: config.workspace,
     allowedCommands: config.mcpAllowedCommands,
     statePath: config.mcpStatePath,

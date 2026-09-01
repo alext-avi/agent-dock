@@ -3,6 +3,13 @@ services:
     image: agent-dock-control-plane:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
       context: ./control-plane
+    # Connector secrets are named MCP_SECRET_<NAME> and cannot be enumerated here,
+    # so they come from a file. Deliberately not .env: this component holds the
+    # Docker socket, and env_file is not prefix-scoped, so pointing it at the file
+    # used for Compose substitution would put every unrelated value in there too.
+    env_file:
+      - path: .env.mcp-secrets
+        required: false
     environment:
       PORT: "3000"
       WORKER_URL: http://worker:7777

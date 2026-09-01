@@ -465,7 +465,7 @@ test('schema-v1 singleton records migrate to one explicitly shared legacy runtim
   assert.doesNotMatch(JSON.stringify(migrated), /legacy-secret|shared-claude/);
 
   const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
-  assert.equal(persisted.schemaVersion, 3);
+  assert.equal(persisted.schemaVersion, 4);
   assert.ok(Array.isArray(persisted.runtimes));
   assert.equal(persisted.agents.filter((agent) => agent.adapter === 'claude-code').every((agent) => !('workerToken' in agent)), true);
 });

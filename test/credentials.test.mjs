@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
+import { createControlPlane } from '../control-plane/server.mjs';
 import {
   createCredentialStore,
   environmentKeyProvider,
@@ -165,4 +167,116 @@ test('the key provider reports which mode is in force', async () => {
   // The UI and docs need to be able to say this plainly.
   assert.match(status.protects, /not this host/);
   assert.equal(publicCredential({ ...apiKey(), id: 'x', hosts: ['a.example.com'], hint: '…1234' }).value, undefined);
+});
+
+
+async function listen(server) {
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function controlPlane(t, { key = KEY } = {}) {
+  const server = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    dataPath: null,
+    credentialKeyProvider: environmentKeyProvider(key ? { CREDENTIAL_ENCRYPTION_KEY: key } : {})
+  });
+  const url = await listen(server);
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return url;
+}
+
+const post = (url, body) => fetch(url, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+});
+
+test('credentials can be managed over the API without the value coming back', async (t) => {
+  const url = await controlPlane(t);
+
+  const created = await post(`${url}/api/v1/credentials`, apiKey());
+  assert.equal(created.status, 201);
+  const body = await created.text();
+  assert.ok(!body.includes('sk-live-abcdef123456'), 'the create response returned the value');
+  const credential = JSON.parse(body).credential;
+  assert.equal(credential.hint, '…3456');
+
+  const listed = await (await fetch(`${url}/api/v1/credentials`)).json();
+  assert.equal(listed.credentials.length, 1);
+  // The operator needs to know which protection mode is in force.
+  assert.equal(listed.storage.name, 'environment');
+  assert.match(listed.storage.protects, /not this host/);
+
+  const rotated = await fetch(`${url}/api/v1/credentials/${credential.id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 'sk-live-rotated-7777' })
+  });
+  assert.equal((await rotated.json()).credential.hint, '…7777');
+
+  const removed = await fetch(`${url}/api/v1/credentials/${credential.id}`, { method: 'DELETE' });
+  assert.equal(removed.status, 204);
+  assert.equal((await (await fetch(`${url}/api/v1/credentials`)).json()).credentials.length, 0);
+});
+
+test('a credential still attached to a connector cannot be deleted', async (t) => {
+  const url = await controlPlane(t);
+  const credential = (await (await post(`${url}/api/v1/credentials`, apiKey())).json()).credential;
+
+  const attached = await post(`${url}/api/v1/mcp/servers`, {
+    name: 'company-docs',
+    transport: 'http',
+    url: 'https://mcp.example.com/mcp',
+    timeoutMs: 30_000,
+    credentialId: credential.id
+  });
+  assert.equal(attached.status, 201);
+
+  const refused = await fetch(`${url}/api/v1/credentials/${credential.id}`, { method: 'DELETE' });
+  assert.equal(refused.status, 409, 'deleting a credential in use would silently break a connector');
+  assert.match((await refused.json()).error, /still used by company-docs/);
+});
+
+test('the API refuses credential work when no key is configured', async (t) => {
+  const url = await controlPlane(t, { key: null });
+
+  const refused = await post(`${url}/api/v1/credentials`, apiKey());
+  assert.equal(refused.status, 503);
+  assert.match((await refused.json()).error, /CREDENTIAL_ENCRYPTION_KEY/);
+
+  // Listing still works, so the UI can explain why nothing can be added.
+  const listed = await (await fetch(`${url}/api/v1/credentials`)).json();
+  assert.deepEqual(listed.credentials, []);
+  assert.equal(listed.storage.available, false);
+});
+
+
+test('a connector cannot reference a credential that does not exist', async (t) => {
+  const url = await controlPlane(t);
+
+  const refused = await post(`${url}/api/v1/mcp/servers`, {
+    name: 'ghost',
+    transport: 'http',
+    url: 'https://mcp.example.com/mcp',
+    timeoutMs: 30_000,
+    credentialId: 'no-such-credential'
+  });
+  assert.equal(refused.status, 400, 'a dangling reference should fail when written, not at apply time');
+  assert.match((await refused.json()).error, /does not exist/);
+});
+
+test('a connector uses a credential or a secret header, not both', async (t) => {
+  const url = await controlPlane(t);
+  const credential = (await (await post(`${url}/api/v1/credentials`, apiKey())).json()).credential;
+
+  const refused = await post(`${url}/api/v1/mcp/servers`, {
+    name: 'ambiguous',
+    transport: 'http',
+    url: 'https://mcp.example.com/mcp',
+    timeoutMs: 30_000,
+    credentialId: credential.id,
+    secretHeaders: { Authorization: { sourceEnv: 'SOMETHING', prefix: 'Bearer ' } }
+  });
+  // Two mechanisms deciding one header, with no rule for which wins.
+  assert.equal(refused.status, 400);
+  assert.match((await refused.json()).error, /not both/);
 });

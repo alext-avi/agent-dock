@@ -28,6 +28,12 @@ Agent Dock stores one provider-neutral MCP server definition and sends the same 
 
 `transport` is `stdio` or `http`. A stdio definition uses `command`, `args`, optional `/workspace` `cwd`, `environment`, and `secretEnvironment`; an HTTP definition uses `url`, `headers`, and `secretHeaders`. Secret maps contain references only. Resolved credential values exist only in the isolated worker while it renders provider configuration and are never persisted in the control-plane registry or returned by either API.
 
+A definition may instead carry a **`credentialId`**, naming a credential the control plane owns. This is the successor to `sourceEnv` for HTTP connectors and the two are mutually exclusive, since both would decide the same header with no rule for which wins.
+
+A credential is resolved by the control plane at apply time and delivered with the configuration, rather than read from the worker's environment. Three properties follow. A worker receives only the credentials its own bound definitions reference, so delivery is per-agent rather than a namespace shared by every runtime. Adding or rotating a credential takes effect on the next apply with no restart. And because resolution happens per destination, a credential's host list is enforced at the moment of use: changing a definition's `url` to a host the credential was not issued for fails the apply instead of sending it there.
+
+The worker holds delivered credentials in memory for the life of the process and never writes them to its state file. The control plane is the record; a restart receives them again on the next apply.
+
 A `sourceEnv` is a **logical connector-secret name, not a worker environment variable**. The worker resolves it from the `MCP_SECRET_` namespace: a definition referencing `COMPANY_MCP_TOKEN` reads `MCP_SECRET_COMPANY_MCP_TOKEN`. Nothing outside that prefix is visible to the resolver, so a definition cannot name the runtime's own `WORKER_TOKEN`, a provider home directory, or `OLLAMA_BASE_URL` — those variables are absent from the map rather than merely rejected by a rule. An unresolvable reference fails the definition rather than applying it with the secret silently absent.
 
 ## Lifecycle

@@ -43,7 +43,7 @@ function secretHeaderMap(value) {
     const normalizedHeader = text(header, 'secretHeaders key', { required: true, max: 120 });
     const source = typeof raw === 'string' ? { sourceEnv: raw } : raw;
     if (!source || typeof source !== 'object' || Array.isArray(source)) {
-      throw failure(`secretHeaders.${normalizedHeader} must name a worker environment variable`);
+      throw failure(`secretHeaders.${normalizedHeader} must name a connector secret provisioned as MCP_SECRET_<NAME>`);
     }
     const sourceEnv = text(source.sourceEnv, `secretHeaders.${normalizedHeader}.sourceEnv`, { required: true, max: 120 });
     if (!ENV_PATTERN.test(sourceEnv)) throw failure(`secretHeaders.${normalizedHeader}.sourceEnv is invalid`);
@@ -103,7 +103,7 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
     let parsed;
     try { parsed = new URL(url); } catch { throw failure('url must be a valid absolute URL'); }
     if (!['http:', 'https:'].includes(parsed.protocol)) throw failure('url must use HTTP or HTTPS');
-    if (parsed.username || parsed.password) throw failure('url must not contain embedded credentials; use a worker secret reference');
+    if (parsed.username || parsed.password) throw failure('url must not contain embedded credentials; use a connector secret reference');
   }
   const timeoutMs = input.timeoutMs === undefined ? 30_000 : Number(input.timeoutMs);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 300_000) {

@@ -228,7 +228,7 @@
           <div class="capability-grid">
             <article class="panel capability-card">
               <div class="panel-heading"><div><p class="kicker">CONNECTIONS</p><h2>MCP servers</h2></div><span id="mcp-count" class="pill neutral">checking</span></div>
-              <p class="capability-copy">One definition format is translated inside the isolated worker for Codex, Claude Code, or OpenCode. Secret fields reference worker environment variables; credentials never return to this page.</p>
+              <p class="capability-copy">One definition format is translated inside the isolated worker for Codex, Claude Code, or OpenCode. Secret fields name a connector secret, provisioned as MCP_SECRET_&lt;NAME&gt;; credentials never return to this page.</p>
               <div class="mcp-toolbar">
                 <select id="mcp-library" aria-label="Available MCP server definitions"><option value="">No unattached definitions</option></select>
                 <button id="attach-mcp" class="button secondary" type="button">Attach existing</button>
@@ -368,14 +368,14 @@
         </div>
         <section id="mcp-http-fields" class="mcp-transport-fields">
           <label class="field">Server URL<input id="mcp-url" type="url" placeholder="https://mcp.example.com/mcp"></label>
-          <label class="field">Bearer token worker variable <span>optional reference; value stays in the container</span><input id="mcp-bearer-env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_MCP_TOKEN"></label>
+          <label class="field">Bearer token connector secret <span>optional reference; value stays in the container</span><input id="mcp-bearer-env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_MCP_TOKEN"></label>
         </section>
         <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
           <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
           <div class="form-grid">
             <label class="field">Secret target variable <span>optional</span><input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="API_TOKEN"></label>
-            <label class="field">Worker source variable <span>optional</span><input id="mcp-secret-source" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN"></label>
+            <label class="field">Connector secret name <span>optional</span><input id="mcp-secret-source" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN"></label>
           </div>
         </section>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>

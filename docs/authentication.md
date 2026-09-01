@@ -9,7 +9,7 @@ A GitHub sign-in to the platform never becomes a provider credential, and provid
 
 ## Modes
 
-`AUTH_MODE=trusted-local` is the default development mode. It creates an explicit local administrator principal so the existing laptop-only workflow remains convenient. Compose also publishes the UI on `127.0.0.1` by default. Trusted-local mode is not suitable when the port is exposed beyond the local machine.
+`AUTH_MODE=trusted-local` is the default development mode. It creates an explicit local administrator principal so the existing laptop-only workflow remains convenient. Compose also publishes the UI on `127.0.0.1` by default. The process refuses to start unless both `AUTH_PUBLIC_ORIGIN` and the host-facing `AUTH_TRUSTED_LOCAL_BIND` reported by Compose are loopback addresses. Trusted-local mode is not suitable when the port is exposed beyond the local machine.
 
 `AUTH_MODE=oidc` enables OpenID Connect Authorization Code flow with PKCE. Use an OIDC authorization server that can federate GitHub identities, such as WorkOS AuthKit or Auth0. Direct GitHub OAuth is not an OIDC issuer and cannot be placed in `AUTH_OIDC_ISSUER`.
 

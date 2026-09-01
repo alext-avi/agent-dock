@@ -60,6 +60,20 @@ export function connectorSecrets(environment = {}) {
   return secrets;
 }
 
+// Reference names a definition uses that the connector-secret map cannot satisfy.
+// Silent about the reason on purpose: an unprovisioned name and an illegitimate
+// one are both simply absent from the map.
+export function unresolvedSecretReferences(servers, environment = {}) {
+  const names = (server) => [
+    ...Object.values(server?.secretEnvironment ?? {}),
+    ...Object.values(server?.secretHeaders ?? {})
+  ].map((reference) => (typeof reference === 'string' ? reference : reference?.sourceEnv));
+
+  return (servers ?? []).flatMap((server) => names(server)
+    .filter((name) => name && environment[name] === undefined)
+    .map((name) => ({ server: server.name ?? server.id, name })));
+}
+
 function resolveServers(servers, environment, { requireSecrets }) {
   return servers.map((server) => {
     const resolved = clone(server);
@@ -155,15 +169,27 @@ export function createMcpManager(options) {
     if (statePath) await atomicJson(statePath, { ...state, health });
   }
 
+  // Adapter validators only check the shape of a secret reference, so a preview
+  // could report "valid" for a definition apply would refuse. Say so instead.
+  function withMissingSecrets(result, servers) {
+    const warnings = unresolvedSecretReferences(servers, environment).map(({ server, name }) => ({
+      field: 'secret',
+      code: 'unresolved_connector_secret',
+      message: `${server} references connector secret ${name}; set MCP_SECRET_${name} or applying will fail`
+    }));
+    if (!warnings.length) return result;
+    return { ...result, warnings: [...(result.warnings ?? []), ...warnings] };
+  }
+
   function validate(servers, { requireSecrets = false } = {}) {
     if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
     let resolved;
     try { resolved = resolveServers(servers, environment, { requireSecrets }); }
     catch (error) { return { valid: false, errors: [{ field: 'secret', code: 'missing_worker_secret', message: error.message }], warnings: [] }; }
     const context = { workspace, allowedCommands };
-    if (adapterId === 'claude-code') return validateClaudeMcpServers(resolved, context);
-    if (adapterId === 'opencode') return validateOpenCodeMcpServers(resolved, context);
-    return validateCodexMcpServers(resolved, context);
+    if (adapterId === 'claude-code') return withMissingSecrets(validateClaudeMcpServers(resolved, context), servers);
+    if (adapterId === 'opencode') return withMissingSecrets(validateOpenCodeMcpServers(resolved, context), servers);
+    return withMissingSecrets(validateCodexMcpServers(resolved, context), servers);
   }
 
   async function apply(servers) {

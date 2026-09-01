@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
-import { CONNECTOR_SECRET_PREFIX, connectorSecrets, createMcpManager } from '../worker/mcp/manager.mjs';
+import { CONNECTOR_SECRET_PREFIX, connectorSecrets, createMcpManager, unresolvedSecretReferences } from '../worker/mcp/manager.mjs';
 import { applyCodexMcpServers } from '../worker/adapters/codex-mcp.mjs';
 
 async function listen(server) {
@@ -442,4 +442,35 @@ test('a spawned harness command gets a usable environment, not the secret map', 
     assert.equal(spawn.env.PATH, '/usr/bin:/bin', `${spawn.command} was spawned without a PATH`);
     assert.equal(spawn.env.CODEX_HOME, '/codex-home', `${spawn.command} lost its harness home directory`);
   }
+});
+
+
+test('validation warns about a reference that apply will refuse', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-validate-'));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+
+  const manager = createMcpManager({
+    adapterId: 'codex-cli',
+    environment: connectorSecrets({ MCP_SECRET_DOCS_TOKEN: 'connector-value' }),
+    workspace: process.cwd(),
+    statePath: join(temporary, 'state.json'),
+    configDir: temporary,
+    allowedCommands: []
+  });
+
+  const server = (name, sourceEnv) => ({
+    id: name, name, transport: 'http', url: 'https://example.invalid/mcp', timeoutMs: 30_000,
+    secretHeaders: { Authorization: { sourceEnv, prefix: 'Bearer ' } }
+  });
+
+  // Reporting "valid" for the shape apply refuses is worse than no preview.
+  const unresolvable = manager.validate([server('bad', 'WORKER_TOKEN')]);
+  assert.match(JSON.stringify(unresolvable.warnings), /WORKER_TOKEN/);
+  assert.match(JSON.stringify(unresolvable.warnings), /MCP_SECRET_WORKER_TOKEN/);
+
+  // A resolvable one warns about nothing.
+  const fine = manager.validate([server('good', 'DOCS_TOKEN')]);
+  assert.deepEqual(fine.warnings ?? [], []);
+
+  assert.deepEqual(unresolvedSecretReferences([server('bad', 'WORKER_TOKEN')], {}), [{ server: 'bad', name: 'WORKER_TOKEN' }]);
 });

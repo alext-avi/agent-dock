@@ -16,6 +16,9 @@ services:
       SCHEDULER_DB_PATH: /control-data/scheduler.sqlite
       AUTH_DB_PATH: /control-data/auth.sqlite
       AUTH_MODE: ${AUTH_MODE:-trusted-local}
+      # Report the host-facing publish address so trusted-local can fail closed
+      # even though the Node process must listen on 0.0.0.0 inside Docker.
+      AUTH_TRUSTED_LOCAL_BIND: ${CONTROL_PLANE_BIND:-127.0.0.1}
       AUTH_PUBLIC_ORIGIN: ${AUTH_PUBLIC_ORIGIN:-http://127.0.0.1:3000}
       AUTH_PROVIDER_NAME: ${AUTH_PROVIDER_NAME:-GitHub}
       AUTH_OIDC_ISSUER: ${AUTH_OIDC_ISSUER:-}

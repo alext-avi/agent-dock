@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { authPermissions, createAuthService } from '../control-plane/auth.mjs';
 import { createControlPlane } from '../control-plane/server.mjs';
@@ -22,7 +25,15 @@ function jwt(privateKey, claims, { kid = 'test-key', algorithm = 'RS256' } = {})
 async function fakeIssuer(t) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const publicJwk = publicKey.export({ format: 'jwk' });
-  const state = { nonce: null, subject: 'admin-user', email: 'admin@example.test' };
+  const defaultJwk = { ...publicJwk, kid: 'test-key', alg: 'RS256', use: 'sig' };
+  const state = {
+    nonce: null,
+    subject: 'admin-user',
+    email: 'admin@example.test',
+    idTokenClaims: {},
+    idTokenOptions: {},
+    jwks: [defaultJwk]
+  };
   let issuer;
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, issuer);
@@ -39,7 +50,7 @@ async function fakeIssuer(t) {
     }
     if (url.pathname === '/jwks') {
       res.setHeader('content-type', 'application/json');
-      return res.end(JSON.stringify({ keys: [{ ...publicJwk, kid: 'test-key', alg: 'RS256', use: 'sig' }] }));
+      return res.end(JSON.stringify({ keys: state.jwks }));
     }
     if (url.pathname === '/token') {
       const chunks = [];
@@ -56,8 +67,9 @@ async function fakeIssuer(t) {
         name: state.subject === 'admin-user' ? 'Admin User' : 'Viewer User',
         nonce: state.nonce,
         iat: now,
-        exp: now + 300
-      });
+        exp: now + 300,
+        ...state.idTokenClaims
+      }, state.idTokenOptions);
       res.setHeader('content-type', 'application/json');
       return res.end(JSON.stringify({ access_token: 'not-used-by-the-control-plane', token_type: 'Bearer', id_token: idToken }));
     }
@@ -69,8 +81,9 @@ async function fakeIssuer(t) {
   return {
     issuer,
     privateKey,
+    publicJwk,
     state,
-    issueAccessToken(claims = {}) {
+    issueAccessToken(claims = {}, options = {}) {
       const now = Math.floor(Date.now() / 1000);
       return jwt(privateKey, {
         iss: issuer,
@@ -79,13 +92,13 @@ async function fakeIssuer(t) {
         iat: now,
         exp: now + 300,
         ...claims
-      });
+      }, options);
     }
   };
 }
 
-async function startOidcControl(t, identity, overrides = {}) {
-  const auth = {
+function oidcOptions(identity, overrides = {}) {
+  return {
     mode: 'oidc',
     issuer: identity.issuer,
     clientId: 'agent-dock-test-client',
@@ -98,6 +111,10 @@ async function startOidcControl(t, identity, overrides = {}) {
     providerName: 'GitHub',
     ...overrides
   };
+}
+
+async function startOidcControl(t, identity, overrides = {}) {
+  const auth = oidcOptions(identity, overrides);
   const control = createControlPlane({
     workerToken: 'test-worker-token',
     dataPath: null,
@@ -121,7 +138,8 @@ async function signIn(url, identity, returnTo = '/jobs') {
   response = await fetch(`${url}/auth/callback?code=test-code&state=${encodeURIComponent(state)}`, { redirect: 'manual' });
   assert.equal(response.status, 302);
   assert.equal(response.headers.get('location'), returnTo.startsWith('/') && !returnTo.startsWith('//') ? returnTo : '/');
-  return { cookie: response.headers.get('set-cookie').split(';')[0], state };
+  const setCookie = response.headers.get('set-cookie');
+  return { cookie: setCookie.split(';')[0], setCookie, state };
 }
 
 test('trusted-local mode provides an explicit local admin principal', async () => {
@@ -130,6 +148,40 @@ test('trusted-local mode provides an explicit local admin principal', async () =
   assert.equal(principal.authentication, 'trusted-local');
   assert.deepEqual(principal.roles, ['admin']);
   assert.equal(auth.allows(principal, 'mcp:manage'), true);
+});
+
+test('trusted-local mode refuses non-loopback origins and externally published binds', () => {
+  for (const trustedLocalBind of ['0.0.0.0', '::', '*', 'agents.example.test']) {
+    assert.throws(
+      () => createAuthService({ mode: 'trusted-local', trustedLocalBind }),
+      /AUTH_TRUSTED_LOCAL_BIND to be loopback/
+    );
+  }
+  assert.throws(
+    () => createAuthService({
+      mode: 'trusted-local',
+      trustedLocalBind: '127.0.0.1',
+      publicOrigin: 'https://agents.example.test'
+    }),
+    /loopback AUTH_PUBLIC_ORIGIN/
+  );
+  for (const trustedLocalBind of ['localhost', '127.0.0.1', '::1', '[::1]']) {
+    const auth = createAuthService({ mode: 'trusted-local', trustedLocalBind });
+    auth.close();
+  }
+  const oidc = createAuthService({
+    ...oidcOptions({ issuer: 'https://issuer.example.test/' }),
+    trustedLocalBind: '0.0.0.0'
+  });
+  oidc.close();
+});
+
+test('return targets cannot escape the control-plane origin', () => {
+  const auth = createAuthService({ mode: 'trusted-local' });
+  assert.equal(auth.normalizeReturnTo('/agents/example?tab=tools'), '/agents/example?tab=tools');
+  for (const hostile of ['https://evil.example/', '//evil.example/', '/\\evil.example', 'agents/example', '']) {
+    assert.equal(auth.normalizeReturnTo(hostile), '/');
+  }
 });
 
 test('route policy explicitly separates reads, execution, and privileged mutations', () => {
@@ -151,7 +203,7 @@ test('route policy explicitly separates reads, execution, and privileged mutatio
   assert.equal(permission('POST', '/api/v1/unclassified-mutation'), 'control:admin');
 });
 
-test('OIDC login uses PKCE, creates a signed session, and enforces CSRF', async (t) => {
+test('OIDC login uses PKCE, creates a signed secure session, and enforces CSRF and Origin', async (t) => {
   const identity = await fakeIssuer(t);
   const { url } = await startOidcControl(t, identity);
 
@@ -162,7 +214,11 @@ test('OIDC login uses PKCE, creates a signed session, and enforces CSRF', async 
   assert.equal(response.status, 200);
   assert.match(await response.text(), /Continue with GitHub/);
 
-  const { cookie, state } = await signIn(url, identity);
+  const { cookie, setCookie, state } = await signIn(url, identity);
+  assert.match(setCookie, /^__Host-agent_dock_session=/);
+  assert.match(setCookie, /; HttpOnly/);
+  assert.match(setCookie, /; SameSite=Lax/);
+  assert.match(setCookie, /; Secure/);
   response = await fetch(`${url}/api/v1/session`, { headers: { cookie } });
   const session = (await response.json()).authentication;
   assert.equal(session.authenticated, true);
@@ -173,6 +229,19 @@ test('OIDC login uses PKCE, creates a signed session, and enforces CSRF', async 
     method: 'POST',
     headers: { cookie, 'content-type': 'application/json' },
     body: JSON.stringify({ name: 'Denied without CSRF' })
+  });
+  assert.equal(response.status, 403);
+  assert.match((await response.json()).error, /CSRF/);
+
+  response = await fetch(`${url}/api/v1/agents`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'content-type': 'application/json',
+      'x-agent-dock-csrf': '1',
+      origin: 'https://evil.example.test'
+    },
+    body: JSON.stringify({ name: 'Denied from hostile origin' })
   });
   assert.equal(response.status, 403);
   assert.match((await response.json()).error, /CSRF/);
@@ -200,6 +269,120 @@ test('OIDC login uses PKCE, creates a signed session, and enforces CSRF', async 
   response = await fetch(`${url}/api/v1/agents`, { headers: { cookie: tampered } });
   assert.equal(response.status, 401);
   assert.match(response.headers.get('www-authenticate'), /oauth-protected-resource/);
+});
+
+test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer tokens', async (t) => {
+  const identity = await fakeIssuer(t);
+  const { url } = await startOidcControl(t, identity);
+  const now = Math.floor(Date.now() / 1000);
+  const request = (token) => fetch(`${url}/api/v1/agents`, {
+    headers: { authorization: `Bearer ${token}` }
+  });
+  const invalid = [
+    identity.issueAccessToken({ iss: 'https://evil.example.test/' }),
+    identity.issueAccessToken({ aud: 'https://wrong.example.test/api' }),
+    identity.issueAccessToken({ exp: now - 60 }),
+    identity.issueAccessToken({ exp: null }),
+    identity.issueAccessToken({ nbf: now + 60 }),
+    identity.issueAccessToken({}, { kid: 'missing-key' }),
+    identity.issueAccessToken({}, { algorithm: 'none' })
+  ];
+  const valid = identity.issueAccessToken();
+  invalid.push(`${valid.slice(0, -1)}${valid.endsWith('a') ? 'b' : 'a'}`);
+
+  const { publicKey: ecPublicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  identity.state.jwks.push({
+    ...ecPublicKey.export({ format: 'jwk' }),
+    kid: 'wrong-key-type',
+    alg: 'RS256',
+    use: 'sig'
+  });
+  invalid.push(identity.issueAccessToken({}, { kid: 'wrong-key-type' }));
+
+  for (const token of invalid) {
+    const response = await request(token);
+    assert.equal(response.status, 401);
+  }
+});
+
+test('verified email is required for email-based elevation', async (t) => {
+  const identity = await fakeIssuer(t);
+  const { url } = await startOidcControl(t, identity, {
+    adminSubjects: [],
+    adminEmails: ['admin@example.test']
+  });
+  const roles = async (emailVerified) => {
+    const response = await fetch(`${url}/api/v1/session`, {
+      headers: {
+        authorization: `Bearer ${identity.issueAccessToken({
+          email: 'admin@example.test',
+          email_verified: emailVerified
+        })}`
+      }
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).authentication.principal.roles;
+  };
+  assert.deepEqual(await roles(false), ['viewer']);
+  assert.deepEqual(await roles(true), ['admin']);
+  assert.deepEqual(await roles(1), ['admin']);
+});
+
+test('OIDC callback rejects nonce and authorized-party substitution', async (t) => {
+  const identity = await fakeIssuer(t);
+  const { url } = await startOidcControl(t, identity);
+
+  let response = await fetch(`${url}/auth/login`, { redirect: 'manual' });
+  let authorization = new URL(response.headers.get('location'));
+  identity.state.nonce = authorization.searchParams.get('nonce');
+  identity.state.idTokenClaims = { nonce: 'attacker-nonce' };
+  response = await fetch(`${url}/auth/callback?code=test-code&state=${authorization.searchParams.get('state')}`);
+  assert.equal(response.status, 401);
+
+  identity.state.idTokenClaims = {};
+  response = await fetch(`${url}/auth/login`, { redirect: 'manual' });
+  authorization = new URL(response.headers.get('location'));
+  identity.state.nonce = authorization.searchParams.get('nonce');
+  identity.state.idTokenClaims = { azp: 'attacker-client' };
+  response = await fetch(`${url}/auth/callback?code=test-code&state=${authorization.searchParams.get('state')}`);
+  assert.equal(response.status, 401);
+});
+
+test('durable sessions survive restart, re-evaluate roles, and expire server-side', async (t) => {
+  const identity = await fakeIssuer(t);
+  const directory = await mkdtemp(join(tmpdir(), 'agent-dock-auth-'));
+  const sessionDbPath = join(directory, 'sessions.sqlite');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let clock = Date.now();
+  const base = oidcOptions(identity, {
+    sessionDbPath,
+    sessionTtlSeconds: 300,
+    adminSubjects: [],
+    adminEmails: ['admin@example.test'],
+    now: () => clock
+  });
+
+  let auth = createAuthService(base);
+  const started = new URL((await auth.beginLogin('/jobs')).location);
+  identity.state.nonce = started.searchParams.get('nonce');
+  identity.state.idTokenClaims = { email_verified: 1 };
+  const completed = await auth.completeLogin(new URL(
+    `/auth/callback?code=test-code&state=${started.searchParams.get('state')}`,
+    'https://dock.example.test'
+  ));
+  const cookie = completed.cookie.split(';')[0];
+  assert.deepEqual((await auth.authenticate({ headers: { cookie } })).roles, ['admin']);
+  auth.close();
+
+  auth = createAuthService(base);
+  assert.deepEqual((await auth.authenticate({ headers: { cookie } })).roles, ['admin']);
+  auth.close();
+
+  auth = createAuthService({ ...base, adminEmails: [] });
+  assert.deepEqual((await auth.authenticate({ headers: { cookie } })).roles, ['viewer']);
+  clock += 301_000;
+  assert.equal(await auth.authenticate({ headers: { cookie } }), null);
+  auth.close();
 });
 
 test('audience-bound bearer tokens obey the same role and permission policy', async (t) => {

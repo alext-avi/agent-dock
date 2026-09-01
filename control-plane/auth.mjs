@@ -18,6 +18,7 @@ const ROLE_PERMISSIONS = {
   admin: new Set(['*'])
 };
 const SUPPORTED_JWT_ALGORITHMS = new Set(['RS256', 'PS256', 'ES256']);
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
 function httpError(message, status = 400) {
   return Object.assign(new Error(message), { status });
@@ -30,6 +31,11 @@ function list(value) {
 
 function base64url(value) {
   return Buffer.from(value).toString('base64url');
+}
+
+function isLoopbackHost(value) {
+  const normalized = String(value ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return LOOPBACK_HOSTS.has(normalized);
 }
 
 function parseJsonSegment(segment, label) {
@@ -73,7 +79,7 @@ function normalizeIssuer(value) {
   if (url.username || url.password || url.search || url.hash) {
     throw new Error('AUTH_OIDC_ISSUER cannot contain credentials, a query, or a fragment');
   }
-  if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+  if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
     throw new Error('AUTH_OIDC_ISSUER must use HTTPS unless it is localhost');
   }
   // Issuer comparison is intentionally exact. Preserve whether the configured
@@ -87,7 +93,7 @@ function normalizeOrigin(value) {
   if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
     throw new Error('AUTH_PUBLIC_ORIGIN must be an origin without credentials, a path, query, or fragment');
   }
-  if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+  if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
     throw new Error('AUTH_PUBLIC_ORIGIN must use HTTPS unless it is localhost');
   }
   return url.origin;
@@ -96,7 +102,7 @@ function normalizeOrigin(value) {
 function secureEndpoint(value, label) {
   const url = new URL(value);
   if (url.username || url.password) throw new Error(`${label} cannot contain URL credentials`);
-  if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+  if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
     throw new Error(`${label} must use HTTPS unless it is localhost`);
   }
   return url.href;
@@ -175,6 +181,7 @@ export function createAuthService(options = {}) {
   if (!['trusted-local', 'oidc'].includes(mode)) throw new Error('AUTH_MODE must be trusted-local or oidc');
 
   const publicOrigin = normalizeOrigin(options.publicOrigin ?? env.AUTH_PUBLIC_ORIGIN ?? 'http://127.0.0.1:3000');
+  const trustedLocalBind = options.trustedLocalBind ?? env.AUTH_TRUSTED_LOCAL_BIND ?? env.HOST ?? '127.0.0.1';
   const providerName = options.providerName ?? env.AUTH_PROVIDER_NAME ?? 'GitHub';
   const apiAudience = options.apiAudience ?? env.AUTH_API_AUDIENCE ?? `${publicOrigin}/api`;
   const sessionTtlSeconds = Number(options.sessionTtlSeconds ?? env.AUTH_SESSION_TTL_SECONDS ?? 8 * 60 * 60);
@@ -199,6 +206,14 @@ export function createAuthService(options = {}) {
   const now = options.now ?? (() => Date.now());
 
   if (!ROLE_PERMISSIONS[defaultRole]) throw new Error('AUTH_DEFAULT_ROLE must be viewer, operator, or admin');
+  if (mode === 'trusted-local') {
+    if (!isLoopbackHost(new URL(publicOrigin).hostname)) {
+      throw new Error('AUTH_MODE=trusted-local requires a loopback AUTH_PUBLIC_ORIGIN');
+    }
+    if (!isLoopbackHost(trustedLocalBind)) {
+      throw new Error('AUTH_MODE=trusted-local requires AUTH_TRUSTED_LOCAL_BIND to be loopback');
+    }
+  }
   if (mode === 'oidc') {
     if (!issuer || !clientId) throw new Error('AUTH_OIDC_ISSUER and AUTH_OIDC_CLIENT_ID are required in oidc mode');
     if (!requestedScopeList.includes('openid')) throw new Error('AUTH_OIDC_SCOPES must include openid');
@@ -258,7 +273,7 @@ export function createAuthService(options = {}) {
       id: claims.agent_id ? `agent:${claims.agent_id}` : `oidc:${base64url(`${issuer}|${subject}`)}`,
       subject,
       email: typeof claims.email === 'string' ? claims.email : null,
-      emailVerified: claims.email_verified === true,
+      emailVerified: claims.email_verified === true || claims.email_verified === 1,
       displayName: claims.name ?? claims.preferred_username ?? claims.email ?? subject,
       provider: providerName,
       authentication,
@@ -332,7 +347,10 @@ export function createAuthService(options = {}) {
     catch { throw httpError('JWT signing key is invalid', 401); }
     const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`);
     const signature = Buffer.from(parts[2], 'base64url');
-    if (!verifyJwtSignature(header.alg, signingInput, signature, publicKey)) throw httpError('JWT signature is invalid', 401);
+    let validSignature = false;
+    try { validSignature = verifyJwtSignature(header.alg, signingInput, signature, publicKey); }
+    catch { /* Treat key/algorithm mismatches as authentication failures. */ }
+    if (!validSignature) throw httpError('JWT signature is invalid', 401);
 
     const seconds = Math.floor(now() / 1000);
     if (claims.iss !== issuer) throw httpError('JWT issuer is invalid', 401);

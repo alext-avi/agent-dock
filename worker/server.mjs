@@ -272,6 +272,10 @@ export function createWorkerServer(options = {}) {
     // and OLLAMA_BASE_URL — none of which a connector definition has any business
     // naming, and all of which it could name when the full environment was passed.
     environment: connectorSecrets(process.env),
+    // The full environment a spawned harness command needs. Kept separate from
+    // the resolver's map on purpose: merging them back is how the vulnerability
+    // returns, and passing the narrow one here is how apply stops working.
+    execEnvironment: providerEnv,
     workspace: config.workspace,
     allowedCommands: config.mcpAllowedCommands,
     statePath: config.mcpStatePath,

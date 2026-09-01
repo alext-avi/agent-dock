@@ -119,7 +119,13 @@ function openCodeServerNames(output) {
 
 export function createMcpManager(options) {
   const adapterId = options.adapterId;
+  // Two different things, conflated until this was caught: the narrow map a
+  // definition's secret references resolve against, and the full process
+  // environment a spawned harness command needs to run at all. Passing the
+  // narrow one to spawn() left codex with no PATH; passing the full one to the
+  // resolver was the vulnerability. They must stay separate.
   const environment = options.environment ?? process.env;
+  const execEnvironment = options.execEnvironment ?? process.env;
   const workspace = options.workspace ?? '/workspace';
   const allowedCommands = new Set(options.allowedCommands ?? []);
   const statePath = options.statePath;
@@ -181,7 +187,7 @@ export function createMcpManager(options) {
       await applyCodexMcpServers(resolved, {
         previousServers: resolveServers(state.servers, environment, { requireSecrets: false }),
         allowedCommands,
-        env: environment,
+        env: execEnvironment,
         run,
         demoMode
       });
@@ -199,7 +205,7 @@ export function createMcpManager(options) {
     await ready;
     if (probe && adapterId === 'opencode' && !demoMode && typeof run === 'function') {
       const resolved = resolveServers(state.servers, environment, { requireSecrets: false });
-      const taskEnv = openCodeMcpTaskEnvironment(environment, resolved, { allowedCommands });
+      const taskEnv = openCodeMcpTaskEnvironment(execEnvironment, resolved, { allowedCommands });
       const result = await run('opencode', ['mcp', 'list'], { env: taskEnv, timeout: 30_000 });
       health = { checkedAt: new Date().toISOString(), ...parseOpenCodeMcpList(result.output, resolved) };
       await persist();

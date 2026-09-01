@@ -92,6 +92,11 @@ function runtimeVolumes(runtimeId) {
 
 // The one namespace a runtime receives for MCP connector credentials. Anything
 // outside it — this process's own tokens and paths — is deliberately not passed.
+//
+// This forwards the whole namespace to every runtime, not the subset an agent's
+// own definitions reference: provisioning happens before an agent has any MCP
+// binding, so there is nothing to filter against yet. Narrowing it needs
+// credentials to be control-plane records rather than container-creation values.
 const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
 
 function connectorSecretEnvironment(environment = process.env) {

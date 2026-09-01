@@ -402,3 +402,44 @@ test('the worker resolves connector secrets only from the namespace, end to end'
   const inspected = await (await fetch(`${workerUrl}/v1/mcp`, { headers })).text();
   assert.ok(!inspected.includes('namespaced-connector-value'), 'a resolved secret reached the wrapper API');
 });
+
+
+// Narrowing the resolver's map broke real subprocess spawning, because the same
+// option was doing double duty as the environment a harness command runs in.
+// Every existing test uses demo mode or a fake runner, so nothing noticed.
+test('a spawned harness command gets a usable environment, not the secret map', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-exec-'));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+
+  const spawns = [];
+  const manager = createMcpManager({
+    adapterId: 'codex-cli',
+    environment: connectorSecrets({ MCP_SECRET_DOCS_TOKEN: 'connector-value' }),
+    execEnvironment: { PATH: '/usr/bin:/bin', CODEX_HOME: '/codex-home', MCP_SECRET_DOCS_TOKEN: 'connector-value' },
+    workspace: process.cwd(),
+    statePath: join(temporary, 'state.json'),
+    configDir: temporary,
+    allowedCommands: [],
+    run: async (command, args, options) => {
+      spawns.push({ command, env: options?.env ?? {} });
+      return { code: 0, output: '' };
+    }
+  });
+
+  await manager.apply([{
+    id: 'docs',
+    name: 'docs',
+    transport: 'http',
+    url: 'https://example.invalid/mcp',
+    timeoutMs: 30_000,
+    secretHeaders: { Authorization: { sourceEnv: 'DOCS_TOKEN', prefix: 'Bearer ' } }
+  }]);
+
+  assert.ok(spawns.length > 0, 'no harness command was spawned, so this proves nothing');
+  for (const spawn of spawns) {
+    // spawn() replaces the environment rather than merging, so a command handed
+    // only the secret map runs with no PATH and cannot execute.
+    assert.equal(spawn.env.PATH, '/usr/bin:/bin', `${spawn.command} was spawned without a PATH`);
+    assert.equal(spawn.env.CODEX_HOME, '/codex-home', `${spawn.command} lost its harness home directory`);
+  }
+});

@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
+import { createMcpService } from '../control-plane/mcp-service.mjs';
 import {
   createCredentialStore,
   environmentKeyProvider,
@@ -279,4 +280,87 @@ test('a connector uses a credential or a secret header, not both', async (t) => 
   // Two mechanisms deciding one header, with no rule for which wins.
   assert.equal(refused.status, 400);
   assert.match((await refused.json()).error, /not both/);
+});
+
+
+// Delivery is where the design earns its keep: a worker receives only the
+// credentials its own connectors reference, resolved only for the destination
+// each connector actually names.
+test('a credential reaches the worker only for the connector that uses it', async (t) => {
+  const records = new Map();
+  const credentials = createCredentialStore({
+    records,
+    persist: async () => {},
+    keyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  });
+
+  const docs = await credentials.create(apiKey({ name: 'docs', value: 'sk-docs-111111111111' }));
+  const unused = await credentials.create(apiKey({ name: 'unused', value: 'sk-unused-2222222222', hosts: ['other.example.com'] }));
+
+  const servers = new Map();
+  const bindings = new Map();
+  const delivered = [];
+  const service = createMcpService({
+    servers,
+    bindings,
+    agents: new Map([['agent-1', { id: 'agent-1', name: 'Agent', adapter: 'claude-code' }]]),
+    persist: async () => {},
+    credentials,
+    workerRequest: async (agent, method, path, body) => {
+      delivered.push(body);
+      return { mcp: { servers: body.servers } };
+    }
+  });
+
+  await service.createServer({
+    name: 'docs-connector', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: docs.id
+  });
+  await service.bind('agent-1', 'docs-connector', { apply: false });
+  await service.applyAgent('agent-1');
+
+  const payload = delivered.at(-1);
+  assert.deepEqual(Object.keys(payload.credentials), [docs.id], 'the worker received a credential it does not use');
+  assert.equal(payload.credentials[docs.id].value, 'sk-docs-111111111111');
+  assert.ok(!JSON.stringify(payload).includes('sk-unused-2222222222'), 'an unrelated credential was delivered');
+  assert.equal(unused.id in payload.credentials, false);
+});
+
+test('editing a connector url cannot redirect its credential', async (t) => {
+  const records = new Map();
+  const credentials = createCredentialStore({
+    records,
+    persist: async () => {},
+    keyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  });
+  const credential = await credentials.create(apiKey());
+
+  const servers = new Map();
+  const bindings = new Map();
+  let lastBody = null;
+  const service = createMcpService({
+    servers,
+    bindings,
+    agents: new Map([['agent-1', { id: 'agent-1', name: 'Agent', adapter: 'claude-code' }]]),
+    persist: async () => {},
+    credentials,
+    workerRequest: async (agent, method, path, body) => { lastBody = body; return { mcp: {} }; }
+  });
+
+  await service.createServer({
+    name: 'docs', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: credential.id
+  });
+  await service.bind('agent-1', 'docs', { apply: false });
+  await service.applyAgent('agent-1');
+  assert.ok(lastBody.credentials[credential.id], 'the permitted destination should resolve');
+
+  // The exfiltration shape: keep the credential, change where it is sent.
+  lastBody = null;
+  await service.updateServer('docs', { url: 'https://attacker.example.com/collect' });
+  await assert.rejects(() => service.applyAgent('agent-1'), (error) => {
+    assert.equal(error.status, 403);
+    assert.match(error.message, /not permitted for https:\/\/attacker\.example\.com/);
+    assert.ok(!error.message.includes('sk-live-abcdef123456'));
+    return true;
+  });
+  assert.equal(lastBody, null, 'the worker was contacted despite the destination being refused');
 });

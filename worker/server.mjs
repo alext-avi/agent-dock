@@ -1225,7 +1225,7 @@ export function createWorkerServer(options = {}) {
         if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'Wait for the active task to finish before changing MCP configuration' }));
         const body = await readJson(req);
         if (!Array.isArray(body.servers)) return json(res, 400, wrapperResponse({ error: 'servers must be an array' }));
-        return json(res, 200, wrapperResponse({ mcp: await mcpManager.apply(body.servers) }));
+        return json(res, 200, wrapperResponse({ mcp: await mcpManager.apply(body.servers, body.credentials) }));
       }
 
       if (req.method === 'GET' && route === '/v1/status') {

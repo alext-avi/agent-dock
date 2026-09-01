@@ -74,7 +74,22 @@ export function unresolvedSecretReferences(servers, environment = {}) {
     .map((name) => ({ server: server.name ?? server.id, name })));
 }
 
-function resolveServers(servers, environment, { requireSecrets }) {
+// Credentials delivered by the control plane for this apply, keyed by id. They
+// are held for the life of the process and never written to the state file: the
+// control plane is the record, and a restart re-delivers on the next apply.
+function applyDeliveredCredentials(resolved, server, delivered) {
+  if (!server.credentialId) return;
+  const credential = delivered?.[server.credentialId];
+  if (!credential) {
+    throw Object.assign(
+      new Error(`Credential ${server.credentialId} was not delivered with this configuration`),
+      { status: 409 }
+    );
+  }
+  resolved.headers[credential.header] = credential.value;
+}
+
+function resolveServers(servers, environment, { requireSecrets, credentials } = {}) {
   return servers.map((server) => {
     const resolved = clone(server);
     resolved.environment = { ...(server.environment ?? {}) };
@@ -85,6 +100,7 @@ function resolveServers(servers, environment, { requireSecrets }) {
       if (value === undefined && requireSecrets) throw missingSecret(sourceEnv);
       if (value !== undefined) resolved.environment[target] = value;
     }
+    if (requireSecrets) applyDeliveredCredentials(resolved, server, credentials);
     for (const [header, reference] of Object.entries(server.secretHeaders ?? {})) {
       const value = environment[reference.sourceEnv];
       if (value === undefined && requireSecrets) throw missingSecret(reference.sourceEnv);
@@ -181,10 +197,10 @@ export function createMcpManager(options) {
     return { ...result, warnings: [...(result.warnings ?? []), ...warnings] };
   }
 
-  function validate(servers, { requireSecrets = false } = {}) {
+  function validate(servers, { requireSecrets = false, credentials = null } = {}) {
     if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
     let resolved;
-    try { resolved = resolveServers(servers, environment, { requireSecrets }); }
+    try { resolved = resolveServers(servers, environment, { requireSecrets, credentials: credentials ?? deliveredCredentials }); }
     catch (error) { return { valid: false, errors: [{ field: 'secret', code: 'missing_worker_secret', message: error.message }], warnings: [] }; }
     const context = { workspace, allowedCommands };
     if (adapterId === 'claude-code') return withMissingSecrets(validateClaudeMcpServers(resolved, context), servers);
@@ -192,17 +208,20 @@ export function createMcpManager(options) {
     return withMissingSecrets(validateCodexMcpServers(resolved, context), servers);
   }
 
-  async function apply(servers) {
+  let deliveredCredentials = {};
+
+  async function apply(servers, credentials = {}) {
     await ready;
     const desired = clone(servers);
-    const validation = validate(desired, { requireSecrets: true });
+    const validation = validate(desired, { requireSecrets: true, credentials });
     if (!validation.valid) {
       const error = new Error(validation.errors.map((item) => item.message).join('; ') || 'Invalid MCP configuration');
       error.status = 400;
       error.validation = validation;
       throw error;
     }
-    const resolved = resolveServers(desired, environment, { requireSecrets: true });
+    deliveredCredentials = credentials ?? {};
+    const resolved = resolveServers(desired, environment, { requireSecrets: true, credentials: deliveredCredentials });
     if (adapterId === 'claude-code') {
       await atomicJson(path.join(configDir, 'claude.json'), renderClaudeMcpConfig(resolved, { workspace, allowedCommands }));
     } else if (adapterId === 'opencode') {
@@ -241,7 +260,7 @@ export function createMcpManager(options) {
 
   async function taskContext(baseEnvironment) {
     await ready;
-    const resolved = resolveServers(state.servers, environment, { requireSecrets: true });
+    const resolved = resolveServers(state.servers, environment, { requireSecrets: true, credentials: deliveredCredentials });
     if (adapterId === 'claude-code') {
       const configPath = path.join(configDir, 'claude.json');
       // Re-render at every task start so a brand-new worker always has a strict

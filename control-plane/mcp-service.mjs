@@ -235,12 +235,27 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     return { agentId, bindings: desired, runtime };
   }
 
+  function resolveCredentials(selected) {
+    if (!credentials) return {};
+    const resolved = {};
+    for (const server of selected) {
+      if (!server.credentialId) continue;
+      // Throws when the destination is outside the credential's host list, so a
+      // definition cannot redirect a credential by editing its url.
+      resolved[server.credentialId] = credentials.resolveForHost(server.credentialId, server.url);
+    }
+    return resolved;
+  }
+
   async function applyAgent(agentId) {
     const agent = requireAgent(agentId);
     const selected = desiredServers(agentId);
     const now = new Date().toISOString();
     try {
-      const result = await workerRequest(agent, 'PUT', '/v1/mcp', { servers: selected });
+      const result = await workerRequest(agent, 'PUT', '/v1/mcp', {
+        servers: selected,
+        credentials: resolveCredentials(selected)
+      });
       for (const binding of bindings.values()) {
         if (binding.agentId === agentId) Object.assign(binding, { state: binding.enabled ? 'applied' : 'disabled', error: null, appliedAt: now, updatedAt: now });
       }

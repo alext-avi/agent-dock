@@ -247,14 +247,41 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     return resolved;
   }
 
+  // An older worker ignores an unknown `credentials` field and applies the
+  // definition with no header at all, reporting success. "No secretHeaders" used
+  // to mean "unauthenticated by design"; it must not now silently also mean
+  // "authenticated by a mechanism this worker cannot speak".
+  async function requireCredentialDelivery(agent, selected) {
+    if (!selected.some((server) => server.credentialId)) return;
+    let supported = false;
+    try {
+      const inspected = await workerRequest(agent, 'GET', '/v1/mcp');
+      supported = inspected?.mcp?.capabilities?.credentialDelivery === true;
+    } catch (error) {
+      throw failure(`Could not confirm this runtime supports delivered credentials: ${error.message}`, 502);
+    }
+    if (!supported) {
+      throw failure(
+        'This runtime does not support control-plane delivered credentials, and would apply the connector '
+        + 'with no credential at all. Refresh the runtime onto the current image, then apply again.',
+        409
+      );
+    }
+  }
+
   async function applyAgent(agentId) {
     const agent = requireAgent(agentId);
     const selected = desiredServers(agentId);
     const now = new Date().toISOString();
     try {
+      // Resolve before contacting the worker at all: a destination outside a
+      // credential's host list has to fail without a round trip, and the failure
+      // has to mark the bindings like any other apply failure.
+      const resolved = resolveCredentials(selected);
+      await requireCredentialDelivery(agent, selected);
       const result = await workerRequest(agent, 'PUT', '/v1/mcp', {
         servers: selected,
-        credentials: resolveCredentials(selected)
+        credentials: resolved
       });
       for (const binding of bindings.values()) {
         if (binding.agentId === agentId) Object.assign(binding, { state: binding.enabled ? 'applied' : 'disabled', error: null, appliedAt: now, updatedAt: now });

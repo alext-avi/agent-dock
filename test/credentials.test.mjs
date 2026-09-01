@@ -214,7 +214,12 @@ test('credentials can be managed over the API without the value coming back', as
   });
   assert.equal((await rotated.json()).credential.hint, '…7777');
 
-  const removed = await fetch(`${url}/api/v1/credentials/${credential.id}`, { method: 'DELETE' });
+  // Deleting is unrecoverable, so it takes the credential's own name back.
+  const unconfirmed = await fetch(`${url}/api/v1/credentials/${credential.id}`, { method: 'DELETE' });
+  assert.equal(unconfirmed.status, 400);
+  const wrongName = await fetch(`${url}/api/v1/credentials/${credential.id}?confirmation=something-else`, { method: 'DELETE' });
+  assert.equal(wrongName.status, 400);
+  const removed = await fetch(`${url}/api/v1/credentials/${credential.id}?confirmation=${credential.name}`, { method: 'DELETE' });
   assert.equal(removed.status, 204);
   assert.equal((await (await fetch(`${url}/api/v1/credentials`)).json()).credentials.length, 0);
 });
@@ -232,7 +237,7 @@ test('a credential still attached to a connector cannot be deleted', async (t) =
   });
   assert.equal(attached.status, 201);
 
-  const refused = await fetch(`${url}/api/v1/credentials/${credential.id}`, { method: 'DELETE' });
+  const refused = await fetch(`${url}/api/v1/credentials/${credential.id}?confirmation=${credential.name}`, { method: 'DELETE' });
   assert.equal(refused.status, 409, 'deleting a credential in use would silently break a connector');
   assert.match((await refused.json()).error, /still used by company-docs/);
 });
@@ -307,6 +312,7 @@ test('a credential reaches the worker only for the connector that uses it', asyn
     persist: async () => {},
     credentials,
     workerRequest: async (agent, method, path, body) => {
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
       delivered.push(body);
       return { mcp: { servers: body.servers } };
     }
@@ -343,7 +349,11 @@ test('editing a connector url cannot redirect its credential', async (t) => {
     agents: new Map([['agent-1', { id: 'agent-1', name: 'Agent', adapter: 'claude-code' }]]),
     persist: async () => {},
     credentials,
-    workerRequest: async (agent, method, path, body) => { lastBody = body; return { mcp: {} }; }
+    workerRequest: async (agent, method, path, body) => {
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
+      lastBody = body;
+      return { mcp: {} };
+    }
   });
 
   await service.createServer({
@@ -363,4 +373,72 @@ test('editing a connector url cannot redirect its credential', async (t) => {
     return true;
   });
   assert.equal(lastBody, null, 'the worker was contacted despite the destination being refused');
+});
+
+// The host list is the whole boundary, so the boundary has to survive an edit of
+// the list itself. Widening it is the same act as sending the credential
+// somewhere new, and an adversarial review found it was reachable in two calls.
+test('widening a credential host list cannot redirect it without the value', async () => {
+  const records = new Map();
+  const credentials = createCredentialStore({
+    records,
+    persist: async () => {},
+    keyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  });
+  const credential = await credentials.create(apiKey());
+
+  const servers = new Map();
+  const bindings = new Map();
+  let lastBody = null;
+  const service = createMcpService({
+    servers,
+    bindings,
+    agents: new Map([['agent-1', { id: 'agent-1', name: 'Agent', adapter: 'claude-code' }]]),
+    persist: async () => {},
+    credentials,
+    workerRequest: async (agent, method, path, body) => {
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
+      lastBody = body;
+      return { mcp: {} };
+    }
+  });
+  await service.createServer({
+    name: 'docs', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: credential.id
+  });
+  await service.bind('agent-1', 'docs', { apply: false });
+
+  // Step one of the exploit: move the allowlist to the destination you want.
+  await assert.rejects(
+    () => credentials.update(credential.id, { hosts: ['attacker.example.com', 'mcp.example.com'] }),
+    (error) => error.status === 403 && /requires supplying the credential value again/.test(error.message)
+  );
+  assert.deepEqual(credentials.get(credential.id).hosts, ['mcp.example.com']);
+
+  // Step two is now moot: the destination is still refused.
+  lastBody = null;
+  await service.updateServer('docs', { url: 'https://attacker.example.com/collect' });
+  await assert.rejects(() => service.applyAgent('agent-1'), (error) => error.status === 403);
+  assert.equal(lastBody, null, 'the worker was contacted for a refused destination');
+});
+
+test('re-supplying the value is what authorises a new host, and it rotates the credential', async () => {
+  const records = new Map();
+  const credentials = createCredentialStore({
+    records,
+    persist: async () => {},
+    keyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  });
+  const credential = await credentials.create(apiKey());
+
+  // Everything but the hosts stays editable without the value.
+  const renamed = await credentials.update(credential.id, { name: 'renamed' });
+  assert.equal(renamed.name, 'renamed');
+  assert.deepEqual(renamed.hosts, ['mcp.example.com']);
+
+  const widened = await credentials.update(credential.id, {
+    hosts: ['mcp.example.com', 'docs.example.com'],
+    value: 'sk-live-999999999999'
+  });
+  assert.deepEqual(widened.hosts, ['mcp.example.com', 'docs.example.com']);
+  assert.equal(credentials.matches(credential.id, 'sk-live-999999999999'), true);
 });

@@ -871,9 +871,22 @@ export function createControlPlane(options = {}) {
     const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
     runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
     await persistAgents();
+    // The replacement process holds no delivered credentials, and MCP state on
+    // disk still names them. Re-applying restores the agent to the configuration
+    // the registry already claims it has.
+    let reapplied = null;
+    try {
+      await mcpService.applyAgent(agent.id);
+      reapplied = true;
+    } catch (error) {
+      reapplied = false;
+      runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+      await persistAgents();
+    }
     return json(res, 200, {
       runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
-      refreshed: true
+      refreshed: true,
+      mcpReapplied: reapplied
     });
   }
 
@@ -894,11 +907,22 @@ export function createControlPlane(options = {}) {
     if (req.method === 'GET') return json(res, 200, { credential: credentials.get(id) });
     if (req.method === 'PATCH') return json(res, 200, { credential: await credentials.update(id, await readJson(req)) });
     if (req.method === 'DELETE') {
+      const record = credentials.get(id);
+      // Report the recoverable objection first: being told to confirm a deletion
+      // that would have been refused anyway is a worse error than being told why.
       const inUse = [...mcpServers.values()].filter((server) => server.credentialId === id).map((server) => server.name);
       if (inUse.length) {
         throw Object.assign(
           new Error(`Credential is still used by ${inUse.join(', ')}; detach it from those connectors first`),
           { status: 409 }
+        );
+      }
+      // Unrecoverable: the value exists nowhere else in Agent Dock, so deleting
+      // takes the same exact-name confirmation as destroying a runtime.
+      if (url.searchParams.get('confirmation') !== record.name) {
+        throw Object.assign(
+          new Error(`Deleting a credential is unrecoverable: its value exists nowhere else. Confirm with ?confirmation=${record.name}`),
+          { status: 400 }
         );
       }
       await credentials.remove(id);

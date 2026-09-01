@@ -219,6 +219,21 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     async update(id, input) {
       const record = requireRecord(id);
       const fields = normalize({ ...record, ...input }, { currentId: id });
+
+      // Widening where a credential may be sent is the same act as handing it to
+      // a new destination, so it takes the same proof: supply the value again.
+      // Without this, the host list defends the connector's url and nothing else —
+      // an editor could simply move the allowlist to wherever they wanted the
+      // credential sent, which is not a boundary at all.
+      const hostsChanged = fields.hosts.join(',') !== record.hosts.join(',');
+      if (hostsChanged && input.value === undefined) {
+        throw failure(
+          'Changing permitted hosts requires supplying the credential value again, '
+          + 'because it changes where the credential may be sent',
+          403
+        );
+      }
+
       Object.assign(record, fields, { updatedAt: new Date().toISOString() });
       // A value is replaced, never read back and edited.
       if (input.value !== undefined) {

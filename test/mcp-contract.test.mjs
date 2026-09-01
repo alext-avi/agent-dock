@@ -3,8 +3,10 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
+import { environmentKeyProvider } from '../control-plane/credentials.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
 import { CONNECTOR_SECRET_PREFIX, connectorSecrets, createMcpManager, unresolvedSecretReferences } from '../worker/mcp/manager.mjs';
 import { applyCodexMcpServers } from '../worker/adapters/codex-mcp.mjs';
@@ -473,4 +475,137 @@ test('validation warns about a reference that apply will refuse', async (t) => {
   assert.deepEqual(fine.warnings ?? [], []);
 
   assert.deepEqual(unresolvedSecretReferences([server('bad', 'WORKER_TOKEN')], {}), [{ server: 'bad', name: 'WORKER_TOKEN' }]);
+});
+
+// The credential delivery path, end to end through the real control plane and a
+// real worker. Every earlier test for this feature built its own fake
+// workerRequest, so nothing proved the value actually reaches the rendered
+// provider configuration — the only outcome the feature exists for.
+test('a delivered credential reaches the rendered provider config and never the worker state file', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-credential-delivery-'));
+  const configDir = join(temporary, 'worker-config');
+  const statePath = join(temporary, 'worker-state.json');
+  const token = 'delivery-token';
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    mcpStatePath: statePath,
+    mcpConfigDir: configDir
+  });
+  const workerUrl = await listen(worker);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    dataPath: null,
+    credentialKeyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64') })
+  });
+  const controlUrl = await listen(control);
+  t.after(async () => {
+    await Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+    await rm(temporary, { recursive: true, force: true });
+  });
+  const post = (pathname, body) => fetch(`${controlUrl}${pathname}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+
+  const credentialResponse = await post('/api/v1/credentials', {
+    name: 'docs-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-DELIVERED'
+  });
+  assert.equal(credentialResponse.status, 201);
+  const credential = (await credentialResponse.json()).credential;
+
+  const serverResponse = await post('/api/v1/mcp/servers', {
+    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+  });
+  assert.equal(serverResponse.status, 201);
+  const definition = (await serverResponse.json()).server;
+
+  const binding = await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: definition.id, apply: true });
+  assert.equal(binding.status, 201);
+
+  const rendered = JSON.parse(await readFile(join(configDir, 'claude.json'), 'utf8'));
+  assert.equal(rendered.mcpServers.docs.headers['X-Api-Key'], 'sk-live-DELIVERED');
+
+  // The worker holds it in memory only; nothing durable on either side has it.
+  assert.doesNotMatch(await readFile(statePath, 'utf8'), /sk-live-DELIVERED/);
+  const listed = await (await fetch(`${controlUrl}/api/v1/credentials`)).json();
+  assert.doesNotMatch(JSON.stringify(listed), /sk-live-DELIVERED/);
+  const inspected = await (await fetch(`${controlUrl}/api/v1/agents/worker-01/mcp`)).json();
+  assert.doesNotMatch(JSON.stringify(inspected), /sk-live-DELIVERED/);
+});
+
+test('a worker refuses a credentialId definition when no credential was delivered', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-credential-undelivered-'));
+  const token = 'undelivered-token';
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    mcpStatePath: join(temporary, 'state.json'),
+    mcpConfigDir: temporary
+  });
+  const workerUrl = await listen(worker);
+  t.after(async () => {
+    await new Promise((resolve) => worker.close(resolve));
+    await rm(temporary, { recursive: true, force: true });
+  });
+
+  // Simulates a control plane that dropped the credentials field. Applying with
+  // no header at all would be worse than failing: the connector would look
+  // configured and authenticate as nobody.
+  const apply = await fetch(`${workerUrl}/v1/mcp`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ servers: [{ ...remoteDefinition('docs'), credentialId: 'docs-key' }] })
+  });
+  assert.equal(apply.status, 400);
+  const validation = (await apply.json()).mcp.validation;
+  assert.equal(validation.errors[0].code, 'missing_credential');
+});
+
+test('the control plane refuses to apply a credential to a worker that cannot receive one', async (t) => {
+  // An older worker ignores the credentials field, renders no header, and reports
+  // success. The fleet is expected to be mixed-version, so this is reachable.
+  const legacyWorker = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.method === 'GET') {
+      return res.end(JSON.stringify({
+        protocol: 'agent-wrapper/v1',
+        mcp: { schemaVersion: 1, capabilities: { transports: ['http'] }, servers: [] }
+      }));
+    }
+    return res.end(JSON.stringify({ protocol: 'agent-wrapper/v1', mcp: { schemaVersion: 1, servers: [] } }));
+  });
+  const workerUrl = await listen(legacyWorker);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: 'legacy-token',
+    dataPath: null,
+    credentialKeyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 9).toString('base64') })
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => legacyWorker.close(resolve))
+  ]));
+  const post = (pathname, body) => fetch(`${controlUrl}${pathname}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+
+  const credential = (await (await post('/api/v1/credentials', {
+    name: 'legacy-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-LEGACY'
+  })).json()).credential;
+  const definition = (await (await post('/api/v1/mcp/servers', {
+    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+  })).json()).server;
+
+  const binding = await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: definition.id, apply: true });
+  assert.equal(binding.status, 409);
+  assert.match((await binding.json()).error, /does not support control-plane delivered credentials/);
 });

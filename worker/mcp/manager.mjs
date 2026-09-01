@@ -82,8 +82,11 @@ function applyDeliveredCredentials(resolved, server, delivered) {
   const credential = delivered?.[server.credentialId];
   if (!credential) {
     throw Object.assign(
-      new Error(`Credential ${server.credentialId} was not delivered with this configuration`),
-      { status: 409 }
+      new Error(
+        `Credential ${server.credentialId} was not delivered with this configuration. `
+        + 'Delivered credentials are held in memory, so a worker restart needs a fresh apply.'
+      ),
+      { status: 409, code: 'missing_credential' }
     );
   }
   resolved.headers[credential.header] = credential.value;
@@ -110,12 +113,16 @@ function resolveServers(servers, environment, { requireSecrets, credentials } = 
   });
 }
 
-function publicState(state, capabilities, health) {
+function publicState(state, capabilities, health, pendingCredentials = []) {
   return {
     schemaVersion: 1,
     capabilities,
     generation: state.generation,
     appliedAt: state.appliedAt,
+    // Named connectors whose credential was not delivered to this process. A
+    // restart empties the delivery, so this is how the control plane learns that
+    // its record of 'applied' is ahead of what the worker can actually do.
+    pendingCredentials,
     activation: capabilities.activation ?? 'next-task',
     restartRequired: capabilities.restartRequired === true,
     servers: clone(state.servers),
@@ -201,7 +208,11 @@ export function createMcpManager(options) {
     if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
     let resolved;
     try { resolved = resolveServers(servers, environment, { requireSecrets, credentials: credentials ?? deliveredCredentials }); }
-    catch (error) { return { valid: false, errors: [{ field: 'secret', code: 'missing_worker_secret', message: error.message }], warnings: [] }; }
+    catch (error) {
+      // Keep the distinction the thrower made: an undelivered credential is a
+      // delivery problem, not a mistyped reference.
+      return { valid: false, errors: [{ field: 'secret', code: error.code ?? 'missing_worker_secret', message: error.message }], warnings: [] };
+    }
     const context = { workspace, allowedCommands };
     if (adapterId === 'claude-code') return withMissingSecrets(validateClaudeMcpServers(resolved, context), servers);
     if (adapterId === 'opencode') return withMissingSecrets(validateOpenCodeMcpServers(resolved, context), servers);
@@ -209,6 +220,12 @@ export function createMcpManager(options) {
   }
 
   let deliveredCredentials = {};
+
+  function pendingCredentials() {
+    return state.servers
+      .filter((server) => server.credentialId && !deliveredCredentials[server.credentialId])
+      .map((server) => server.name);
+  }
 
   async function apply(servers, credentials = {}) {
     await ready;
@@ -243,7 +260,7 @@ export function createMcpManager(options) {
       servers: desired.map((server) => ({ name: server.name, status: 'configured', error: null }))
     };
     await persist();
-    return publicState(state, capabilities, health);
+    return publicState(state, capabilities, health, pendingCredentials());
   }
 
   async function inspect({ probe = false } = {}) {
@@ -255,7 +272,7 @@ export function createMcpManager(options) {
       health = { checkedAt: new Date().toISOString(), ...parseOpenCodeMcpList(result.output, resolved) };
       await persist();
     }
-    return publicState(state, capabilities, health);
+    return publicState(state, capabilities, health, pendingCredentials());
   }
 
   async function taskContext(baseEnvironment) {

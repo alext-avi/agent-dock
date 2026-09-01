@@ -2202,7 +2202,7 @@ function openCredentialDialog(credential = null) {
   // "here is what it is".
   ui.credentialValue.required = !credential;
   ui.credentialValueHint.textContent = credential
-    ? `currently ${credential.hint} — leave blank to keep it`
+    ? `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`
     : 'pasted once, never shown again';
   ui.credentialDialog.showModal();
 }
@@ -2233,7 +2233,7 @@ async function saveCredential(event) {
 async function deleteCredential(credential) {
   if (!window.confirm(`Delete ${credential.name}? Any connector still using it must be changed first.`)) return;
   try {
-    await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}`, { method: 'DELETE' });
+    await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}?confirmation=${encodeURIComponent(credential.name)}`, { method: 'DELETE' });
     await loadCredentials();
   } catch (error) {
     setConnection('offline', error.message);

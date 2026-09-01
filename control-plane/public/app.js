@@ -23,6 +23,9 @@ const ui = {
   agentView: $('#agent-view'),
   connectionDot: $('#connection-dot'),
   connectionLabel: $('#connection-label'),
+  operatorName: $('#operator-name'),
+  operatorRole: $('#operator-role'),
+  signOut: $('#sign-out'),
   agentGrid: $('#agent-grid'),
   emptyFleet: $('#empty-fleet'),
   agentCount: $('#agent-count'),
@@ -195,14 +198,46 @@ function setConnection(state, label) {
 }
 
 async function api(path, options = {}) {
+  const method = (options.method ?? 'GET').toUpperCase();
   const response = await fetch(path, {
     ...options,
-    headers: options.body ? { 'content-type': 'application/json', ...options.headers } : options.headers
+    headers: {
+      ...(options.body ? { 'content-type': 'application/json' } : {}),
+      ...(!['GET', 'HEAD', 'OPTIONS'].includes(method) ? { 'x-agent-dock-csrf': '1' } : {}),
+      ...options.headers
+    }
   });
+  if (response.status === 401) {
+    const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
+    throw new Error('Authentication required');
+  }
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
   return data;
+}
+
+async function loadPlatformSession() {
+  try {
+    const { authentication } = await api(`${API_ROOT}/session`);
+    const principal = authentication.principal;
+    if (!principal) return;
+    ui.operatorName.textContent = principal.displayName;
+    ui.operatorRole.textContent = principal.roles.join(' · ') || principal.provider;
+    ui.signOut.classList.toggle('hidden', authentication.mode !== 'oidc');
+  } catch {
+    // The API helper handles an expired session by returning to the login page.
+  }
+}
+
+async function signOut() {
+  ui.signOut.disabled = true;
+  try {
+    await fetch('/auth/logout', { method: 'POST', headers: { 'x-agent-dock-csrf': '1' } });
+  } finally {
+    window.location.assign('/login');
+  }
 }
 
 // maxAgeMs lets the live poll resync cheaply: drift only changes when someone
@@ -2078,6 +2113,7 @@ ui.runButton.addEventListener('click', runTask);
 ui.cancelButton.addEventListener('click', cancelRun);
 ui.refreshUsage.addEventListener('click', refreshUsage);
 ui.refreshAuth.addEventListener('click', refreshAuthentication);
+ui.signOut.addEventListener('click', signOut);
 $('#refresh-files').addEventListener('click', refreshWorkspace);
 $('#clear-output').addEventListener('click', () => {
   ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';
@@ -2095,6 +2131,7 @@ window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { 
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 const jobsRoute = /^\/(?:jobs|schedules)\/?$/.test(window.location.pathname);
+void loadPlatformSession();
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
 else if (jobsRoute) loadJobs();
 else loadDashboard();

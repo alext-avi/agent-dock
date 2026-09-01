@@ -775,6 +775,7 @@ test('the shared container spec carries every setting a worker needs', async () 
   for (const key of [
     'PORT',
     'WORKER_TOKEN',
+    'WORKER_AUTH_MODE',
     'AGENT_ID',
     'ALLOW_UNSANDBOXED',
     'AGENT_DATA_PATH',
@@ -811,6 +812,7 @@ test('the shared container spec carries every setting a worker needs', async () 
     delete process.env.NOT_A_CONNECTOR_SECRET;
   }
   assert.equal(env.WORKER_TOKEN, 'token-abc');
+  assert.equal(env.WORKER_AUTH_MODE, 'jwt');
   assert.equal(env.AGENT_ID, 'worker-abc');
 
   // All four private volumes are mounted, and nothing from the host is.

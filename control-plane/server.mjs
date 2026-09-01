@@ -4,9 +4,11 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createAuthService } from './auth.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
 import { createScheduler } from './scheduler.mjs';
+import { createWorkloadToken, workloadScopeForRequest } from './workload-token.mjs';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const MIME = {
@@ -22,6 +24,21 @@ function json(res, status, value) {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store'
+  });
+  res.end(body);
+}
+
+function redirect(res, location, headers = {}) {
+  res.writeHead(302, { location, 'cache-control': 'no-store', ...headers });
+  res.end();
+}
+
+function html(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
   });
   res.end(body);
 }
@@ -227,6 +244,10 @@ export function createControlPlane(options = {}) {
   if (!Number.isFinite(config.schedulerIntervalMs) || config.schedulerIntervalMs < 100) {
     throw new Error('SCHEDULER_INTERVAL_MS must be at least 100');
   }
+  const auth = options.authService ?? createAuthService({
+    sessionDbPath: dataPath ? join(dirname(dataPath), 'auth.sqlite') : ':memory:',
+    ...options.auth
+  });
 
   const agents = new Map();
   const deletingAgents = new Set();
@@ -409,10 +430,17 @@ export function createControlPlane(options = {}) {
 
   async function workerFetch(agent, pathname, init = {}) {
     const runtime = requireRunnableAgent(agent);
+    const method = (init.method ?? 'GET').toUpperCase();
+    const transportCredential = runtime.workerAuthMode === 'jwt'
+      ? createWorkloadToken(runtime.workerToken, {
+          audience: `agent-wrapper:${runtime.workerId}`,
+          scopes: [workloadScopeForRequest(pathname, method)]
+        })
+      : runtime.workerToken;
     const response = await fetch(`${runtime.workerUrl}${pathname}`, {
       ...init,
       headers: {
-        authorization: `Bearer ${runtime.workerToken}`,
+        authorization: `Bearer ${transportCredential}`,
         ...(init.body ? { 'content-type': 'application/json' } : {}),
         ...init.headers
       },
@@ -879,10 +907,104 @@ export function createControlPlane(options = {}) {
     return false;
   }
 
+  async function handlePlatformAuth(req, res, url) {
+    if (req.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource') {
+      return json(res, 200, auth.protectedResourceMetadata());
+    }
+    if (req.method === 'GET' && url.pathname === '/login') {
+      const principal = await auth.authenticate(req);
+      const returnTo = auth.normalizeReturnTo(url.searchParams.get('returnTo') ?? '/');
+      if (principal) return redirect(res, returnTo);
+      return html(res, 200, auth.loginPage(returnTo, url.searchParams.get('error')));
+    }
+    if (req.method === 'GET' && url.pathname === '/auth/login') {
+      const result = await auth.beginLogin(url.searchParams.get('returnTo') ?? '/');
+      return redirect(res, result.location);
+    }
+    if (req.method === 'GET' && url.pathname === '/auth/callback') {
+      try {
+        const result = await auth.completeLogin(new URL(url.pathname + url.search, auth.publicOrigin));
+        return redirect(res, result.location, result.cookie ? { 'set-cookie': result.cookie } : {});
+      } catch (error) {
+        return html(res, error.status ?? 401, auth.loginPage('/', error.message));
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/auth/logout') {
+      const principal = await auth.authenticate(req);
+      if (!principal) return authenticationRequired(res);
+      if (!auth.checkCsrf(req, principal)) return authorizationDenied(res, null, 'CSRF validation failed');
+      auth.revokeSession(req);
+      return redirect(res, '/login', { 'set-cookie': auth.clearSessionCookie() });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/v1/session') {
+      const principal = await auth.authenticate(req);
+      return json(res, 200, {
+        authentication: {
+          mode: auth.mode,
+          authenticated: Boolean(principal),
+          principal: auth.publicPrincipal(principal)
+        }
+      });
+    }
+    return false;
+  }
+
+  function authenticationRequired(res) {
+    const metadata = `${auth.publicOrigin}/.well-known/oauth-protected-resource`;
+    res.writeHead(401, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'www-authenticate': `Bearer resource_metadata="${metadata}"`
+    });
+    res.end(JSON.stringify({ error: 'Authentication required' }));
+  }
+
+  function authorizationDenied(res, permission, message = 'Insufficient permission') {
+    return json(res, 403, { error: message, requiredPermission: permission });
+  }
+
+  function publicSchedulerHealth() {
+    const status = scheduler.status();
+    return {
+      enabled: status.enabled,
+      database: status.database,
+      lastTickAt: status.lastTickAt,
+      tickFailed: Boolean(status.lastTickError),
+      executionFailed: Boolean(status.lastExecutionError),
+      activeExecutions: status.activeExecutions
+    };
+  }
+
   const server = createServer(async (req, res) => {
     try {
       await registryReady;
       const url = new URL(req.url, 'http://control.local');
+      const authRoute = await handlePlatformAuth(req, res, url);
+      if (authRoute !== false) return authRoute;
+
+      let principal;
+      try {
+        principal = await auth.authenticate(req);
+      } catch (error) {
+        if (error.status === 401) return authenticationRequired(res);
+        throw error;
+      }
+      const permission = auth.permissionForRequest(req, url);
+      if (permission && !principal) return authenticationRequired(res);
+      if (permission && !auth.allows(principal, permission)) return authorizationDenied(res, permission);
+      if (permission && !auth.checkCsrf(req, principal)) {
+        return authorizationDenied(res, permission, 'CSRF validation failed');
+      }
+
+      const browserRoute = req.method === 'GET'
+        && !url.pathname.startsWith('/api/')
+        && !url.pathname.startsWith('/auth/')
+        && !url.pathname.startsWith('/.well-known/')
+        && !extname(url.pathname);
+      if (browserRoute && auth.mode === 'oidc' && !principal) {
+        return redirect(res, `/login?returnTo=${encodeURIComponent(url.pathname + url.search)}`);
+      }
+
       const scheduled = await handleSchedules(req, res, url);
       if (scheduled !== false) return scheduled;
       const mcp = await handleMcp(req, res, url);
@@ -895,12 +1017,12 @@ export function createControlPlane(options = {}) {
       const agent = defaultAgent();
       if (req.method === 'GET' && ['/api/v1/health', '/api/health'].includes(url.pathname)) {
         const runtime = agent?.runtimeId ? runtimes.get(agent.runtimeId) : null;
-        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured', scheduler: scheduler.status() });
+        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured', scheduler: publicSchedulerHealth() });
         try {
           const upstream = await fetch(`${runtime.workerUrl}/v1/health`, { signal: AbortSignal.timeout(2000) });
-          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy', scheduler: scheduler.status() });
+          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy', scheduler: publicSchedulerHealth() });
         } catch {
-          return json(res, 200, { ok: true, worker: 'offline', scheduler: scheduler.status() });
+          return json(res, 200, { ok: true, worker: 'offline', scheduler: publicSchedulerHealth() });
         }
       }
       if (!agent && url.pathname.startsWith('/api/')) return json(res, 404, { error: 'No agents configured' });
@@ -940,12 +1062,14 @@ export function createControlPlane(options = {}) {
     schedulerClosed = true;
     if (schedulerTimer) clearInterval(schedulerTimer);
     void scheduler.whenIdle().finally(() => scheduler.close());
+    auth.close?.();
   });
   return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env.PORT ?? 3000);
+  const host = process.env.HOST ?? '127.0.0.1';
   const server = createControlPlane();
-  server.listen(port, '0.0.0.0', () => console.log(`[control-plane] http://localhost:${port}`));
+  server.listen(port, host, () => console.log(`[control-plane] listening on ${host}:${port}`));
 }

@@ -5,6 +5,8 @@ flowchart TB
 
   subgraph Plane["Control plane · Node.js 22 built-in HTTP server"]
     API["REST/JSON + NDJSON proxy\nAgent + MCP + schedule lifecycle operations"]
+    Auth["Platform identity + policy\nOIDC/PKCE · sessions · roles/scopes"]
+    AuthDb[("SQLite\nRevocable browser sessions")]
     Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
@@ -13,6 +15,7 @@ flowchart TB
   end
 
   Engine["Docker Engine API\nLocal Unix socket"]
+  Identity["OIDC authorization server\nGitHub as upstream identity"]
 
   subgraph Docker["Docker private network"]
     subgraph RuntimeA["Managed runtime A · exclusive container"]
@@ -36,7 +39,11 @@ flowchart TB
   React["Planned web client\nReact + TypeScript + Vite"]
   Database["Planned unified repository\nMigrate JSON registry · Postgres-ready boundary"]
 
-  UI <-->|"Same-origin HTTP"| API
+  UI -->|"Sign in"| Identity
+  Identity -->|"Authorization code + signed identity"| Auth
+  UI <-->|"Signed session + CSRF"| API
+  API --> Auth
+  Auth <--> AuthDb
   API <--> Registry
   API <--> McpService
   API <--> Scheduler
@@ -44,8 +51,8 @@ flowchart TB
   API --> Provisioner --> Engine
   Engine --> RuntimeA
   Engine --> RuntimeB
-  API -->|"Unique URL + bearer token"| WA
-  API -->|"Unique URL + bearer token"| WB
+  API -->|"Short-lived scoped JWT\nworker-specific audience"| WA
+  API -->|"Short-lived scoped JWT\nworker-specific audience"| WB
   Scheduler -->|"Claim then dispatch via wrapper"| WA
   Scheduler -->|"Claim then dispatch via wrapper"| WB
   WA <--> Providers
@@ -57,6 +64,7 @@ flowchart TB
   McpService -->|"same servers payload"| WB
   WA --> MCP
   WB --> MCP
+  FutureMcp -.->|"OAuth bearer token"| Auth
   FutureMcp -.-> API
   FutureMcp --- Guard
   Data -.-> VA

@@ -16,7 +16,7 @@ RUN apt-get update \
     && chown -R agent:agent /app /workspace /claude-home /opt/claude /agent-data
 
 WORKDIR /app
-COPY --chown=agent:agent server.mjs protocol.mjs entrypoint-claude.sh ./
+COPY --chown=agent:agent server.mjs protocol.mjs workload-auth.mjs entrypoint-claude.sh ./
 COPY --chown=agent:agent adapters ./adapters
 COPY --chown=agent:agent mcp ./mcp
 RUN chmod 0755 /app/entrypoint-claude.sh

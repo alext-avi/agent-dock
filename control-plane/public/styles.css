@@ -30,6 +30,12 @@ a { color: inherit; }
 .topbar-right { display: flex; align-items: center; gap: 22px; }
 .nav-link { color: var(--muted); font: 11px ui-monospace, monospace; letter-spacing: .08em; text-decoration: none; text-transform: uppercase; }
 .nav-link:hover { color: var(--acid); }
+.operator-account { display: flex; align-items: center; gap: 9px; padding-left: 16px; border-left: 1px solid var(--line); }
+.operator-account span, .operator-account strong, .operator-account small { display: block; }
+.operator-account strong { max-width: 150px; overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.operator-account small { margin-top: 2px; color: var(--faint); font: 8px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.operator-sign-out { padding: 4px 0; color: var(--muted); background: transparent; border: 0; font: 9px ui-monospace, monospace; text-decoration: underline; text-underline-offset: 3px; }
+.operator-sign-out:hover { color: var(--acid); }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .dot.online { background: var(--acid); box-shadow: 0 0 10px #c7ff4a88; }
 .dot.offline { background: var(--danger); }

@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows } from './adapters/codex.mjs';
@@ -10,6 +10,7 @@ import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/open
 import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 import { connectorSecrets, createMcpManager } from './mcp/manager.mjs';
+import { authorizeWorkerRequest } from './workload-auth.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
@@ -41,13 +42,6 @@ async function readJson(req, limit = 128 * 1024) {
   } catch {
     throw Object.assign(new Error('Body must be valid JSON'), { status: 400 });
   }
-}
-
-function authorized(req, token) {
-  const actual = req.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
-  const a = Buffer.from(actual);
-  const b = Buffer.from(token);
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function capture(command, args, options = {}) {
@@ -192,6 +186,7 @@ export function createWorkerServer(options = {}) {
     : adapterId === 'codex-cli' ? normalizeCodexQuotaWindows : () => [];
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
+    authMode: options.authMode ?? process.env.WORKER_AUTH_MODE ?? 'hybrid',
     port: Number(options.port ?? process.env.PORT ?? 7777),
     agentId: options.agentId ?? process.env.AGENT_ID ?? 'worker-01',
     adapterId,
@@ -227,6 +222,7 @@ export function createWorkerServer(options = {}) {
     claudeUsageFetch: options.claudeUsageFetch ?? undefined
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
+  if (!['token', 'jwt', 'hybrid'].includes(config.authMode)) throw new Error('WORKER_AUTH_MODE must be token, jwt, or hybrid');
 
   // The manifest states what the adapter implements; this states what this
   // instance actually has switched on. Claude Code has no supported quota
@@ -1204,7 +1200,15 @@ export function createWorkerServer(options = {}) {
           adapter: { id: adapterManifest.id, provider: adapterManifest.provider }
         }));
       }
-      if (!authorized(req, config.token)) return json(res, 401, wrapperResponse({ error: 'Unauthorized' }));
+      const authorization = authorizeWorkerRequest(req, {
+        secret: config.token,
+        mode: config.authMode,
+        agentId: config.agentId,
+        route
+      });
+      if (!authorization.authenticated) {
+        return json(res, 401, wrapperResponse({ error: 'Unauthorized', requiredScope: authorization.permission }));
+      }
 
       if (req.method === 'GET' && route === '/v1/providers') {
         return json(res, 200, wrapperResponse(await providerConnections()));

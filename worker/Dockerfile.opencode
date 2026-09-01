@@ -15,7 +15,7 @@ RUN apt-get update \
     && chown -R agent:agent /app /workspace /opencode-home /opt/opencode /agent-data
 
 WORKDIR /app
-COPY --chown=agent:agent server.mjs protocol.mjs entrypoint-opencode.sh ./
+COPY --chown=agent:agent server.mjs protocol.mjs workload-auth.mjs entrypoint-opencode.sh ./
 COPY --chown=agent:agent adapters ./adapters
 COPY --chown=agent:agent mcp ./mcp
 RUN chmod 0755 /app/entrypoint-opencode.sh

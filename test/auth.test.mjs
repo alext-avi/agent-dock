@@ -102,6 +102,7 @@ async function startOidcControl(t, identity, overrides = {}) {
     workerToken: 'test-worker-token',
     dataPath: null,
     schedulerEnabled: false,
+    mcpAllowedHostnames: ['127.0.0.1'],
     auth
   });
   const url = await listen(control);
@@ -243,4 +244,37 @@ test('audience-bound bearer tokens obey the same role and permission policy', as
   const metadata = await (await fetch(`${url}/.well-known/oauth-protected-resource`)).json();
   assert.equal(metadata.resource, 'https://dock.example.test/api');
   assert.deepEqual(metadata.authorization_servers, [identity.issuer]);
+
+  const mcpMetadata = await (await fetch(`${url}/.well-known/oauth-protected-resource/mcp`)).json();
+  assert.equal(mcpMetadata.resource, 'https://dock.example.test/mcp');
+  assert.deepEqual(mcpMetadata.scopes_supported, ['fleet:read', 'tasks:execute']);
+
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${viewer}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 401, 'an API-audience token cannot be replayed at the MCP resource');
+
+  const mcpViewer = identity.issueAccessToken({ aud: 'https://dock.example.test/mcp' });
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${mcpViewer}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 200);
+  const mcpText = await response.text();
+  const mcpData = mcpText.split('\n').find((line) => line.startsWith('data: '));
+  const mcpPayload = JSON.parse(mcpData ? mcpData.slice(6) : mcpText);
+  assert.deepEqual(mcpPayload.result.tools.map((tool) => tool.name).sort(), ['get_agent_status', 'list_agents']);
 });

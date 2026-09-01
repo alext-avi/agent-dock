@@ -2,7 +2,7 @@
 
 Agent Dock has two deliberately separate identity boundaries:
 
-1. **Platform identity** controls the web UI, REST API, and future control-plane MCP server.
+1. **Platform identity** controls the web UI, REST API, and control-plane MCP server.
 2. **Provider identity** belongs to a single worker container and is used only by Codex, Claude Code, or OpenCode.
 
 A GitHub sign-in to the platform never becomes a provider credential, and provider OAuth files never leave their worker's private auth volume.
@@ -30,11 +30,12 @@ AUTH_OIDC_CLIENT_ID=your-client-id
 AUTH_OIDC_CLIENT_SECRET=your-client-secret
 AUTH_SESSION_SECRET=a-random-secret-containing-at-least-32-bytes
 AUTH_API_AUDIENCE=https://agents.example.com/api
+AUTH_MCP_AUDIENCE=https://agents.example.com/mcp
 AUTH_DEFAULT_ROLE=viewer
 AUTH_ADMIN_SUBJECTS=provider-subject-for-the-first-admin
 ```
 
-`AUTH_PUBLIC_ORIGIN` must be the exact browser-facing origin. If the local Compose port changes, change this value and `AUTH_API_AUDIENCE` as well.
+`AUTH_PUBLIC_ORIGIN` must be the exact browser-facing origin. If the local Compose port changes, change this value, `AUTH_API_AUDIENCE`, and `AUTH_MCP_AUDIENCE` as well.
 
 The authorization server must issue signed JWT ID tokens, and API bearer tokens must be JWTs with `iss` equal to `AUTH_OIDC_ISSUER` and `aud` equal to `AUTH_API_AUDIENCE`. RS256, PS256, and ES256 are supported. Opaque access tokens are not accepted by this POC.
 
@@ -65,7 +66,7 @@ AUTH_OPERATOR_SUBJECTS=subject-3
 
 Email allowlists (`AUTH_ADMIN_EMAILS`, `AUTH_OPERATOR_EMAILS`) are supported for initial setup only when the issuer marks the email claim verified, but they are still weaker identifiers because email ownership and claims can change. Everyone else receives `AUTH_DEFAULT_ROLE`, which should normally remain `viewer`.
 
-The future control-plane MCP server will call this same verifier and permission service. Tokens carrying an `agent_id` claim are scope-only and never inherit a human role. Its tool registry will expose an intentionally smaller capability set: MCP administration, provider-auth operations, runtime mutation, and storage/volume mutation will not be registered as agent-callable MCP tools even for a broadly scoped agent token.
+The control-plane MCP server calls this same verifier and permission service. Tokens carrying an `agent_id` claim are scope-only and never inherit a human role. Its tool registry exposes an intentionally smaller capability set: MCP administration, provider-auth operations, runtime mutation, and storage/volume mutation are not registered as MCP tools even for a broadly scoped agent token.
 
 ## REST and MCP bearer tokens
 
@@ -75,7 +76,33 @@ Non-browser clients send an OIDC access token:
 Authorization: Bearer <audience-bound-jwt>
 ```
 
-Agent Dock publishes OAuth protected-resource metadata at `/.well-known/oauth-protected-resource`. Missing credentials receive `401` with a `WWW-Authenticate` challenge pointing to that document. The same discovery and audience rules are the foundation for the control-plane MCP transport.
+Agent Dock publishes REST protected-resource metadata at `/.well-known/oauth-protected-resource` and MCP metadata at `/.well-known/oauth-protected-resource/mcp`. Missing credentials receive `401` with a `WWW-Authenticate` challenge pointing to the corresponding document. A REST token cannot be replayed at MCP because the two resources use different audiences.
+
+## Control-plane MCP
+
+The Streamable HTTP endpoint is `${AUTH_PUBLIC_ORIGIN}/mcp`. It uses the official MCP TypeScript SDK, serves the current `2026-07-28` protocol, and retains its stateless compatibility path for 2025-era clients. It is deliberately unavailable in `trusted-local` mode: MCP requires `AUTH_MODE=oidc` and a bearer JWT whose audience is exactly `AUTH_MCP_AUDIENCE`.
+
+The registered safe tools are:
+
+| Tool | Capability |
+|---|---|
+| `list_agents` | List safe summaries of visible delegation targets |
+| `get_agent_status` | Read an allowed agent's wrapper status |
+| `submit_agent_task` | Queue work and return a durable control-plane task handle |
+| `get_agent_task` | Poll an owned or assigned task and read its normalized result/usage |
+| `cancel_agent_task` | Request cancellation of a task owned by the caller |
+
+Human viewers receive only the two read tools. Operators and administrators receive the task tools as well. An agent token must carry `agent_id`, the corresponding `fleet:read` and/or `tasks:execute` scope, and an explicit entry in `MCP_AGENT_POLICIES_JSON`. Both its visible tools and target agents are the intersection of the token scopes and that policy. No policy means no agent-callable tools.
+
+For example, this lets `researcher` inspect and delegate to two agents, with bounded fan-out and depth:
+
+```dotenv
+MCP_AGENT_POLICIES_JSON={"researcher":{"tools":["list_agents","get_agent_status","submit_agent_task","get_agent_task","cancel_agent_task"],"targetAgentIds":["analyst","writer"],"maxDepth":3,"maxConcurrent":2}}
+```
+
+Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. Delegation cycles, spoofed parent ownership, excessive depth, and per-caller concurrency overflow fail closed.
+
+The control plane does not yet mint or exchange third-party agent tokens. The configured authorization server must issue an MCP-audience JWT with the required `agent_id` and scopes. That is an identity-provider provisioning concern, separate from the provider subscription credential isolated in each worker.
 
 ## Control plane to worker authentication
 

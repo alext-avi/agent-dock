@@ -177,6 +177,7 @@ export function createAuthService(options = {}) {
   const publicOrigin = normalizeOrigin(options.publicOrigin ?? env.AUTH_PUBLIC_ORIGIN ?? 'http://127.0.0.1:3000');
   const providerName = options.providerName ?? env.AUTH_PROVIDER_NAME ?? 'GitHub';
   const apiAudience = options.apiAudience ?? env.AUTH_API_AUDIENCE ?? `${publicOrigin}/api`;
+  const mcpAudience = options.mcpAudience ?? env.AUTH_MCP_AUDIENCE ?? `${publicOrigin}/mcp`;
   const sessionTtlSeconds = Number(options.sessionTtlSeconds ?? env.AUTH_SESSION_TTL_SECONDS ?? 8 * 60 * 60);
   if (!Number.isInteger(sessionTtlSeconds) || sessionTtlSeconds < 300 || sessionTtlSeconds > 7 * 24 * 60 * 60) {
     throw new Error('AUTH_SESSION_TTL_SECONDS must be between 300 and 604800');
@@ -203,6 +204,8 @@ export function createAuthService(options = {}) {
     if (!issuer || !clientId) throw new Error('AUTH_OIDC_ISSUER and AUTH_OIDC_CLIENT_ID are required in oidc mode');
     if (!requestedScopeList.includes('openid')) throw new Error('AUTH_OIDC_SCOPES must include openid');
     if (typeof apiAudience !== 'string' || !apiAudience) throw new Error('AUTH_API_AUDIENCE is required in oidc mode');
+    if (typeof mcpAudience !== 'string' || !mcpAudience) throw new Error('AUTH_MCP_AUDIENCE is required in oidc mode');
+    secureEndpoint(mcpAudience, 'AUTH_MCP_AUDIENCE');
     if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
       throw new Error('AUTH_SESSION_SECRET must contain at least 32 bytes in oidc mode');
     }
@@ -256,9 +259,10 @@ export function createAuthService(options = {}) {
     return {
       type: claims.agent_id ? 'agent' : 'user',
       id: claims.agent_id ? `agent:${claims.agent_id}` : `oidc:${base64url(`${issuer}|${subject}`)}`,
+      agentId: claims.agent_id ? String(claims.agent_id) : null,
       subject,
       email: typeof claims.email === 'string' ? claims.email : null,
-      emailVerified: claims.email_verified === true,
+      emailVerified: claims.email_verified === true || claims.email_verified === 1,
       displayName: claims.name ?? claims.preferred_username ?? claims.email ?? subject,
       provider: providerName,
       authentication,
@@ -443,12 +447,33 @@ export function createAuthService(options = {}) {
     if (mode === 'trusted-local') return localPrincipal;
     const authorization = req.headers.authorization;
     if (authorization) {
-      const match = authorization.match(/^Bearer\s+(.+)$/i);
-      if (!match) throw httpError('Authorization header must use Bearer', 401);
-      return makePrincipal(await verifyJwt(match[1], { audience: apiAudience }), 'bearer');
+      return (await authenticateBearer(req, { audience: apiAudience })).principal;
     }
     const token = parseCookies(req.headers.cookie).get(sessionCookieName);
     return readSession(token);
+  }
+
+  async function authenticateBearer(req, { audience = apiAudience } = {}) {
+    if (mode !== 'oidc') throw httpError('Bearer authentication requires AUTH_MODE=oidc', 503);
+    const authorization = req.headers.authorization;
+    const match = authorization?.match(/^Bearer\s+(.+)$/i);
+    if (!match) throw httpError('Authorization header must use Bearer', 401);
+    const token = match[1];
+    const claims = await verifyJwt(token, { audience });
+    const principal = makePrincipal(claims, 'bearer');
+    const clientId = String(claims.client_id ?? claims.azp ?? claims.sub ?? 'unknown');
+    const scopes = scopesFromClaims(claims);
+    return {
+      principal,
+      authInfo: {
+        token,
+        clientId,
+        scopes,
+        ...(Number.isFinite(claims.exp) ? { expiresAt: claims.exp } : {}),
+        resource: new URL(audience),
+        extra: { principal }
+      }
+    };
   }
 
   function allows(principal, permission) {
@@ -577,7 +602,9 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     providerName,
     publicOrigin,
     apiAudience,
+    mcpAudience,
     authenticate,
+    authenticateBearer,
     allows,
     checkCsrf,
     permissionForRequest,
@@ -589,22 +616,22 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     revokeSession,
     clearSessionCookie: () => sessionCookie('', { clear: true }),
     close: () => sessionDb?.close(),
-    protectedResourceMetadata: () => ({
-      resource: apiAudience,
+    protectedResourceMetadata: (resourceIdentifier = apiAudience, scopes = [
+      'fleet:read',
+      'tasks:execute',
+      'schedules:manage',
+      'usage:refresh',
+      'agents:manage',
+      'mcp:manage',
+      'provider-auth:manage',
+      'runtime:manage',
+      'workspace:read',
+      'control:admin'
+    ]) => ({
+      resource: resourceIdentifier,
       authorization_servers: issuer ? [issuer] : [],
       bearer_methods_supported: ['header'],
-      scopes_supported: [
-        'fleet:read',
-        'tasks:execute',
-        'schedules:manage',
-        'usage:refresh',
-        'agents:manage',
-        'mcp:manage',
-        'provider-auth:manage',
-        'runtime:manage',
-        'workspace:read',
-        'control:admin'
-      ]
+      scopes_supported: scopes
     })
   };
 }

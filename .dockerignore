@@ -1,0 +1,9 @@
+.git
+.claude
+node_modules
+test
+docs
+workspace
+claude-workspace
+opencode-workspace
+npm-debug.log

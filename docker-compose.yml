@@ -2,7 +2,8 @@ services:
   control-plane:
     image: agent-dock-control-plane:${AGENT_DOCK_IMAGE_TAG:-local}
     build:
-      context: ./control-plane
+      context: .
+      dockerfile: control-plane/Dockerfile
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"
@@ -24,6 +25,7 @@ services:
       AUTH_SESSION_SECRET: ${AUTH_SESSION_SECRET:-}
       AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-28800}
       AUTH_API_AUDIENCE: ${AUTH_API_AUDIENCE:-http://127.0.0.1:3000/api}
+      AUTH_MCP_AUDIENCE: ${AUTH_MCP_AUDIENCE:-http://127.0.0.1:3000/mcp}
       AUTH_OIDC_RESOURCE: ${AUTH_OIDC_RESOURCE:-}
       AUTH_OIDC_SCOPES: ${AUTH_OIDC_SCOPES:-openid,profile,email}
       AUTH_DEFAULT_ROLE: ${AUTH_DEFAULT_ROLE:-viewer}
@@ -33,6 +35,12 @@ services:
       AUTH_OPERATOR_EMAILS: ${AUTH_OPERATOR_EMAILS:-}
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-1}
       SCHEDULER_INTERVAL_MS: ${SCHEDULER_INTERVAL_MS:-1000}
+      DELEGATION_DB_PATH: /control-data/delegations.sqlite
+      MCP_TASK_TIMEOUT_MS: ${MCP_TASK_TIMEOUT_MS:-3600000}
+      MCP_MAX_DELEGATION_DEPTH: ${MCP_MAX_DELEGATION_DEPTH:-4}
+      MCP_MAX_CONCURRENT_PER_CALLER: ${MCP_MAX_CONCURRENT_PER_CALLER:-4}
+      MCP_AGENT_POLICIES_JSON: ${MCP_AGENT_POLICIES_JSON:-{}}
+      MCP_ALLOWED_HOSTNAMES: ${MCP_ALLOWED_HOSTNAMES:-}
       RUNTIME_PROVISIONER: docker
       DOCKER_SOCKET_PATH: /var/run/docker.sock
       CODEX_WORKER_IMAGE: agent-dock-worker-codex:${AGENT_DOCK_IMAGE_TAG:-local}

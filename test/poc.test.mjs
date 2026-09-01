@@ -753,6 +753,24 @@ test('a runtime refresh is refused while a task is running and for unmanaged run
 // reports it somewhere no test watches and then drops the constraint, so the
 // field silently validates nothing while looking entirely normal. Compiling them
 // the way the browser does is the only cheap way to see it.
+// The wrapping key unwraps every stored credential, including ones belonging to
+// agents on other runtimes. A container that runs an agent is a container a
+// prompt injection can read `env` from, so the key crossing that boundary would
+// turn "protects a copied backup" into protecting nothing.
+test('the credential wrapping key is never given to a container that runs an agent', async () => {
+  const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  const services = compose.split(/\n  (?=[a-z][a-z-]*:\n)/);
+  for (const service of services) {
+    const name = service.trimStart().split(':')[0];
+    if (name === 'services' || name.startsWith('control-plane')) continue;
+    assert.ok(
+      !service.includes('CREDENTIAL_ENCRYPTION_KEY'),
+      `${name} is given CREDENTIAL_ENCRYPTION_KEY; only the control plane may hold it`
+    );
+  }
+  assert.ok(compose.includes('CREDENTIAL_ENCRYPTION_KEY'), 'the control plane is no longer given the key at all');
+});
+
 test('every form pattern compiles the way a browser compiles it', async () => {
   const markup = await readFile(new URL('../control-plane/public/index.html', import.meta.url), 'utf8');
   const patterns = [...markup.matchAll(/pattern="([^"]+)"/g)].map(([, value]) => value);

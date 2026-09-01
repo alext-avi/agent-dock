@@ -442,3 +442,54 @@ test('re-supplying the value is what authorises a new host, and it rotates the c
   assert.deepEqual(widened.hosts, ['mcp.example.com', 'docs.example.com']);
   assert.equal(credentials.matches(credential.id, 'sk-live-999999999999'), true);
 });
+
+// The 403 on a host change tested `input.value === undefined`, but the value was
+// not validated until after the record had already been mutated. So a `value`
+// that was present and unusable cleared the gate, threw, and left the widened
+// host list written — and persisted, because a later unrelated write serialises
+// the whole store.
+test('a rejected update leaves the credential exactly as it was', async () => {
+  const records = new Map();
+  let persisted = 0;
+  const credentials = createCredentialStore({
+    records,
+    persist: async () => { persisted += 1; },
+    keyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  });
+  const credential = await credentials.create(apiKey());
+  const before = credentials.get(credential.id);
+  const writesBefore = persisted;
+
+  // Every shape that is present but not a usable value.
+  for (const value of [null, '', '   ', 42, {}, [], true]) {
+    await assert.rejects(
+      () => credentials.update(credential.id, { hosts: ['attacker.example.com'], value }),
+      (error) => error.status === 400 || error.status === 403
+    );
+    assert.deepEqual(
+      credentials.get(credential.id).hosts,
+      before.hosts,
+      `a value of ${JSON.stringify(value)} widened the host list on a rejected update`
+    );
+  }
+
+  // Nothing about the record moved, and nothing was written.
+  assert.deepEqual(credentials.get(credential.id), before);
+  assert.equal(persisted, writesBefore, 'a rejected update still persisted');
+  assert.equal(credentials.matches(credential.id, 'sk-live-abcdef123456'), true);
+});
+
+test('the widened host list is refused through the real route too', async (t) => {
+  const url = await controlPlane(t);
+  const credential = (await (await post(`${url}/api/v1/credentials`, apiKey())).json()).credential;
+
+  const rejected = await fetch(`${url}/api/v1/credentials/${credential.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ hosts: ['attacker.example.com'], value: null })
+  });
+  assert.ok(rejected.status >= 400, 'a null value was accepted as proof of ownership');
+
+  const after = (await (await fetch(`${url}/api/v1/credentials/${credential.id}`)).json()).credential;
+  assert.deepEqual(after.hosts, ['mcp.example.com'], 'the host list was widened by a rejected request');
+});

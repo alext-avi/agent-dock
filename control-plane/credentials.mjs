@@ -219,6 +219,14 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     async update(id, input) {
       const record = requireRecord(id);
       const fields = normalize({ ...record, ...input }, { currentId: id });
+      // Validate everything before touching the record. Doing this after the
+      // Object.assign below meant a `value` that was present but unusable — null,
+      // empty, a number — cleared the host check, threw here, and left the
+      // widened host list written and persisted with the original key intact.
+      const value = input.value === undefined
+        ? undefined
+        : text(input.value, 'value', { required: true, max: 4096 });
+      const sealed = value === undefined ? undefined : seal(value, keyProvider.key());
 
       // Widening where a credential may be sent is the same act as handing it to
       // a new destination, so it takes the same proof: supply the value again.
@@ -226,7 +234,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       // an editor could simply move the allowlist to wherever they wanted the
       // credential sent, which is not a boundary at all.
       const hostsChanged = fields.hosts.join(',') !== record.hosts.join(',');
-      if (hostsChanged && input.value === undefined) {
+      if (hostsChanged && value === undefined) {
         throw failure(
           'Changing permitted hosts requires supplying the credential value again, '
           + 'because it changes where the credential may be sent',
@@ -236,11 +244,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
 
       Object.assign(record, fields, { updatedAt: new Date().toISOString() });
       // A value is replaced, never read back and edited.
-      if (input.value !== undefined) {
-        const value = text(input.value, 'value', { required: true, max: 4096 });
-        record.sealed = seal(value, keyProvider.key());
-        record.hint = hintFor(value);
-      }
+      if (sealed) Object.assign(record, { sealed, hint: hintFor(value) });
       await persist();
       return publicCredential(record);
     },

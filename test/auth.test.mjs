@@ -32,7 +32,9 @@ async function fakeIssuer(t) {
     email: 'admin@example.test',
     idTokenClaims: {},
     idTokenOptions: {},
-    jwks: [defaultJwk]
+    jwks: [defaultJwk],
+    tokenEndpointAuthMethods: ['client_secret_basic'],
+    tokenRequest: null
   };
   let issuer;
   const server = createServer(async (req, res) => {
@@ -44,7 +46,7 @@ async function fakeIssuer(t) {
         authorization_endpoint: new URL('authorize', issuer).href,
         token_endpoint: new URL('token', issuer).href,
         jwks_uri: new URL('jwks', issuer).href,
-        token_endpoint_auth_methods_supported: ['client_secret_basic'],
+        token_endpoint_auth_methods_supported: state.tokenEndpointAuthMethods,
         code_challenge_methods_supported: ['S256']
       }));
     }
@@ -56,6 +58,11 @@ async function fakeIssuer(t) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+      state.tokenRequest = {
+        authorization: req.headers.authorization ?? null,
+        clientId: body.get('client_id'),
+        clientSecret: body.get('client_secret')
+      };
       assert.equal(body.get('grant_type'), 'authorization_code');
       assert.ok(body.get('code_verifier'));
       const now = Math.floor(Date.now() / 1000);
@@ -349,6 +356,87 @@ test('OIDC login uses PKCE, creates a signed secure session, and enforces CSRF a
   response = await fetch(`${url}/api/v1/agents`, { headers: { cookie: tampered } });
   assert.equal(response.status, 401);
   assert.match(response.headers.get('www-authenticate'), /oauth-protected-resource/);
+});
+
+test('durable loopback OIDC profile preserves PKCE, sessions, CSRF, and resource audiences', async (t) => {
+  const identity = await fakeIssuer(t);
+  const publicOrigin = 'http://127.0.0.1:8787';
+  const { url } = await startOidcControl(t, identity, {
+    publicOrigin,
+    apiAudience: `${publicOrigin}/api`,
+    mcpAudience: `${publicOrigin}/mcp`,
+    resource: `${publicOrigin}/api`
+  });
+
+  let response = await fetch(`${url}/auth/login?returnTo=%2Fjobs`, { redirect: 'manual' });
+  assert.equal(response.status, 302);
+  const authorization = new URL(response.headers.get('location'));
+  assert.equal(authorization.searchParams.get('redirect_uri'), `${publicOrigin}/auth/callback`);
+  assert.equal(authorization.searchParams.get('resource'), `${publicOrigin}/api`);
+  assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256');
+  identity.state.nonce = authorization.searchParams.get('nonce');
+
+  response = await fetch(
+    `${url}/auth/callback?code=test-code&state=${encodeURIComponent(authorization.searchParams.get('state'))}`,
+    { redirect: 'manual' }
+  );
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), '/jobs');
+  const setCookie = response.headers.get('set-cookie');
+  const cookie = setCookie.split(';')[0];
+  assert.match(setCookie, /^agent_dock_session=/);
+  assert.doesNotMatch(setCookie, /; Secure/);
+  assert.match(setCookie, /; HttpOnly/);
+  assert.match(setCookie, /; SameSite=Lax/);
+
+  response = await fetch(`${url}/api/v1/session`, { headers: { cookie } });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).authentication.principal.roles, ['admin']);
+
+  response = await fetch(`${url}/api/v1/agents`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'content-type': 'application/json',
+      'x-agent-dock-csrf': '1',
+      origin: publicOrigin
+    },
+    body: JSON.stringify({ name: 'Loopback authorized agent', runtime: { mode: 'unprovisioned' } })
+  });
+  assert.equal(response.status, 201);
+
+  response = await fetch(`${url}/api/v1/agents`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'content-type': 'application/json',
+      'x-agent-dock-csrf': '1',
+      origin: 'http://127.0.0.1:8788'
+    },
+    body: JSON.stringify({ name: 'Wrong loopback origin' })
+  });
+  assert.equal(response.status, 403);
+
+  const metadata = await (await fetch(`${url}/.well-known/oauth-protected-resource`)).json();
+  assert.equal(metadata.resource, `${publicOrigin}/api`);
+  assert.deepEqual(metadata.authorization_servers, [identity.issuer]);
+  const mcpMetadata = await (await fetch(`${url}/.well-known/oauth-protected-resource/mcp`)).json();
+  assert.equal(mcpMetadata.resource, `${publicOrigin}/mcp`);
+});
+
+test('OIDC supports explicit client_secret_post for providers that register body credentials', async (t) => {
+  const identity = await fakeIssuer(t);
+  identity.state.tokenEndpointAuthMethods = ['none', 'client_secret_basic', 'client_secret_post'];
+  const { url } = await startOidcControl(t, identity, {
+    tokenEndpointAuthMethod: 'client_secret_post'
+  });
+
+  await signIn(url, identity);
+  assert.deepEqual(identity.state.tokenRequest, {
+    authorization: null,
+    clientId: 'agent-dock-test-client',
+    clientSecret: 'test-client-secret'
+  });
 });
 
 test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer tokens', async (t) => {

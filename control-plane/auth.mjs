@@ -193,6 +193,9 @@ export function createAuthService(options = {}) {
   const issuer = mode === 'oidc' ? normalizeIssuer(options.issuer ?? env.AUTH_OIDC_ISSUER) : null;
   const clientId = options.clientId ?? env.AUTH_OIDC_CLIENT_ID ?? null;
   const clientSecret = options.clientSecret ?? env.AUTH_OIDC_CLIENT_SECRET ?? null;
+  const tokenEndpointAuthMethod = options.tokenEndpointAuthMethod
+    ?? env.AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD
+    ?? 'auto';
   const requestedScopeList = list(options.scopes ?? env.AUTH_OIDC_SCOPES ?? 'openid,profile,email');
   const requestedScopes = requestedScopeList.join(' ');
   const resource = options.resource ?? env.AUTH_OIDC_RESOURCE ?? null;
@@ -219,6 +222,9 @@ export function createAuthService(options = {}) {
   if (mode === 'oidc') {
     if (!issuer || !clientId) throw new Error('AUTH_OIDC_ISSUER and AUTH_OIDC_CLIENT_ID are required in oidc mode');
     if (!requestedScopeList.includes('openid')) throw new Error('AUTH_OIDC_SCOPES must include openid');
+    if (!['auto', 'client_secret_basic', 'client_secret_post', 'none'].includes(tokenEndpointAuthMethod)) {
+      throw new Error('AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be auto, client_secret_basic, client_secret_post, or none');
+    }
     if (typeof apiAudience !== 'string' || !apiAudience) throw new Error('AUTH_API_AUDIENCE is required in oidc mode');
     if (typeof mcpAudience !== 'string' || !mcpAudience) throw new Error('AUTH_MCP_AUDIENCE is required in oidc mode');
     secureEndpoint(mcpAudience, 'AUTH_MCP_AUDIENCE');
@@ -589,14 +595,23 @@ export function createAuthService(options = {}) {
     const headers = { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' };
     const supported = metadata.token_endpoint_auth_methods_supported ?? [];
     if (clientSecret) {
-      if (supported.includes('client_secret_basic') || !supported.length) {
+      const method = tokenEndpointAuthMethod === 'auto'
+        ? (supported.includes('client_secret_basic') || !supported.length ? 'client_secret_basic' : 'client_secret_post')
+        : tokenEndpointAuthMethod;
+      if (method === 'none') {
+        throw new Error('AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none cannot be combined with AUTH_OIDC_CLIENT_SECRET');
+      }
+      if (supported.length && !supported.includes(method)) {
+        throw new Error(`OIDC token endpoint does not support ${method}`);
+      }
+      if (method === 'client_secret_basic') {
         headers.authorization = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
-      } else if (supported.includes('client_secret_post')) {
+      } else if (method === 'client_secret_post') {
         body.set('client_secret', clientSecret);
       } else {
         throw new Error('OIDC token endpoint does not support the configured client-secret authentication');
       }
-    } else if (supported.length && !supported.includes('none')) {
+    } else if (tokenEndpointAuthMethod !== 'none' && supported.length && !supported.includes('none')) {
       throw new Error('OIDC token endpoint requires client authentication but AUTH_OIDC_CLIENT_SECRET is empty');
     }
     if (resource) body.set('resource', resource);

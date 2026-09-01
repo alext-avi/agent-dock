@@ -13,6 +13,26 @@ A GitHub sign-in to the platform never becomes a provider credential, and provid
 
 `AUTH_MODE=oidc` enables OpenID Connect Authorization Code flow with PKCE. Use an OIDC authorization server that can federate GitHub identities, such as WorkOS AuthKit or Auth0. Direct GitHub OAuth is not an OIDC issuer and cannot be placed in `AUTH_OIDC_ISSUER`.
 
+### Durable local OIDC deployment
+
+A single-workstation installation does not need a public tunnel. Use `http://127.0.0.1:8787` as the stable browser, REST, and MCP origin and keep `CONTROL_PLANE_BIND=127.0.0.1`. WorkOS staging environments allow HTTP loopback redirect URIs for local development. Register these exact values:
+
+```text
+Redirect URI:       http://127.0.0.1:8787/auth/callback
+API resource:       http://127.0.0.1:8787/api
+MCP resource:       http://127.0.0.1:8787/mcp
+```
+
+Enable CIMD and DCR in WorkOS Connect and make the MCP resource the default. The GitHub OAuth application's callback remains the WorkOS-provided HTTPS callback; only WorkOS's return to Agent Dock uses loopback.
+
+Copy [`.env.local-oidc.example`](../.env.local-oidc.example) to `.env.local-oidc`, fill in its placeholders, and start Compose with:
+
+```sh
+docker compose --env-file .env.local-oidc up --build -d
+```
+
+The local secrets file is ignored by Git. HTTP is accepted only because the origin is loopback; the session cookie remains HTTP-only and SameSite=Lax but omits `Secure`. This profile is a durable local deployment, not an internet- or LAN-facing production configuration. Any non-loopback deployment must use a stable HTTPS origin and a separately registered provider configuration.
+
 Register this callback URI with the authorization server:
 
 ```text
@@ -28,6 +48,7 @@ AUTH_PROVIDER_NAME=GitHub
 AUTH_OIDC_ISSUER=https://your-authorization-server.example.com/
 AUTH_OIDC_CLIENT_ID=your-client-id
 AUTH_OIDC_CLIENT_SECRET=your-client-secret
+AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=auto
 AUTH_SESSION_SECRET=a-random-secret-containing-at-least-32-bytes
 AUTH_API_AUDIENCE=https://agents.example.com/api
 AUTH_MCP_AUDIENCE=https://agents.example.com/mcp
@@ -39,6 +60,8 @@ AUTH_ADMIN_SUBJECTS=provider-subject-for-the-first-admin
 
 The authorization server must issue signed JWT ID tokens, and API bearer tokens must be JWTs with `iss` equal to `AUTH_OIDC_ISSUER` and `aud` equal to `AUTH_API_AUDIENCE`. RS256, PS256, and ES256 are supported. Opaque access tokens are not accepted by this POC.
 
+`AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD` defaults to `auto`, which prefers `client_secret_basic` when the issuer supports it. Set it to `client_secret_post` for a confidential WorkOS Connect application. Public/native clients use `none` and leave `AUTH_OIDC_CLIENT_SECRET` empty. Agent Dock rejects methods the issuer does not advertise.
+
 ## Sessions and request protection
 
 The browser login uses state, nonce, and PKCE S256. Agent Dock verifies the token signature against the issuer's JWKS plus its issuer, audience, expiry, and nonce claims.
@@ -49,7 +72,7 @@ Unsafe browser API requests must send `x-agent-dock-csrf: 1`. The bundled client
 
 ## Roles and permissions
 
-Roles are computed on every request, so changes to an allowlist take effect for existing sessions:
+Roles are computed on every request. Allowlist changes apply to existing sessions after the control plane reloads its deployment configuration (currently by restarting the process/container):
 
 | Role | Permissions |
 |---|---|

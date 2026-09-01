@@ -339,3 +339,66 @@ test('a definition cannot resolve the runtime\'s own transport token', async (t)
   assert.ok(!published.includes('a-real-connector-secret'), 'a resolved secret reached the public state');
   assert.ok(!published.includes('the-runtime-transport-secret'));
 });
+
+
+// The wiring test. Everything else about the namespace can be correct while the
+// worker still hands its whole environment to the MCP manager — that single line
+// has already been wrong twice in this branch's history, and every other test
+// here passes with the vulnerability reintroduced because they construct the
+// manager themselves. This one goes through the real factory and the real HTTP
+// route, so it fails if that line regresses.
+test('the worker resolves connector secrets only from the namespace, end to end', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-wiring-'));
+  const token = 'wiring-worker-token';
+
+  // A namespaced connector secret, and an unprefixed variable sitting right
+  // beside it in the same process environment — exactly the shape of the flaw.
+  process.env.MCP_SECRET_WIRING_TOKEN = 'namespaced-connector-value';
+  process.env.WIRING_BARE_TOKEN = 'must-not-be-resolvable';
+  t.after(async () => {
+    delete process.env.MCP_SECRET_WIRING_TOKEN;
+    delete process.env.WIRING_BARE_TOKEN;
+    await rm(temporary, { recursive: true, force: true });
+  });
+
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    agentId: 'wiring-test',
+    workspace: process.cwd(),
+    mcpStatePath: join(temporary, 'state.json'),
+    mcpConfigDir: temporary,
+    dataPath: null
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  const put = (servers) => fetch(`${workerUrl}/v1/mcp`, { method: 'PUT', headers, body: JSON.stringify({ servers }) });
+
+  const server = (name, sourceEnv) => ({
+    id: name,
+    name,
+    transport: 'http',
+    url: 'https://example.invalid/mcp',
+    secretHeaders: { Authorization: { sourceEnv, prefix: 'Bearer ' } }
+  });
+
+  // A variable outside the namespace must be unreachable even though it is
+  // present in this very process's environment.
+  const refused = await put([server('bare', 'WIRING_BARE_TOKEN')]);
+  assert.notEqual(refused.status, 200, 'an unprefixed variable resolved through the worker');
+  const refusedBody = await refused.text();
+  assert.match(refusedBody, /WIRING_BARE_TOKEN is not configured/);
+  assert.ok(!refusedBody.includes('must-not-be-resolvable'), 'the refusal disclosed the value it refused to use');
+
+  // The namespaced one resolves, so the mechanism is doing real work rather
+  // than refusing everything.
+  const accepted = await put([server('namespaced', 'WIRING_TOKEN')]);
+  assert.equal(accepted.status, 200, await accepted.text());
+
+  // And the resolved value never comes back out.
+  const inspected = await (await fetch(`${workerUrl}/v1/mcp`, { headers })).text();
+  assert.ok(!inspected.includes('namespaced-connector-value'), 'a resolved secret reached the wrapper API');
+});

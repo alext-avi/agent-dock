@@ -190,6 +190,7 @@ export function createAuthService(options = {}) {
   const requestedScopes = requestedScopeList.join(' ');
   const resource = options.resource ?? env.AUTH_OIDC_RESOURCE ?? null;
   const sessionSecret = options.sessionSecret ?? env.AUTH_SESSION_SECRET ?? null;
+  const localMcpToken = options.localMcpToken ?? env.AUTH_LOCAL_MCP_TOKEN ?? null;
   const sessionDbPath = options.sessionDbPath ?? env.AUTH_DB_PATH ?? ':memory:';
   const defaultRole = options.defaultRole ?? env.AUTH_DEFAULT_ROLE ?? 'viewer';
   const adminSubjects = new Set(list(options.adminSubjects ?? env.AUTH_ADMIN_SUBJECTS));
@@ -209,6 +210,9 @@ export function createAuthService(options = {}) {
     if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
       throw new Error('AUTH_SESSION_SECRET must contain at least 32 bytes in oidc mode');
     }
+  }
+  if (mode === 'trusted-local' && localMcpToken && Buffer.byteLength(localMcpToken) < 32) {
+    throw new Error('AUTH_LOCAL_MCP_TOKEN must contain at least 32 bytes when configured');
   }
 
   if (mode === 'oidc' && sessionDbPath !== ':memory:') mkdirSync(dirname(sessionDbPath), { recursive: true });
@@ -476,6 +480,31 @@ export function createAuthService(options = {}) {
     };
   }
 
+  async function authenticateMcpBearer(req) {
+    if (mode === 'oidc') return authenticateBearer(req, { audience: mcpAudience });
+    if (!localMcpToken) {
+      throw httpError('Control-plane MCP requires OIDC or an explicit trusted-local MCP token', 503);
+    }
+    const authorization = req.headers.authorization;
+    const match = authorization?.match(/^Bearer\s+(.+)$/i);
+    if (!match) throw httpError('Authorization header must use Bearer', 401);
+    const supplied = Buffer.from(match[1]);
+    const expected = Buffer.from(localMcpToken);
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+      throw httpError('Bearer token is invalid', 401);
+    }
+    return {
+      principal: localPrincipal,
+      authInfo: {
+        token: match[1],
+        clientId: 'local-codex',
+        scopes: localPrincipal.scopes,
+        resource: new URL(mcpAudience),
+        extra: { principal: localPrincipal }
+      }
+    };
+  }
+
   function allows(principal, permission) {
     if (!permission) return true;
     if (!principal) return false;
@@ -605,6 +634,7 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     mcpAudience,
     authenticate,
     authenticateBearer,
+    authenticateMcpBearer,
     allows,
     checkCsrf,
     permissionForRequest,

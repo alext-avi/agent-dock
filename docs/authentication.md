@@ -80,7 +80,25 @@ Agent Dock publishes REST protected-resource metadata at `/.well-known/oauth-pro
 
 ## Control-plane MCP
 
-The Streamable HTTP endpoint is `${AUTH_PUBLIC_ORIGIN}/mcp`. It uses the official MCP TypeScript SDK, serves the current `2026-07-28` protocol, and retains its stateless compatibility path for 2025-era clients. It is deliberately unavailable in `trusted-local` mode: MCP requires `AUTH_MODE=oidc` and a bearer JWT whose audience is exactly `AUTH_MCP_AUDIENCE`.
+The Streamable HTTP endpoint is `${AUTH_PUBLIC_ORIGIN}/mcp`. It uses the official MCP TypeScript SDK, serves the current `2026-07-28` protocol, and retains its stateless compatibility path for 2025-era clients. Shared and remote deployments require `AUTH_MODE=oidc` and a bearer JWT whose audience is exactly `AUTH_MCP_AUDIENCE`.
+
+For a laptop-only trusted-local deployment, set a separate random value of at least 32 bytes in `AUTH_LOCAL_MCP_TOKEN` and keep Compose published exclusively on `127.0.0.1`. Codex should read that value from its environment rather than storing the credential in `config.toml`:
+
+```sh
+codex mcp add agent-dock \
+  --url http://127.0.0.1:8787/mcp \
+  --bearer-token-env-var AGENT_DOCK_MCP_TOKEN
+```
+
+The equivalent Codex configuration is:
+
+```toml
+[mcp_servers.agent-dock]
+url = "http://127.0.0.1:8787/mcp"
+bearer_token_env_var = "AGENT_DOCK_MCP_TOKEN"
+```
+
+`AGENT_DOCK_MCP_TOKEN` and `AUTH_LOCAL_MCP_TOKEN` must contain the same value. The trusted-local token grants the MCP client local administrator capabilities, so do not reuse it as a worker or provider credential and never combine it with a non-loopback bind.
 
 The registered safe tools are:
 

@@ -26,7 +26,7 @@ The first boot of each agent can take a minute because its worker installs its o
 
 The control plane also stores scheduled jobs and their run history in SQLite on the `control-data` volume. Open **Jobs** from the top navigation to schedule a one-off job for later or choose a plain-language hourly, daily, weekday, weekly, or monthly cadence, inspect the next occurrence and history, edit the cadence, pause/resume, or run a job immediately. The UI translates recurring choices to five-field cron under the hood. Occurrence claiming is at-most-once, overlapping work is skipped for a busy agent, and each run retains duration, outcome, task ID, and normalized usage when the worker reports it. The contract and delivery semantics are documented in [`docs/scheduling.md`](./docs/scheduling.md).
 
-With OIDC enabled, the control plane also serves an authenticated MCP endpoint at `/mcp`. Its small safe-tool registry can list agents, read status, submit work, poll durable results, and cancel caller-owned tasks. Agent identities require an audience-bound JWT plus an explicit tool/target policy; trusted-local mode does not expose MCP. MCP configuration, provider credentials, runtime lifecycle, and storage/volume operations are intentionally absent. See [`docs/authentication.md`](./docs/authentication.md#control-plane-mcp).
+The control plane serves an authenticated MCP endpoint at `/mcp`. Its small safe-tool registry can list agents, read status, submit work, poll durable results, and cancel caller-owned tasks. Shared deployments use OIDC; laptop-only trusted-local deployments require a separate 32+ byte `AUTH_LOCAL_MCP_TOKEN`. Agent identities require an audience-bound JWT plus an explicit tool/target policy. MCP configuration, provider credentials, runtime lifecycle, and storage/volume operations are intentionally absent. See [`docs/authentication.md`](./docs/authentication.md#control-plane-mcp).
 
 Use **Tools & MCP** on an agent page to create a remote HTTP or local stdio MCP definition, attach a reusable definition, validate it against the selected harness, and apply the complete desired state. The control plane and all three workers use the same canonical payload in both directions; only the isolated worker translates it into Codex, Claude Code, or OpenCode configuration. Connector credentials are referenced by worker environment-variable name and never returned to the control plane. Local stdio MCP is denied unless its exact executable appears in `MCP_ALLOWED_COMMANDS` (comma-separated in `.env`).
 
@@ -96,7 +96,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 |---|---|---|
 | `GET` | `/.well-known/oauth-protected-resource` | OAuth resource metadata for the REST API resource |
 | `GET` | `/.well-known/oauth-protected-resource/mcp` | OAuth resource metadata for the separately audience-bound MCP resource |
-| `POST`, `GET`, `DELETE` | `/mcp` | Authenticated MCP Streamable HTTP transport; unavailable in trusted-local mode |
+| `POST`, `GET`, `DELETE` | `/mcp` | Authenticated MCP Streamable HTTP transport; OIDC remotely or a separate bearer token in trusted-local mode |
 | `GET` | `/api/v1/session` | Current platform principal, role, and authentication mode |
 | `GET` | `/api/v1/health` | Control-plane and worker reachability |
 | `GET` | `/api/v1/scheduler` | Scheduler storage, tick health, and active execution status |

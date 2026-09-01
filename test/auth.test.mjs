@@ -133,6 +133,85 @@ test('trusted-local mode provides an explicit local admin principal', async () =
   assert.equal(auth.allows(principal, 'mcp:manage'), true);
 });
 
+test('trusted-local MCP requires a separate strong bearer token', async () => {
+  assert.throws(
+    () => createAuthService({ mode: 'trusted-local', localMcpToken: 'too-short' }),
+    /at least 32 bytes/
+  );
+  const token = 'local-mcp-token-that-is-more-than-thirty-two-bytes';
+  const auth = createAuthService({ mode: 'trusted-local', localMcpToken: token });
+
+  await assert.rejects(
+    auth.authenticateMcpBearer({ headers: {} }),
+    (error) => error.status === 401 && /Bearer/.test(error.message)
+  );
+  await assert.rejects(
+    auth.authenticateMcpBearer({ headers: { authorization: 'Bearer wrong-token' } }),
+    (error) => error.status === 401 && /invalid/.test(error.message)
+  );
+  const authenticated = await auth.authenticateMcpBearer({ headers: { authorization: `Bearer ${token}` } });
+  assert.equal(authenticated.principal.id, 'local:operator');
+  assert.equal(authenticated.authInfo.clientId, 'local-codex');
+});
+
+test('trusted-local control-plane MCP is unavailable without its token and exposes tools with it', async (t) => {
+  const token = 'local-mcp-token-that-is-more-than-thirty-two-bytes';
+  const control = createControlPlane({
+    workerToken: 'test-worker-token',
+    dataPath: null,
+    schedulerEnabled: false,
+    auth: { mode: 'trusted-local', localMcpToken: token }
+  });
+  const url = await listen(control);
+  t.after(() => new Promise((resolve) => control.close(resolve)));
+  const request = (authorization) => ({
+    method: 'POST',
+    headers: {
+      ...(authorization ? { authorization } : {}),
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+
+  let response = await fetch(`${url}/mcp`, request());
+  assert.equal(response.status, 401);
+  response = await fetch(`${url}/mcp`, request(`Bearer ${token}`));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const data = text.split('\n').find((line) => line.startsWith('data: '));
+  const payload = JSON.parse(data ? data.slice(6) : text);
+  assert.deepEqual(payload.result.tools.map((tool) => tool.name).sort(), [
+    'cancel_agent_task',
+    'get_agent_status',
+    'get_agent_task',
+    'list_agents',
+    'submit_agent_task'
+  ]);
+});
+
+test('trusted-local control-plane MCP remains unavailable when no local token is configured', async (t) => {
+  const control = createControlPlane({
+    workerToken: 'test-worker-token',
+    dataPath: null,
+    schedulerEnabled: false,
+    auth: { mode: 'trusted-local' }
+  });
+  const url = await listen(control);
+  t.after(() => new Promise((resolve) => control.close(resolve)));
+  const response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 503);
+});
+
 test('route policy explicitly separates reads, execution, and privileged mutations', () => {
   const permission = (method, pathname) => authPermissions.permissionForRequest({ method }, new URL(pathname, 'https://dock.test'));
   assert.equal(permission('GET', '/api/v1/agents'), 'fleet:read');

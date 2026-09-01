@@ -1038,12 +1038,9 @@ export function createControlPlane(options = {}) {
   async function handleControlMcp(req, res, url) {
     if (url.pathname !== '/mcp') return false;
     if (!controlMcp.validate(req, res)) return true;
-    if (auth.mode !== 'oidc') {
-      return json(res, 503, { error: 'Control-plane MCP requires AUTH_MODE=oidc and a bearer token issued for the MCP audience' });
-    }
     let authenticated;
     try {
-      authenticated = await auth.authenticateBearer(req, { audience: auth.mcpAudience });
+      authenticated = await auth.authenticateMcpBearer(req);
     } catch (error) {
       if (error.status === 401) return mcpAuthenticationRequired(res, error.message);
       throw error;

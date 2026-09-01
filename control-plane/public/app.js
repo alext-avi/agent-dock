@@ -1241,9 +1241,21 @@ function renderMcp(result, definitions) {
     const refs = mcpSecretReferences(server);
     const meta = document.createElement('p');
     meta.className = 'mcp-meta';
-    meta.textContent = refs.length
-      ? `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`
-      : `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+    // A stored credential is not a connector-secret reference, and saying "no
+    // credential references" on a connector that plainly has one reads as a bug
+    // in the thing the operator just configured.
+    const credential = server.credentialId
+      ? storedCredentials.find((item) => item.id === server.credentialId)
+      : null;
+    if (refs.length) {
+      meta.textContent = `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
+    } else if (server.credentialId) {
+      meta.textContent = credential
+        ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
+        : `Credential ${server.credentialId} · no longer stored`;
+    } else {
+      meta.textContent = `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+    }
     const actions = document.createElement('div');
     actions.className = 'mcp-row-actions';
     const validate = document.createElement('button');
@@ -1279,10 +1291,14 @@ async function refreshMcp() {
   if (!currentAgent || mcpRefreshInFlight) return;
   mcpRefreshInFlight = true;
   try {
-    const [agentMcp, library] = await Promise.all([
+    const [agentMcp, library, credentials] = await Promise.all([
       api(agentApi('mcp')),
-      api(`${API_ROOT}/mcp/servers`)
+      api(`${API_ROOT}/mcp/servers`),
+      // A row names the credential it uses, so the panel needs them before it
+      // renders rather than only when the dialog opens.
+      api(`${API_ROOT}/credentials`).catch(() => null)
     ]);
+    if (credentials) storedCredentials = credentials.credentials;
     renderMcp(agentMcp, library.servers ?? []);
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
@@ -2245,6 +2261,7 @@ async function deleteCredential(credential) {
 async function syncCredentialOptions(selectedId = '') {
   try {
     const { credentials } = await api(`${API_ROOT}/credentials`);
+    storedCredentials = credentials;
     ui.mcpCredential.replaceChildren();
     const none = document.createElement('option');
     none.value = '';

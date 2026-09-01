@@ -384,8 +384,8 @@
         <input id="credential-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">CONNECTOR CREDENTIAL</p><h2 id="credential-dialog-title">New credential</h2></div><button id="close-credential-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">The value is write-only. Once saved it is never displayed or returned again — only the last four characters, so you can recognise a key you already hold.</p>
-        <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="company-docs"></label>
-        <label class="field">Header <span>the request header this key is sent in</span><input id="credential-header" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9-]*" placeholder="X-Api-Key"></label>
+        <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company-docs"></label>
+        <label class="field">Header <span>the request header this key is sent in</span><input id="credential-header" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="X-Api-Key"></label>
         <label class="field">Permitted hosts <span>one per line; a credential is only ever sent to these</span><textarea id="credential-hosts" rows="3" required placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
         <label class="field">Value <span id="credential-value-hint">pasted once, never shown again</span><input id="credential-value" type="password" autocomplete="off" maxlength="4096" placeholder="paste the key"></label>
         <p id="credential-message" class="usage-error hidden"></p>
@@ -402,7 +402,7 @@
         <div class="dialog-heading"><div><p class="kicker">WORKER CONNECTION</p><h2 id="mcp-dialog-title">New MCP server</h2></div><button id="close-mcp-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
         <div class="form-grid">
-          <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="company_docs"></label>
+          <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company_docs"></label>
           <label class="field">Transport<select id="mcp-transport"><option value="http">Remote HTTP</option><option value="stdio">Local stdio process</option></select></label>
         </div>
         <section id="mcp-http-fields" class="mcp-transport-fields">

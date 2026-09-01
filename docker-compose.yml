@@ -35,6 +35,10 @@ services:
       USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
       CLAUDE_OAUTH_USAGE: ${CLAUDE_OAUTH_USAGE:-0}
       CLAUDE_OAUTH_USAGE_INTERVAL_MS: ${CLAUDE_OAUTH_USAGE_INTERVAL_MS:-1800000}
+      # Wraps stored connector credentials. Without it the credentials page loads
+      # and refuses every write, which is the intended behaviour: no key is
+      # generated, because one generated here would sit beside what it protects.
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
     ports:
       - "${CONTROL_PLANE_PORT:-3000}:3000"
     volumes:
@@ -98,6 +102,10 @@ services:
       USAGE_POLL_INTERVAL_MS: ${USAGE_POLL_INTERVAL_MS:-60000}
       CLAUDE_OAUTH_USAGE: ${CLAUDE_OAUTH_USAGE:-0}
       CLAUDE_OAUTH_USAGE_INTERVAL_MS: ${CLAUDE_OAUTH_USAGE_INTERVAL_MS:-1800000}
+      # Wraps stored connector credentials. Without it the credentials page loads
+      # and refuses every write, which is the intended behaviour: no key is
+      # generated, because one generated here would sit beside what it protects.
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
       DISABLE_AUTOUPDATER: "1"
       BROWSER: echo
     volumes:

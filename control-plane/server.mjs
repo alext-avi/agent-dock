@@ -834,6 +834,21 @@ export function createControlPlane(options = {}) {
   // Replace a managed runtime's container with one built from the current image,
   // keeping its volumes so the agent stays authenticated. Without this the only
   // way to get new worker code onto an agent is to destroy its credentials.
+  // A recreated container is running before its worker is listening. Poll health
+  // rather than sleeping on a guess, and give up rather than hold the request open.
+  async function workerReady(agent, { attempts = 30, intervalMs = 500 } = {}) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const { response } = await workerFetch(agent, '/v1/health', { timeout: 2_000 });
+        if (response.ok) return true;
+      } catch {
+        // Not listening yet.
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw Object.assign(new Error('The replacement runtime did not become reachable'), { status: 504 });
+  }
+
   async function refreshAgentRuntime(req, res, agent) {
     if (!runtimeManager) {
       throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
@@ -873,9 +888,11 @@ export function createControlPlane(options = {}) {
     await persistAgents();
     // The replacement process holds no delivered credentials, and MCP state on
     // disk still names them. Re-applying restores the agent to the configuration
-    // the registry already claims it has.
+    // the registry already claims it has — but the container has only just been
+    // started, so wait for it to answer before asking it to do anything.
     let reapplied = null;
     try {
+      await workerReady(agent);
       await mcpService.applyAgent(agent.id);
       reapplied = true;
     } catch (error) {

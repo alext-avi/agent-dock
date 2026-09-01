@@ -609,3 +609,86 @@ test('the control plane refuses to apply a credential to a worker that cannot re
   assert.equal(binding.status, 409);
   assert.match((await binding.json()).error, /does not support control-plane delivered credentials/);
 });
+
+test('a runtime refresh re-delivers the credentials the replacement process lost', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-refresh-redeliver-'));
+  const configDir = join(temporary, 'worker-config');
+  const token = 'refresh-delivery-token';
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    mcpStatePath: join(temporary, 'state.json'),
+    mcpConfigDir: configDir
+  });
+  const workerUrl = await listen(worker);
+
+  // Recreating returns the same worker: the point is the control plane's own
+  // behaviour after a replacement, not Docker's.
+  const runtimeManager = {
+    currentImage: 'agent-dock-worker:v1',
+    async provision({ agentId, adapter }) {
+      return {
+        id: `runtime-${agentId}`,
+        workerId: 'refreshable',
+        workerUrl,
+        workerToken: token,
+        adapter,
+        managed: true,
+        dedicated: true,
+        binding: 'dedicated',
+        image: this.currentImage,
+        imageId: this.currentImage,
+        createdAt: new Date().toISOString()
+      };
+    },
+    async recreate(runtime) {
+      return { ...runtime, image: this.currentImage, imageId: this.currentImage, updatedAt: new Date().toISOString() };
+    },
+    async currentImageId() { return this.currentImage; },
+    async inspect() { return { state: 'running', health: 'healthy' }; },
+    async destroy() {}
+  };
+
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager,
+    dataPath: null,
+    credentialKeyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 5).toString('base64') })
+  });
+  const controlUrl = await listen(control);
+  t.after(async () => {
+    await Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+    await rm(temporary, { recursive: true, force: true });
+  });
+  const post = (pathname, body) => fetch(`${controlUrl}${pathname}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+
+  const agent = (await (await post('/api/v1/agents', {
+    name: 'Refreshable', adapter: 'claude-code', runtime: { mode: 'provision' }
+  })).json()).agent;
+  const credential = (await (await post('/api/v1/credentials', {
+    name: 'refresh-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-REDELIVERED'
+  })).json()).credential;
+  const definition = (await (await post('/api/v1/mcp/servers', {
+    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+  })).json()).server;
+  assert.equal((await post(`/api/v1/agents/${agent.id}/mcp/bindings`, { serverId: definition.id, apply: true })).status, 201);
+
+  // Stand in for the replacement process: the config is gone and the delivery
+  // with it. Nothing on disk changed, so the control plane still says 'applied'.
+  await rm(join(configDir, 'claude.json'));
+
+  const refresh = await post(`/api/v1/agents/${agent.id}/runtime/refresh`, {});
+  assert.equal(refresh.status, 200);
+  assert.equal((await refresh.json()).mcpReapplied, true, 'a refresh left the agent unable to configure its connectors');
+
+  const rendered = JSON.parse(await readFile(join(configDir, 'claude.json'), 'utf8'));
+  assert.equal(rendered.mcpServers.docs.headers['X-Api-Key'], 'sk-live-REDELIVERED');
+});

@@ -48,7 +48,7 @@ Each provider starts a fresh CLI process per task, so successful changes activat
 
 Local MCP commands are code execution inside the agent container. They are denied by default and must exactly match the worker's `MCP_ALLOWED_COMMANDS` allowlist. Allowlisting an interpreter such as `node`, `python`, or `bash` is equivalent to permitting arbitrary execution, because a definition's arguments are unconstrained — the allowlist bounds which binary runs, not what it does. Remote definitions reject embedded URL credentials.
 
-Connector secrets are provisioned into that one agent container under the `MCP_SECRET_` namespace, separately from the variables the worker uses to run. They are readable by the agent in that container: this design keeps a credential scoped to a single agent and revocable, but it is not confidentiality against the harness itself.
+Connector secrets are provisioned into that one agent container under the `MCP_SECRET_` namespace, separately from the variables the worker uses to run. The provisioner forwards that namespace and nothing else, so adding a connector credential means setting `MCP_SECRET_<NAME>` where the control plane runs and then provisioning or refreshing the runtime; no code change is needed for a new one. Bootstrap workers declared in `docker-compose.yml` need the variable added to that service explicitly, since Compose cannot forward a namespace. They are readable by the agent in that container: this design keeps a credential scoped to a single agent and revocable, but it is not confidentiality against the harness itself.
 
 ## Control-plane MCP privilege boundary
 

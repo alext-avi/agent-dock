@@ -90,6 +90,16 @@ function runtimeVolumes(runtimeId) {
   };
 }
 
+// The one namespace a runtime receives for MCP connector credentials. Anything
+// outside it — this process's own tokens and paths — is deliberately not passed.
+const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
+
+function connectorSecretEnvironment(environment = process.env) {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) => key.startsWith(CONNECTOR_SECRET_PREFIX) && key.length > CONNECTOR_SECRET_PREFIX.length)
+  );
+}
+
 function safeName(value) {
   return value.toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
 }
@@ -219,6 +229,10 @@ export class DockerRuntimeManager {
       AGENT_DATA_PATH: '/agent-data/usage.json',
       USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
       MCP_ALLOWED_COMMANDS: this.mcpAllowedCommands,
+      // Connector secrets are forwarded by namespace rather than enumerated, so
+      // adding one needs no code change. Only this prefix crosses into a runtime;
+      // the worker resolves definitions against exactly these and nothing else.
+      ...connectorSecretEnvironment(),
       [template.versionEnv]: version,
       ...template.environment
     };

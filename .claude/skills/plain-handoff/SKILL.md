@@ -22,6 +22,11 @@ not `resolveServers`. Use an identifier only if the reader will go looking for i
 counts, mutation results and review provenance are all reasons to trust the work, not
 the work itself. One line at the end is usually enough: "tests pass" beats a table.
 
+**Never give a bare number.** An issue or pull request reference always carries its
+title: "#26, connector credential types", not "#26". The number is a lookup key for
+someone who already knows the work; the title is the only part that means anything to a
+reader who does not. This applies to every mention, including ones in passing.
+
 **Say who has to act.** Separate "done, nothing needed from you" from "this is
 blocked on you". If a decision is needed, give the options as outcomes — what happens
 either way — not as implementation routes.
@@ -36,9 +41,13 @@ A few sentences. A short list if there are genuinely separate items. If it wants
 longer, that is usually a sign the reply is carrying detail that belongs in the
 artifacts instead.
 
-## When not to simplify
+## When there is more to say
 
-The reader asked for depth: a recommendation, a design discussion, an explanation of
-how something works or why a position is wrong, or a written comparison. Those are
-requests for substance and should get it. This skill governs the routine handoff, not
-every reply.
+A request for a recommendation, a design discussion, or an explanation deserves real
+substance — but substance is not the same as jargon, and a technical question is not a
+licence to answer in technical register. Give the reasoning in plain words: what the
+options mean, what each one costs, what you would choose. Product names, licence terms,
+version numbers and internal identifiers earn their place only if they change the
+decision.
+
+If a reply is turning into a survey, it has probably stopped answering the question.

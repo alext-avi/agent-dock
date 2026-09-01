@@ -279,16 +279,18 @@ test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer 
     headers: { authorization: `Bearer ${token}` }
   });
   const invalid = [
-    identity.issueAccessToken({ iss: 'https://evil.example.test/' }),
-    identity.issueAccessToken({ aud: 'https://wrong.example.test/api' }),
-    identity.issueAccessToken({ exp: now - 60 }),
-    identity.issueAccessToken({ exp: null }),
-    identity.issueAccessToken({ nbf: now + 60 }),
-    identity.issueAccessToken({}, { kid: 'missing-key' }),
-    identity.issueAccessToken({}, { algorithm: 'none' })
+    ['wrong issuer', identity.issueAccessToken({ iss: 'https://evil.example.test/' })],
+    ['wrong audience', identity.issueAccessToken({ aud: 'https://wrong.example.test/api' })],
+    ['expired', identity.issueAccessToken({ exp: now - 60 })],
+    ['missing expiry', identity.issueAccessToken({ exp: null })],
+    ['not active', identity.issueAccessToken({ nbf: now + 60 })],
+    ['unknown key', identity.issueAccessToken({}, { kid: 'missing-key' })],
+    ['unsupported algorithm', identity.issueAccessToken({}, { algorithm: 'none' })]
   ];
   const valid = identity.issueAccessToken();
-  invalid.push(`${valid.slice(0, -1)}${valid.endsWith('a') ? 'b' : 'a'}`);
+  const parts = valid.split('.');
+  parts[2] = `${parts[2][0] === 'A' ? 'B' : 'A'}${parts[2].slice(1)}`;
+  invalid.push(['forged signature', parts.join('.')]);
 
   const { publicKey: ecPublicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   identity.state.jwks.push({
@@ -297,11 +299,11 @@ test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer 
     alg: 'RS256',
     use: 'sig'
   });
-  invalid.push(identity.issueAccessToken({}, { kid: 'wrong-key-type' }));
+  invalid.push(['key type confusion', identity.issueAccessToken({}, { kid: 'wrong-key-type' })]);
 
-  for (const token of invalid) {
+  for (const [label, token] of invalid) {
     const response = await request(token);
-    assert.equal(response.status, 401);
+    assert.equal(response.status, 401, label);
   }
 });
 

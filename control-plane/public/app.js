@@ -25,6 +25,11 @@ const ui = {
   connectionLabel: $('#connection-label'),
   operatorName: $('#operator-name'),
   operatorRole: $('#operator-role'),
+  accessPolicyButton: $('#access-policy-button'),
+  accessPolicyDialog: $('#access-policy-dialog'),
+  accessIdentityName: $('#access-identity-name'),
+  accessIdentityProvider: $('#access-identity-provider'),
+  accessIdentityRole: $('#access-identity-role'),
   signOut: $('#sign-out'),
   agentGrid: $('#agent-grid'),
   emptyFleet: $('#empty-fleet'),
@@ -174,6 +179,7 @@ const ui = {
 };
 
 let running = false;
+let activeWorkerTaskId = null;
 let authPolling = null;
 let refreshingAuth = false;
 let currentAgent = null;
@@ -207,7 +213,12 @@ async function api(path, options = {}) {
       ...options.headers
     }
   });
-  if (response.status === 401) {
+  // A proxied agent can return 401 when its private worker credential is stale.
+  // Only the control plane's own protected-resource challenge means the
+  // operator session has expired; treating every upstream 401 as that signal
+  // traps the dashboard in a /login -> / refresh loop.
+  const authenticationChallenge = response.headers.get('www-authenticate') ?? '';
+  if (response.status === 401 && /\bresource_metadata\s*=/.test(authenticationChallenge)) {
     const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
     throw new Error('Authentication required');
@@ -225,6 +236,9 @@ async function loadPlatformSession() {
     if (!principal) return;
     ui.operatorName.textContent = principal.displayName;
     ui.operatorRole.textContent = principal.roles.join(' · ') || principal.provider;
+    ui.accessIdentityName.textContent = principal.displayName;
+    ui.accessIdentityProvider.textContent = [principal.email, principal.provider].filter(Boolean).join(' · ');
+    ui.accessIdentityRole.textContent = principal.roles.join(' · ') || 'scope only';
     ui.signOut.classList.toggle('hidden', authentication.mode !== 'oidc');
   } catch {
     // The API helper handles an expired session by returning to the login page.
@@ -1984,6 +1998,8 @@ function appendLine(kind, text) {
 }
 
 function appendEvent(event) {
+  if (event.type === 'task.started' && event.taskId) activeWorkerTaskId = event.taskId;
+  if (event.type === 'task.completed' && event.taskId === activeWorkerTaskId) activeWorkerTaskId = null;
   ui.rawOutput.textContent += `${JSON.stringify(event)}\n`;
   ui.rawOutput.scrollTop = ui.rawOutput.scrollHeight;
   if (event.type === 'usage.updated') renderUsage(event.data?.usage);
@@ -2035,6 +2051,7 @@ async function runTask() {
     ui.runMessage.textContent = error.message;
   } finally {
     running = false;
+    activeWorkerTaskId = null;
     ui.cancelButton.classList.add('hidden');
     await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders(), refreshMcp()]);
   }
@@ -2043,7 +2060,8 @@ async function runTask() {
 async function cancelRun() {
   ui.cancelButton.disabled = true;
   try {
-    await api(agentApi('tasks/cancel'), { method: 'POST', body: '{}' });
+    if (!activeWorkerTaskId) throw new Error('The worker has not reported a cancellable task yet');
+    await api(agentApi('tasks/cancel'), { method: 'POST', body: JSON.stringify({ taskId: activeWorkerTaskId }) });
     ui.runMessage.textContent = 'Cancelling…';
   } catch (error) {
     ui.runMessage.textContent = error.message;
@@ -2114,6 +2132,9 @@ ui.cancelButton.addEventListener('click', cancelRun);
 ui.refreshUsage.addEventListener('click', refreshUsage);
 ui.refreshAuth.addEventListener('click', refreshAuthentication);
 ui.signOut.addEventListener('click', signOut);
+ui.accessPolicyButton.addEventListener('click', () => ui.accessPolicyDialog.showModal());
+$('#close-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
+$('#dismiss-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
 $('#refresh-files').addEventListener('click', refreshWorkspace);
 $('#clear-output').addEventListener('click', () => {
   ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';

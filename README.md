@@ -26,6 +26,8 @@ The first boot of each agent can take a minute because its worker installs its o
 
 The control plane also stores scheduled jobs and their run history in SQLite on the `control-data` volume. Open **Jobs** from the top navigation to schedule a one-off job for later or choose a plain-language hourly, daily, weekday, weekly, or monthly cadence, inspect the next occurrence and history, edit the cadence, pause/resume, or run a job immediately. The UI translates recurring choices to five-field cron under the hood. Occurrence claiming is at-most-once, overlapping work is skipped for a busy agent, and each run retains duration, outcome, task ID, and normalized usage when the worker reports it. The contract and delivery semantics are documented in [`docs/scheduling.md`](./docs/scheduling.md).
 
+The control plane serves an authenticated MCP endpoint at `/mcp`. Its small safe-tool registry can list agents, read status, submit work, poll durable results, and cancel caller-owned tasks. Shared deployments use OIDC; laptop-only trusted-local deployments require a separate 32+ byte `AUTH_LOCAL_MCP_TOKEN`. Agent identities require an audience-bound JWT plus an explicit tool/target policy. MCP configuration, provider credentials, runtime lifecycle, and storage/volume operations are intentionally absent. See [`docs/authentication.md`](./docs/authentication.md#control-plane-mcp).
+
 Use **Tools & MCP** on an agent page to create a remote HTTP or local stdio MCP definition, attach a reusable definition, validate it against the selected harness, and apply the complete desired state. The control plane and all three workers use the same canonical payload in both directions; only the isolated worker translates it into Codex, Claude Code, or OpenCode configuration. Connector credentials are referenced by worker environment-variable name and never returned to the control plane. Local stdio MCP is denied unless its exact executable appears in `MCP_ALLOWED_COMMANDS` (comma-separated in `.env`).
 
 Claude Code is always launched with a worker-owned strict MCP file, including an empty file before its first connector is configured. OpenCode resolves its merged configuration before task start and disables MCP entries introduced outside Agent Dock's managed set; an unreadable or invalid merged configuration prevents the task from starting.
@@ -92,7 +94,9 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/.well-known/oauth-protected-resource` | OAuth resource metadata for REST and the future MCP transport |
+| `GET` | `/.well-known/oauth-protected-resource` | OAuth resource metadata for the REST API resource |
+| `GET` | `/.well-known/oauth-protected-resource/mcp` | OAuth resource metadata for the separately audience-bound MCP resource |
+| `POST`, `GET`, `DELETE` | `/mcp` | Authenticated MCP Streamable HTTP transport; OIDC remotely or a separate bearer token in trusted-local mode |
 | `GET` | `/api/v1/session` | Current platform principal, role, and authentication mode |
 | `GET` | `/api/v1/health` | Control-plane and worker reachability |
 | `GET` | `/api/v1/scheduler` | Scheduler storage, tick health, and active execution status |
@@ -112,7 +116,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `POST` | `/api/v1/agents/:id/auth/complete` | Forward a provider-issued one-time browser authorization code to a waiting CLI |
 | `POST` | `/api/v1/agents/:id/auth/refresh` | Ask the adapter to refresh its managed session |
 | `POST` | `/api/v1/agents/:id/tasks` | Run `{ "prompt": "..." }` with saved durable instructions; returns canonical NDJSON |
-| `POST` | `/api/v1/agents/:id/tasks/cancel` | Cancel the active task |
+| `POST` | `/api/v1/agents/:id/tasks/cancel` | Safely cancel `{ "taskId": "..." }` only if it is still active and the worker advertises targeted cancellation |
 | `GET` | `/api/v1/agents/:id/workspace` | List worker artifacts (not their contents) |
 | `GET` | `/api/v1/agents/:id/usage` | Read normalized request history, totals, quota windows, and account activity |
 | `POST` | `/api/v1/agents/:id/usage/refresh` | Ask the adapter to refresh its available usage sources |
@@ -154,7 +158,9 @@ The included Compose file retains one bootstrap worker for each adapter so schem
 
 That floor defaults to thirty minutes and is per worker process. Each agent has its own container and its own copy of the credential, so a fleet of agents signed in to one subscription still multiplies calls to that account by the number of agents; there is no shared cross-agent budget. The endpoint does throttle in practice — a fifty-four-minute `Retry-After` was observed while the floor was five minutes — so raise `CLAUDE_OAUTH_USAGE_INTERVAL_MS` further before running many Claude agents against a single account. When a backoff or the floor is in force, the agent page reports when the source will next be read rather than offering a refresh that cannot run.
 
-This prototype deliberately omits multi-tenancy, webhooks, automatic model fallback, usage-limit routing, TLS termination, remote secret management, egress controls, and container resource limits. Platform authentication now supports explicit trusted-local mode or OIDC with durable revocable sessions, centralized role policy, and audience-bound API tokens; organization membership synchronization, administrative session management, and multi-replica login transactions remain follow-ons. Scheduled jobs use a local SQLite database, but multi-replica leader election, retries beyond one attempt, webhook triggers, and an agent-facing MCP schedule surface remain follow-ons. The agent/runtime/MCP registry is still a single JSON file and the browser is vanilla JavaScript; migration of that registry behind the SQLite/Postgres-ready persistence boundary and a React/TypeScript frontend are separately tracked. Usage telemetry, agent configuration, schedules, and run history are durable; live event streams and test conversations are not.
+This prototype deliberately omits multi-tenancy, webhooks, automatic model fallback, usage-limit routing, TLS termination, remote secret management, egress controls, and container resource limits. Platform authentication now supports explicit trusted-local mode or OIDC with durable revocable sessions, centralized role policy, separately audience-bound API/MCP tokens, and a safe control-plane MCP delegation surface; organization membership synchronization, administrative session management, agent-token issuance/exchange, and multi-replica login transactions remain follow-ons. Scheduled jobs use a local SQLite database, but multi-replica leader election, retries beyond one attempt, webhook triggers, and an agent-facing MCP schedule surface remain follow-ons. The agent/runtime/MCP registry is still a single JSON file and the browser is vanilla JavaScript; migration of that registry behind the SQLite/Postgres-ready persistence boundary and a React/TypeScript frontend are separately tracked. Usage telemetry, agent configuration, schedules, delegated task results, and run history are durable; live event streams and test conversations are not.
+
+Delegation restart recovery currently assumes one control-plane process: startup fails abandoned in-flight rows rather than replaying them, but it has no replica lease or worker-orphan reconciliation yet ([#33](https://github.com/alext-avi/agent-dock/issues/33)). Durable delegation rows retain prompt and result text in local SQLite until an operator deletes the database; configurable retention, redaction, and content deletion are tracked in [#34](https://github.com/alext-avi/agent-dock/issues/34).
 
 The experimental Claude usage source is the one place a provider credential is read by Agent Dock code rather than only by the vendor CLI. That read happens inside the worker, against the worker's own private auth volume; the token is never returned, logged, persisted, or sent to the control plane or browser, and only normalized quota windows cross the wrapper. The response is reduced to the quota fields before anything is written to the telemetry volume, so the account and billing state it also carries is not retained at rest. It targets an endpoint Anthropic does not document and for which no third-party OAuth flow or scoped usage-only token exists, so it may break without notice and is disabled unless you set `CLAUDE_OAUTH_USAGE=1`. The account-profile endpoint, which returns names, email addresses, and organization identifiers, is deliberately not called.
 
@@ -162,13 +168,15 @@ Connector secrets for MCP servers are provisioned under the `MCP_SECRET_` namesp
 
 The control plane does not inspect or copy provider credentials, but the Docker host administrator can technically inspect container volumes. The CLI needs its auth volume to remain writable so refreshed tokens can be persisted. Each managed runtime has a unique random secret used to verify short-lived, scope- and worker-audience-bound workload JWTs minted by the control plane. Legacy bootstrap workers retain a hybrid static-token compatibility mode. These are transport credentials, not provider credentials. Mounting `/var/run/docker.sock` gives the local control plane host-level container authority. For remote deployment, isolate that authority behind a narrowly scoped provisioner, use OIDC behind TLS, move workload signing to asymmetric keys or a dedicated workload identity system, keep secrets in a secret manager, constrain network egress, run rootless containers, pin the CLI version and base image digest, and add CPU/memory/PID limits.
 
-The planned control-plane MCP server will use an explicit safe-tool registry. It will not expose MCP definition/binding/apply operations or storage, volume, and mount mutation operations, even though the operator REST/UI uses adjacent internal services. This separation is enforced in code rather than delegated to agent instructions.
+The control-plane MCP server uses an explicit safe-tool registry. It does not expose MCP definition/binding/apply operations or storage, volume, and mount mutation operations, even though the operator REST/UI uses adjacent internal services. This separation is enforced in code rather than delegated to agent instructions.
 
 Users and operators remain responsible for complying with applicable OpenAI terms and account rules. This project does not implement automatic account rollover or subscription provisioning.
 
 ## Development and test
 
-The application has no third-party JavaScript dependencies. Run the contract test with:
+The control-plane MCP transport uses the official Model Context Protocol SDK and Zod; versions and integrity
+metadata are locked in `package-lock.json`, and the production image installs runtime dependencies with
+`npm ci --omit=dev --ignore-scripts`. Run the contract test with:
 
 ```bash
 npm test

@@ -81,6 +81,6 @@ The create/edit dialog keeps cron out of the operator experience. A person can c
 
 Compose stores `/control-data/scheduler.sqlite` in the existing `control-data` volume. Override it with `SCHEDULER_DB_PATH`; change the one-second due-work poll with `SCHEDULER_INTERVAL_MS` (minimum 100 milliseconds), or set `SCHEDULER_ENABLED=0` to leave the API available without automatic dispatch. Scheduler status is also included in the control-plane health response so a failed tick is visible instead of silently stopping autonomous work.
 
-The scheduler requires Node.js 22 or newer for the built-in `node:sqlite` module. It introduces no third-party runtime package.
+The scheduler itself requires Node.js 22 or newer for the built-in `node:sqlite` module and adds no scheduler-specific package. The application also carries the official MCP SDK and Zod for the separate control-plane MCP transport; those packages are locked and installed without lifecycle scripts in the production image.
 
 The REST API currently has the same operator trust boundary as the rest of this POC. Scheduled-job MCP tools must wait for control-plane authentication and will be exposed through a narrow allowlist; MCP administration and storage/mount mutation remain explicitly excluded from that agent-facing surface.

@@ -184,6 +184,7 @@ export function createAuthService(options = {}) {
   const trustedLocalBind = options.trustedLocalBind ?? env.AUTH_TRUSTED_LOCAL_BIND ?? env.HOST ?? '127.0.0.1';
   const providerName = options.providerName ?? env.AUTH_PROVIDER_NAME ?? 'GitHub';
   const apiAudience = options.apiAudience ?? env.AUTH_API_AUDIENCE ?? `${publicOrigin}/api`;
+  const mcpAudience = options.mcpAudience ?? env.AUTH_MCP_AUDIENCE ?? `${publicOrigin}/mcp`;
   const sessionTtlSeconds = Number(options.sessionTtlSeconds ?? env.AUTH_SESSION_TTL_SECONDS ?? 8 * 60 * 60);
   if (!Number.isInteger(sessionTtlSeconds) || sessionTtlSeconds < 300 || sessionTtlSeconds > 7 * 24 * 60 * 60) {
     throw new Error('AUTH_SESSION_TTL_SECONDS must be between 300 and 604800');
@@ -192,10 +193,14 @@ export function createAuthService(options = {}) {
   const issuer = mode === 'oidc' ? normalizeIssuer(options.issuer ?? env.AUTH_OIDC_ISSUER) : null;
   const clientId = options.clientId ?? env.AUTH_OIDC_CLIENT_ID ?? null;
   const clientSecret = options.clientSecret ?? env.AUTH_OIDC_CLIENT_SECRET ?? null;
+  const tokenEndpointAuthMethod = options.tokenEndpointAuthMethod
+    ?? env.AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD
+    ?? 'auto';
   const requestedScopeList = list(options.scopes ?? env.AUTH_OIDC_SCOPES ?? 'openid,profile,email');
   const requestedScopes = requestedScopeList.join(' ');
   const resource = options.resource ?? env.AUTH_OIDC_RESOURCE ?? null;
   const sessionSecret = options.sessionSecret ?? env.AUTH_SESSION_SECRET ?? null;
+  const localMcpToken = options.localMcpToken ?? env.AUTH_LOCAL_MCP_TOKEN ?? null;
   const sessionDbPath = options.sessionDbPath ?? env.AUTH_DB_PATH ?? ':memory:';
   const defaultRole = options.defaultRole ?? env.AUTH_DEFAULT_ROLE ?? 'viewer';
   const adminSubjects = new Set(list(options.adminSubjects ?? env.AUTH_ADMIN_SUBJECTS));
@@ -217,10 +222,20 @@ export function createAuthService(options = {}) {
   if (mode === 'oidc') {
     if (!issuer || !clientId) throw new Error('AUTH_OIDC_ISSUER and AUTH_OIDC_CLIENT_ID are required in oidc mode');
     if (!requestedScopeList.includes('openid')) throw new Error('AUTH_OIDC_SCOPES must include openid');
+    if (!['auto', 'client_secret_basic', 'client_secret_post', 'none'].includes(tokenEndpointAuthMethod)) {
+      throw new Error('AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be auto, client_secret_basic, client_secret_post, or none');
+    }
     if (typeof apiAudience !== 'string' || !apiAudience) throw new Error('AUTH_API_AUDIENCE is required in oidc mode');
+    if (typeof mcpAudience !== 'string' || !mcpAudience) throw new Error('AUTH_MCP_AUDIENCE is required in oidc mode');
+    secureEndpoint(apiAudience, 'AUTH_API_AUDIENCE');
+    secureEndpoint(mcpAudience, 'AUTH_MCP_AUDIENCE');
+    if (apiAudience === mcpAudience) throw new Error('AUTH_API_AUDIENCE and AUTH_MCP_AUDIENCE must be different resources');
     if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
       throw new Error('AUTH_SESSION_SECRET must contain at least 32 bytes in oidc mode');
     }
+  }
+  if (mode === 'trusted-local' && localMcpToken && Buffer.byteLength(localMcpToken) < 32) {
+    throw new Error('AUTH_LOCAL_MCP_TOKEN must contain at least 32 bytes when configured');
   }
 
   if (mode === 'oidc' && sessionDbPath !== ':memory:') mkdirSync(dirname(sessionDbPath), { recursive: true });
@@ -255,22 +270,24 @@ export function createAuthService(options = {}) {
   let jwks = options.jwks ?? null;
   let jwksReadAt = jwks ? now() : 0;
 
-  function rolesFor(claims) {
+  function roleAssignmentFor(claims) {
     const subject = String(claims.sub ?? '');
     const email = claims.email_verified === true || claims.email_verified === 1
       ? String(claims.email ?? '').toLowerCase()
       : '';
-    if (adminSubjects.has(subject) || (email && adminEmails.has(email))) return ['admin'];
-    if (operatorSubjects.has(subject) || (email && operatorEmails.has(email))) return ['operator'];
-    return [defaultRole];
+    if (adminSubjects.has(subject) || (email && adminEmails.has(email))) return { roles: ['admin'], source: 'explicit' };
+    if (operatorSubjects.has(subject) || (email && operatorEmails.has(email))) return { roles: ['operator'], source: 'explicit' };
+    return { roles: [defaultRole], source: 'default' };
   }
 
   function makePrincipal(claims, authentication) {
     const subject = String(claims.sub ?? '');
     if (!subject) throw httpError('Identity token is missing sub', 401);
+    const assignment = claims.agent_id ? { roles: [], source: 'agent' } : roleAssignmentFor(claims);
     return {
       type: claims.agent_id ? 'agent' : 'user',
       id: claims.agent_id ? `agent:${claims.agent_id}` : `oidc:${base64url(`${issuer}|${subject}`)}`,
+      agentId: claims.agent_id ? String(claims.agent_id) : null,
       subject,
       email: typeof claims.email === 'string' ? claims.email : null,
       emailVerified: claims.email_verified === true || claims.email_verified === 1,
@@ -279,7 +296,8 @@ export function createAuthService(options = {}) {
       authentication,
       // Workload/agent identities are scope-only. They never inherit a human
       // role (including AUTH_DEFAULT_ROLE) from this control plane.
-      roles: claims.agent_id ? [] : rolesFor(claims),
+      roles: assignment.roles,
+      roleSource: assignment.source,
       scopes: scopesFromClaims(claims)
     };
   }
@@ -293,6 +311,7 @@ export function createAuthService(options = {}) {
     provider: 'Trusted local mode',
     authentication: 'trusted-local',
     roles: ['admin'],
+    roleSource: 'trusted-local',
     scopes: ['*']
   };
 
@@ -355,6 +374,9 @@ export function createAuthService(options = {}) {
     const seconds = Math.floor(now() / 1000);
     if (claims.iss !== issuer) throw httpError('JWT issuer is invalid', 401);
     if (!audienceMatches(claims.aud, audience)) throw httpError('JWT audience is invalid', 401);
+    if (authorizedParty === undefined && Array.isArray(claims.aud) && claims.aud.length !== 1) {
+      throw httpError('Resource JWT must identify exactly one audience', 401);
+    }
     if (authorizedParty !== undefined) {
       if (claims.azp !== undefined && claims.azp !== authorizedParty) throw httpError('JWT authorized party is invalid', 401);
       if (Array.isArray(claims.aud) && claims.aud.length > 1 && claims.azp !== authorizedParty) {
@@ -423,6 +445,7 @@ export function createAuthService(options = {}) {
       if (stored) sessionDb.prepare('DELETE FROM auth_sessions WHERE id = ?').run(value.sid);
       return null;
     }
+    const assignment = roleAssignmentFor({ sub: stored.subject, email: stored.email, email_verified: stored.email_verified });
     return {
       type: 'user',
       id: `oidc:${base64url(`${issuer}|${stored.subject}`)}`,
@@ -433,7 +456,8 @@ export function createAuthService(options = {}) {
       authentication: 'session',
       // Re-evaluate authorization policy for every request so removing a
       // subject from an allowlist takes effect without waiting for logout.
-      roles: rolesFor({ sub: stored.subject, email: stored.email, email_verified: stored.email_verified }),
+      roles: assignment.roles,
+      roleSource: assignment.source,
       scopes: []
     };
   }
@@ -461,12 +485,58 @@ export function createAuthService(options = {}) {
     if (mode === 'trusted-local') return localPrincipal;
     const authorization = req.headers.authorization;
     if (authorization) {
-      const match = authorization.match(/^Bearer\s+(.+)$/i);
-      if (!match) throw httpError('Authorization header must use Bearer', 401);
-      return makePrincipal(await verifyJwt(match[1], { audience: apiAudience }), 'bearer');
+      return (await authenticateBearer(req, { audience: apiAudience })).principal;
     }
     const token = parseCookies(req.headers.cookie).get(sessionCookieName);
     return readSession(token);
+  }
+
+  async function authenticateBearer(req, { audience = apiAudience } = {}) {
+    if (mode !== 'oidc') throw httpError('Bearer authentication requires AUTH_MODE=oidc', 503);
+    const authorization = req.headers.authorization;
+    const match = authorization?.match(/^Bearer\s+(.+)$/i);
+    if (!match) throw httpError('Authorization header must use Bearer', 401);
+    const token = match[1];
+    const claims = await verifyJwt(token, { audience });
+    const principal = makePrincipal(claims, 'bearer');
+    const clientId = String(claims.client_id ?? claims.azp ?? claims.sub ?? 'unknown');
+    const scopes = scopesFromClaims(claims);
+    return {
+      principal,
+      authInfo: {
+        token,
+        clientId,
+        scopes,
+        ...(Number.isFinite(claims.exp) ? { expiresAt: claims.exp } : {}),
+        resource: new URL(audience),
+        extra: { principal }
+      }
+    };
+  }
+
+  async function authenticateMcpBearer(req) {
+    if (mode === 'oidc') return authenticateBearer(req, { audience: mcpAudience });
+    if (!localMcpToken) {
+      throw httpError('Control-plane MCP requires OIDC or an explicit trusted-local MCP token', 503);
+    }
+    const authorization = req.headers.authorization;
+    const match = authorization?.match(/^Bearer\s+(.+)$/i);
+    if (!match) throw httpError('Authorization header must use Bearer', 401);
+    const supplied = Buffer.from(match[1]);
+    const expected = Buffer.from(localMcpToken);
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+      throw httpError('Bearer token is invalid', 401);
+    }
+    return {
+      principal: localPrincipal,
+      authInfo: {
+        token: match[1],
+        clientId: 'agent-dock-local-mcp',
+        scopes: localPrincipal.scopes,
+        resource: new URL(mcpAudience),
+        extra: { principal: localPrincipal }
+      }
+    };
   }
 
   function allows(principal, permission) {
@@ -474,6 +544,14 @@ export function createAuthService(options = {}) {
     if (!principal) return false;
     if (principal.scopes?.includes('*') || principal.scopes?.includes(permission)) return true;
     return principal.roles?.some((role) => ROLE_PERMISSIONS[role]?.has('*') || ROLE_PERMISSIONS[role]?.has(permission)) ?? false;
+  }
+
+  function allowsMcpPrincipal(principal) {
+    if (!principal) return false;
+    if (principal.type === 'agent') return true;
+    if (principal.authentication === 'trusted-local' || principal.roleSource === 'trusted-local') return true;
+    if (principal.roleSource === 'explicit') return true;
+    return principal.scopes?.some((scope) => ['*', 'fleet:read', 'tasks:execute'].includes(scope)) ?? false;
   }
 
   function checkCsrf(req, principal) {
@@ -535,14 +613,23 @@ export function createAuthService(options = {}) {
     const headers = { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' };
     const supported = metadata.token_endpoint_auth_methods_supported ?? [];
     if (clientSecret) {
-      if (supported.includes('client_secret_basic') || !supported.length) {
+      const method = tokenEndpointAuthMethod === 'auto'
+        ? (supported.includes('client_secret_basic') || !supported.length ? 'client_secret_basic' : 'client_secret_post')
+        : tokenEndpointAuthMethod;
+      if (method === 'none') {
+        throw new Error('AUTH_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none cannot be combined with AUTH_OIDC_CLIENT_SECRET');
+      }
+      if (supported.length && !supported.includes(method)) {
+        throw new Error(`OIDC token endpoint does not support ${method}`);
+      }
+      if (method === 'client_secret_basic') {
         headers.authorization = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
-      } else if (supported.includes('client_secret_post')) {
+      } else if (method === 'client_secret_post') {
         body.set('client_secret', clientSecret);
       } else {
         throw new Error('OIDC token endpoint does not support the configured client-secret authentication');
       }
-    } else if (supported.length && !supported.includes('none')) {
+    } else if (tokenEndpointAuthMethod !== 'none' && supported.length && !supported.includes('none')) {
       throw new Error('OIDC token endpoint requires client authentication but AUTH_OIDC_CLIENT_SECRET is empty');
     }
     if (resource) body.set('resource', resource);
@@ -595,8 +682,12 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     providerName,
     publicOrigin,
     apiAudience,
+    mcpAudience,
     authenticate,
+    authenticateBearer,
+    authenticateMcpBearer,
     allows,
+    allowsMcpPrincipal,
     checkCsrf,
     permissionForRequest,
     beginLogin,
@@ -607,22 +698,11 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     revokeSession,
     clearSessionCookie: () => sessionCookie('', { clear: true }),
     close: () => sessionDb?.close(),
-    protectedResourceMetadata: () => ({
-      resource: apiAudience,
+    protectedResourceMetadata: (resourceIdentifier = apiAudience, scopes = []) => ({
+      resource: resourceIdentifier,
       authorization_servers: issuer ? [issuer] : [],
       bearer_methods_supported: ['header'],
-      scopes_supported: [
-        'fleet:read',
-        'tasks:execute',
-        'schedules:manage',
-        'usage:refresh',
-        'agents:manage',
-        'mcp:manage',
-        'provider-auth:manage',
-        'runtime:manage',
-        'workspace:read',
-        'control:admin'
-      ]
+      ...(scopes.length ? { scopes_supported: scopes } : {})
     })
   };
 }

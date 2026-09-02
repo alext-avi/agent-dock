@@ -32,7 +32,9 @@ async function fakeIssuer(t) {
     email: 'admin@example.test',
     idTokenClaims: {},
     idTokenOptions: {},
-    jwks: [defaultJwk]
+    jwks: [defaultJwk],
+    tokenEndpointAuthMethods: ['client_secret_basic'],
+    tokenRequest: null
   };
   let issuer;
   const server = createServer(async (req, res) => {
@@ -44,7 +46,7 @@ async function fakeIssuer(t) {
         authorization_endpoint: new URL('authorize', issuer).href,
         token_endpoint: new URL('token', issuer).href,
         jwks_uri: new URL('jwks', issuer).href,
-        token_endpoint_auth_methods_supported: ['client_secret_basic'],
+        token_endpoint_auth_methods_supported: state.tokenEndpointAuthMethods,
         code_challenge_methods_supported: ['S256']
       }));
     }
@@ -56,6 +58,11 @@ async function fakeIssuer(t) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+      state.tokenRequest = {
+        authorization: req.headers.authorization ?? null,
+        clientId: body.get('client_id'),
+        clientSecret: body.get('client_secret')
+      };
       assert.equal(body.get('grant_type'), 'authorization_code');
       assert.ok(body.get('code_verifier'));
       const now = Math.floor(Date.now() / 1000);
@@ -119,6 +126,7 @@ async function startOidcControl(t, identity, overrides = {}) {
     workerToken: 'test-worker-token',
     dataPath: null,
     schedulerEnabled: false,
+    mcpAllowedHostnames: ['127.0.0.1'],
     auth
   });
   const url = await listen(control);
@@ -150,6 +158,85 @@ test('trusted-local mode provides an explicit local admin principal', async () =
   assert.equal(auth.allows(principal, 'mcp:manage'), true);
 });
 
+test('trusted-local MCP requires a separate strong bearer token', async () => {
+  assert.throws(
+    () => createAuthService({ mode: 'trusted-local', localMcpToken: 'too-short' }),
+    /at least 32 bytes/
+  );
+  const token = 'local-mcp-token-that-is-more-than-thirty-two-bytes';
+  const auth = createAuthService({ mode: 'trusted-local', localMcpToken: token });
+
+  await assert.rejects(
+    auth.authenticateMcpBearer({ headers: {} }),
+    (error) => error.status === 401 && /Bearer/.test(error.message)
+  );
+  await assert.rejects(
+    auth.authenticateMcpBearer({ headers: { authorization: 'Bearer wrong-token' } }),
+    (error) => error.status === 401 && /invalid/.test(error.message)
+  );
+  const authenticated = await auth.authenticateMcpBearer({ headers: { authorization: `Bearer ${token}` } });
+  assert.equal(authenticated.principal.id, 'local:operator');
+  assert.equal(authenticated.authInfo.clientId, 'agent-dock-local-mcp');
+});
+
+test('trusted-local control-plane MCP is unavailable without its token and exposes tools with it', async (t) => {
+  const token = 'local-mcp-token-that-is-more-than-thirty-two-bytes';
+  const control = createControlPlane({
+    workerToken: 'test-worker-token',
+    dataPath: null,
+    schedulerEnabled: false,
+    auth: { mode: 'trusted-local', localMcpToken: token }
+  });
+  const url = await listen(control);
+  t.after(() => new Promise((resolve) => control.close(resolve)));
+  const request = (authorization) => ({
+    method: 'POST',
+    headers: {
+      ...(authorization ? { authorization } : {}),
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+
+  let response = await fetch(`${url}/mcp`, request());
+  assert.equal(response.status, 401);
+  response = await fetch(`${url}/mcp`, request(`Bearer ${token}`));
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const data = text.split('\n').find((line) => line.startsWith('data: '));
+  const payload = JSON.parse(data ? data.slice(6) : text);
+  assert.deepEqual(payload.result.tools.map((tool) => tool.name).sort(), [
+    'cancel_agent_task',
+    'get_agent_status',
+    'get_agent_task',
+    'list_agents',
+    'submit_agent_task'
+  ]);
+});
+
+test('trusted-local control-plane MCP remains unavailable when no local token is configured', async (t) => {
+  const control = createControlPlane({
+    workerToken: 'test-worker-token',
+    dataPath: null,
+    schedulerEnabled: false,
+    auth: { mode: 'trusted-local' }
+  });
+  const url = await listen(control);
+  t.after(() => new Promise((resolve) => control.close(resolve)));
+  const response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 503);
+});
+
 test('trusted-local mode refuses non-loopback origins and externally published binds', () => {
   for (const trustedLocalBind of ['0.0.0.0', '::', '*', 'agents.example.test']) {
     assert.throws(
@@ -174,6 +261,24 @@ test('trusted-local mode refuses non-loopback origins and externally published b
     trustedLocalBind: '0.0.0.0'
   });
   oidc.close();
+});
+
+test('OIDC keeps API and MCP resource identifiers distinct and transport-safe', () => {
+  const identity = { issuer: 'https://issuer.example.test/' };
+  assert.throws(
+    () => createAuthService({
+      ...oidcOptions(identity),
+      mcpAudience: 'https://dock.example.test/api'
+    }),
+    /must be different resources/
+  );
+  assert.throws(
+    () => createAuthService({
+      ...oidcOptions(identity),
+      apiAudience: 'http://dock.example.test/api'
+    }),
+    /AUTH_API_AUDIENCE must use HTTPS/
+  );
 });
 
 test('return targets cannot escape the control-plane origin', () => {
@@ -271,6 +376,87 @@ test('OIDC login uses PKCE, creates a signed secure session, and enforces CSRF a
   assert.match(response.headers.get('www-authenticate'), /oauth-protected-resource/);
 });
 
+test('durable loopback OIDC profile preserves PKCE, sessions, CSRF, and resource audiences', async (t) => {
+  const identity = await fakeIssuer(t);
+  const publicOrigin = 'http://127.0.0.1:8787';
+  const { url } = await startOidcControl(t, identity, {
+    publicOrigin,
+    apiAudience: `${publicOrigin}/api`,
+    mcpAudience: `${publicOrigin}/mcp`,
+    resource: `${publicOrigin}/api`
+  });
+
+  let response = await fetch(`${url}/auth/login?returnTo=%2Fjobs`, { redirect: 'manual' });
+  assert.equal(response.status, 302);
+  const authorization = new URL(response.headers.get('location'));
+  assert.equal(authorization.searchParams.get('redirect_uri'), `${publicOrigin}/auth/callback`);
+  assert.equal(authorization.searchParams.get('resource'), `${publicOrigin}/api`);
+  assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256');
+  identity.state.nonce = authorization.searchParams.get('nonce');
+
+  response = await fetch(
+    `${url}/auth/callback?code=test-code&state=${encodeURIComponent(authorization.searchParams.get('state'))}`,
+    { redirect: 'manual' }
+  );
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), '/jobs');
+  const setCookie = response.headers.get('set-cookie');
+  const cookie = setCookie.split(';')[0];
+  assert.match(setCookie, /^agent_dock_session=/);
+  assert.doesNotMatch(setCookie, /; Secure/);
+  assert.match(setCookie, /; HttpOnly/);
+  assert.match(setCookie, /; SameSite=Lax/);
+
+  response = await fetch(`${url}/api/v1/session`, { headers: { cookie } });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).authentication.principal.roles, ['admin']);
+
+  response = await fetch(`${url}/api/v1/agents`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'content-type': 'application/json',
+      'x-agent-dock-csrf': '1',
+      origin: publicOrigin
+    },
+    body: JSON.stringify({ name: 'Loopback authorized agent', runtime: { mode: 'unprovisioned' } })
+  });
+  assert.equal(response.status, 201);
+
+  response = await fetch(`${url}/api/v1/agents`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'content-type': 'application/json',
+      'x-agent-dock-csrf': '1',
+      origin: 'http://127.0.0.1:8788'
+    },
+    body: JSON.stringify({ name: 'Wrong loopback origin' })
+  });
+  assert.equal(response.status, 403);
+
+  const metadata = await (await fetch(`${url}/.well-known/oauth-protected-resource`)).json();
+  assert.equal(metadata.resource, `${publicOrigin}/api`);
+  assert.deepEqual(metadata.authorization_servers, [identity.issuer]);
+  const mcpMetadata = await (await fetch(`${url}/.well-known/oauth-protected-resource/mcp`)).json();
+  assert.equal(mcpMetadata.resource, `${publicOrigin}/mcp`);
+});
+
+test('OIDC supports explicit client_secret_post for providers that register body credentials', async (t) => {
+  const identity = await fakeIssuer(t);
+  identity.state.tokenEndpointAuthMethods = ['none', 'client_secret_basic', 'client_secret_post'];
+  const { url } = await startOidcControl(t, identity, {
+    tokenEndpointAuthMethod: 'client_secret_post'
+  });
+
+  await signIn(url, identity);
+  assert.deepEqual(identity.state.tokenRequest, {
+    authorization: null,
+    clientId: 'agent-dock-test-client',
+    clientSecret: 'test-client-secret'
+  });
+});
+
 test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer tokens', async (t) => {
   const identity = await fakeIssuer(t);
   const { url } = await startOidcControl(t, identity);
@@ -281,6 +467,7 @@ test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer 
   const invalid = [
     ['wrong issuer', identity.issueAccessToken({ iss: 'https://evil.example.test/' })],
     ['wrong audience', identity.issueAccessToken({ aud: 'https://wrong.example.test/api' })],
+    ['multiple audiences', identity.issueAccessToken({ aud: ['https://dock.example.test/api', 'https://dock.example.test/mcp'], azp: 'agent-dock-test-client' })],
     ['expired', identity.issueAccessToken({ exp: now - 60 })],
     ['missing expiry', identity.issueAccessToken({ exp: null })],
     ['not active', identity.issueAccessToken({ nbf: now + 60 })],
@@ -428,4 +615,60 @@ test('audience-bound bearer tokens obey the same role and permission policy', as
   const metadata = await (await fetch(`${url}/.well-known/oauth-protected-resource`)).json();
   assert.equal(metadata.resource, 'https://dock.example.test/api');
   assert.deepEqual(metadata.authorization_servers, [identity.issuer]);
+
+  const mcpMetadata = await (await fetch(`${url}/.well-known/oauth-protected-resource/mcp`)).json();
+  assert.equal(mcpMetadata.resource, 'https://dock.example.test/mcp');
+  assert.equal('scopes_supported' in mcpMetadata, false, 'resource metadata must not advertise scopes unsupported by the OIDC issuer');
+
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${viewer}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 401, 'an API-audience token cannot be replayed at the MCP resource');
+
+  const mcpViewer = identity.issueAccessToken({ aud: 'https://dock.example.test/mcp' });
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${mcpViewer}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 403, 'a default role is not positive MCP authorization');
+  assert.match((await response.json()).error, /not explicitly authorized/);
+
+  const mcpOperator = identity.issueAccessToken({
+    aud: 'https://dock.example.test/mcp',
+    sub: 'operator-user'
+  });
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${mcpOperator}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'tools/list', params: {} })
+  });
+  assert.equal(response.status, 200);
+  const operatorText = await response.text();
+  const operatorData = operatorText.split('\n').find((line) => line.startsWith('data: '));
+  const operatorPayload = JSON.parse(operatorData ? operatorData.slice(6) : operatorText);
+  assert.deepEqual(operatorPayload.result.tools.map((tool) => tool.name).sort(), [
+    'cancel_agent_task',
+    'get_agent_status',
+    'get_agent_task',
+    'list_agents',
+    'submit_agent_task'
+  ]);
 });

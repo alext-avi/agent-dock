@@ -198,6 +198,77 @@ test('the whole fleet card is the link into its agent', async (t) => {
   assert.equal(await page.locator('.configure-link').count(), 0, 'the open-agent link returned to the fleet card');
 });
 
+test('the signed-in identity explains where authorization roles are configured', async (t) => {
+  const page = await openPage('/');
+  t.after(() => page.close());
+  await page.click('#access-policy-button');
+  await page.waitForFunction(() => document.querySelector('#access-policy-dialog')?.open === true);
+
+  const text = await page.locator('#access-policy-dialog').textContent();
+  assert.match(text, /not currently editable in this web interface/i);
+  assert.match(text, /AUTH_DEFAULT_ROLE/);
+  assert.match(text, /AUTH_OPERATOR_SUBJECTS/);
+  assert.match(text, /AUTH_ADMIN_SUBJECTS/);
+  assert.equal(await page.locator('#access-identity-role').textContent(), 'admin');
+  assert.match(text, /Read fleet, agent, schedule, usage, and runtime status/);
+});
+
+test('fleet cards choose useful columns and keep every fragment inside the viewport', async (t) => {
+  const page = await browser.newPage();
+  t.after(() => page.close());
+
+  for (const width of [1180, 980, 820, 640, 430]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`${app.url}/`);
+    await page.waitForSelector('a.agent-card');
+    const layout = await page.evaluate(() => ({
+      viewport: document.documentElement.clientWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      cards: [...document.querySelectorAll('.agent-card')].map((card) => ({
+        top: Math.round(card.getBoundingClientRect().top),
+        clientWidth: card.clientWidth,
+        scrollWidth: card.scrollWidth
+      }))
+    }));
+    assert.equal(layout.documentWidth, layout.viewport, `${width}px viewport has horizontal page overflow`);
+    for (const card of layout.cards) {
+      assert.ok(card.scrollWidth <= card.clientWidth + 1, `${width}px card contains an overflowing fragment`);
+    }
+    const firstRowCards = layout.cards.filter((card) => card.top === layout.cards[0].top).length;
+    assert.equal(firstRowCards, width >= 980 ? 2 : 1, `${width}px selected an awkward fleet column count`);
+  }
+});
+
+test('a worker 401 marks that agent offline without restarting the control-plane login flow', async (t) => {
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  const agent = app.agents['codex-cli'];
+  await page.route(`**/api/v1/agents/${agent.id}/status`, (route) => route.fulfill({
+    status: 401,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: 'Worker credential is stale' })
+  }));
+  let navigations = 0;
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) navigations += 1;
+  });
+
+  await page.goto(`${app.url}/`);
+  const card = page.locator(`a.agent-card[data-agent-id="${agent.id}"]`);
+  await card.waitFor();
+  await page.waitForFunction(
+    (id) => document.querySelector(`a.agent-card[data-agent-id="${id}"] .status-pill`)?.textContent === 'offline',
+    agent.id
+  );
+  // Wait across a live-update tick: a generic 401 used to navigate to /login,
+  // return here, and repeat every three seconds.
+  await page.waitForTimeout(3_500);
+
+  assert.equal(page.url(), `${app.url}/`);
+  assert.equal(navigations, 1, 'the worker response restarted the browser login flow');
+  assert.equal(await card.locator('.status-pill').textContent(), 'offline');
+});
+
 test('the harness picker keeps selection, highlight and submitted value in step', async (t) => {
   const page = await openPage('/');
   t.after(() => page.close());

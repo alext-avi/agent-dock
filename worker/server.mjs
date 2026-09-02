@@ -229,12 +229,22 @@ export function createWorkerServer(options = {}) {
   // endpoint, so the window source is only advertised when the operator opts in,
   // and it is labelled experimental so the UI never presents it as supported.
   const claudeUsageEnabled = config.adapterId === 'claude-code' && config.claudeOAuthUsage;
-  const capabilities = claudeUsageEnabled
+  const instanceCapabilities = claudeUsageEnabled
     ? {
         ...adapterManifest.capabilities,
         usage: { ...adapterManifest.capabilities.usage, quotaWindows: true, quotaWindowSource: 'experimental-oauth' }
       }
     : adapterManifest.capabilities;
+  const capabilities = {
+    ...instanceCapabilities,
+    tasks: {
+      ...instanceCapabilities.tasks,
+      // Older agent-wrapper/v1 workers accepted an optional taskId but did not
+      // advertise that behavior. The control plane must see this positive flag
+      // before it sends a cancellation that could otherwise kill unrelated work.
+      targetedCancellation: true
+    }
+  };
 
   const state = {
     startedAt: new Date().toISOString(),
@@ -1362,6 +1372,10 @@ export function createWorkerServer(options = {}) {
 
       if (req.method === 'POST' && route === '/v1/tasks/cancel') {
         if (!state.activeJob) return json(res, 404, wrapperResponse({ error: 'No active task' }));
+        const body = await readJson(req, 16 * 1024);
+        if (body.taskId !== undefined && body.taskId !== state.activeJob.id) {
+          return json(res, 409, wrapperResponse({ error: 'The requested task is no longer active' }));
+        }
         state.activeJob.cancelled = true;
         state.activeJob.child?.kill('SIGTERM');
         return json(res, 202, wrapperResponse({ task: { id: state.activeJob.id, status: 'cancelling' } }));

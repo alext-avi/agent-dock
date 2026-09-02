@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=7">
+    <link rel="stylesheet" href="/styles.css?v=8">
   </head>
   <body>
     <header class="topbar">
@@ -18,7 +18,9 @@
         <a class="nav-link" href="/jobs">Jobs</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
         <div id="operator-account" class="operator-account" aria-label="Signed-in operator">
-          <span><strong id="operator-name">Operator</strong><small id="operator-role">checking identity</small></span>
+          <button id="access-policy-button" class="operator-access" type="button" aria-haspopup="dialog" title="View access policy">
+            <span><strong id="operator-name">Operator</strong><small id="operator-role">checking identity</small></span>
+          </button>
           <button id="sign-out" class="operator-sign-out hidden" type="button">Sign out</button>
         </div>
       </div>
@@ -384,7 +386,31 @@
       </form>
     </dialog>
 
+    <dialog id="access-policy-dialog" class="access-policy-dialog">
+      <div class="dialog-heading"><div><p class="kicker">CONTROL PLANE ACCESS</p><h2>Authentication &amp; authorization</h2></div><button id="close-access-policy" class="icon-button" type="button" aria-label="Close">×</button></div>
+      <p class="dialog-copy">WorkOS and GitHub prove identity. Agent Dock assigns permissions locally from control-plane deployment configuration; roles are not currently editable in this web interface.</p>
+      <section class="access-identity" aria-label="Current access">
+        <div><span>CURRENT IDENTITY</span><strong id="access-identity-name">Operator</strong><small id="access-identity-provider">Checking provider</small></div>
+        <div><span>ASSIGNED ROLE</span><strong id="access-identity-role">—</strong><small>Re-evaluated on every request</small></div>
+      </section>
+      <section class="access-config">
+        <h3>Where roles are configured</h3>
+        <p>Edit the control plane's environment file—for this local profile, <code>.env.local-oidc</code>—then restart the control-plane container. Prefer immutable provider subjects; verified-email lists are intended for bootstrap.</p>
+        <dl>
+          <div><dt>Default</dt><dd><code>AUTH_DEFAULT_ROLE</code></dd></div>
+          <div><dt>Operators</dt><dd><code>AUTH_OPERATOR_SUBJECTS</code> or <code>AUTH_OPERATOR_EMAILS</code></dd></div>
+          <div><dt>Administrators</dt><dd><code>AUTH_ADMIN_SUBJECTS</code> or <code>AUTH_ADMIN_EMAILS</code></dd></div>
+        </dl>
+      </section>
+      <section class="access-roles" aria-label="Role permissions">
+        <article><span>VIEWER</span><strong>Observe</strong><p>Read fleet, agent, schedule, usage, and runtime status.</p></article>
+        <article><span>OPERATOR</span><strong>Operate</strong><p>Viewer access plus tasks, schedules, and usage refresh.</p></article>
+        <article><span>ADMIN</span><strong>Configure</strong><p>All UI and REST operations, including agents, runtimes, provider auth, MCP, and workspaces.</p></article>
+      </section>
+      <div class="actions dialog-actions"><button id="dismiss-access-policy" class="button primary" type="button">Done</button></div>
+    </dialog>
+
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=9"></script>
+    <script type="module" src="/app.js?v=10"></script>
   </body>
 </html>

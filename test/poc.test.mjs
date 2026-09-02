@@ -479,6 +479,122 @@ test('worker rejects unauthenticated direct API calls', async (t) => {
   assert.equal((await response.json()).apiVersion, 'agent-wrapper/v1');
 });
 
+test('worker advertises targeted cancellation and rejects a stale task id', async (t) => {
+  const token = 'targeted-cancel-secret';
+  const worker = createWorkerServer({ token, demoMode: true, workspace: process.cwd() });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+  const taskResponse = fetch(`${workerUrl}/v1/tasks`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ prompt: 'remain active long enough to cancel' })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  let response = await fetch(`${workerUrl}/v1/status`, { headers: { authorization: `Bearer ${token}` } });
+  const status = await response.json();
+  assert.equal(status.capabilities.tasks.targetedCancellation, true);
+  assert.ok(status.task.active?.id);
+
+  response = await fetch(`${workerUrl}/v1/tasks/cancel`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ taskId: 'a-stale-task-id' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /no longer active/);
+
+  const events = (await (await taskResponse).text()).trim().split('\n').map(JSON.parse);
+  assert.equal(events.at(-1).data.status, 'succeeded', 'a stale cancellation must not affect the active task');
+});
+
+test('delegation refuses targeted cancellation against a legacy worker capability set', async (t) => {
+  const token = 'legacy-worker-secret';
+  let cancelCalls = 0;
+  const legacyWorker = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      res.statusCode = 401;
+      return res.end(JSON.stringify({ error: 'unauthorized' }));
+    }
+    if (req.method === 'GET' && req.url === '/v1/status') {
+      return res.end(JSON.stringify({
+        apiVersion: 'agent-wrapper/v1',
+        capabilities: { tasks: { cancellation: true } },
+        task: { active: { id: 'worker-task', status: 'running' } }
+      }));
+    }
+    if (req.method === 'POST' && req.url === '/v1/tasks/cancel') cancelCalls += 1;
+    res.statusCode = 404;
+    return res.end(JSON.stringify({ error: 'not found' }));
+  });
+  const workerUrl = await listen(legacyWorker);
+  let finish;
+  const control = createControlPlane({
+    workerUrl,
+    workerToken: token,
+    dataPath: null,
+    schedulerEnabled: false,
+    delegationDispatch: (task, context) => {
+      context.reportWorkerTaskId('worker-task');
+      return new Promise((resolve) => { finish = resolve; });
+    }
+  });
+  await listen(control);
+  t.after(async () => {
+    finish?.({ status: 'succeeded' });
+    await new Promise((resolve) => control.close(resolve));
+    await new Promise((resolve) => legacyWorker.close(resolve));
+  });
+
+  const caller = { id: 'oidc:user', type: 'user', agentId: null, isAdmin: false };
+  const submitted = control.delegation.submit({ targetAgentId: 'worker-01', prompt: 'legacy cancellation test' }, caller);
+  await assert.rejects(
+    control.delegation.cancel(submitted.id, caller),
+    (error) => error.status === 409 && /targeted cancellation/.test(error.message)
+  );
+  assert.equal(cancelCalls, 0, 'the control plane must not send an unsafe cancellation to an old worker');
+  finish({ status: 'succeeded' });
+  await control.delegation.whenIdle();
+});
+
+test('agent deletion is blocked while delegated work is in flight', async (t) => {
+  let finish;
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused-worker-secret',
+    dataPath: null,
+    schedulerEnabled: false,
+    delegationDispatch: () => new Promise((resolve) => { finish = resolve; })
+  });
+  const controlUrl = await listen(control);
+  t.after(async () => {
+    finish?.({ status: 'succeeded' });
+    await new Promise((resolve) => control.close(resolve));
+  });
+
+  const caller = { id: 'oidc:user', type: 'user', agentId: null, isAdmin: false };
+  control.delegation.submit({ targetAgentId: 'worker-01', prompt: 'keep the target alive' }, caller);
+  let response = await fetch(`${controlUrl}/api/v1/agents/worker-01`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'retain' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /delegated work/);
+
+  finish({ status: 'succeeded' });
+  await control.delegation.whenIdle();
+  response = await fetch(`${controlUrl}/api/v1/agents/worker-01`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeAction: 'retain' })
+  });
+  assert.equal(response.status, 204);
+});
+
 test('Claude Code implements the same wrapper contract and normalizes stream usage', async (t) => {
   const token = 'claude-worker-secret';
   const worker = createWorkerServer({ token, adapter: 'claude-code', demoMode: true, workspace: process.cwd() });

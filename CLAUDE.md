@@ -66,7 +66,8 @@ The `shared-legacy` bootstrap runtimes in `docker-compose.yml` are a migration a
 
 ## Style
 
-- Node 20+, ESM only, `node:` prefixed builtins, **zero third-party runtime dependencies** — keep it that way.
+- Node 22+, ESM only, and `node:`-prefixed builtins. Runtime dependencies are intentionally limited to the
+  official MCP SDK packages and Zod; review lockfile changes and do not add packages for built-in behavior.
 - Two-space indent, semicolons, single quotes, no trailing-comma noise. Small pure functions at module top,
   factories (`createControlPlane`, `createWorkerServer`) that return a server.
 - Errors carry an HTTP status: `throw Object.assign(new Error('...'), { status: 409 })`.

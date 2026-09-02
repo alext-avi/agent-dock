@@ -30,6 +30,15 @@ a { color: inherit; }
 .topbar-right { display: flex; align-items: center; gap: 22px; }
 .nav-link { color: var(--muted); font: 11px ui-monospace, monospace; letter-spacing: .08em; text-decoration: none; text-transform: uppercase; }
 .nav-link:hover { color: var(--acid); }
+.operator-account { display: flex; align-items: center; gap: 9px; padding-left: 16px; border-left: 1px solid var(--line); }
+.operator-account span, .operator-account strong, .operator-account small { display: block; }
+.operator-account strong { max-width: 150px; overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.operator-account small { margin-top: 2px; color: var(--faint); font: 8px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.operator-access { min-width: 0; padding: 4px 0; color: inherit; background: transparent; border: 0; text-align: left; }
+.operator-access:hover strong { color: var(--acid); }
+.operator-access:hover small { color: var(--muted); }
+.operator-sign-out { padding: 4px 0; color: var(--muted); background: transparent; border: 0; font: 9px ui-monospace, monospace; text-decoration: underline; text-underline-offset: 3px; }
+.operator-sign-out:hover { color: var(--acid); }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .dot.online { background: var(--acid); box-shadow: 0 0 10px #c7ff4a88; }
 .dot.offline { background: var(--danger); }
@@ -100,13 +109,15 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .tab-panel { min-height: 340px; }
 
 .fleet-heading { display: flex; justify-content: space-between; align-items: end; margin-bottom: 18px; }
-.agent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-.agent-card { display: block; color: inherit; text-decoration: none; background: linear-gradient(145deg, rgba(24,29,26,.96), rgba(16,20,18,.96)); border: 1px solid var(--line); border-radius: 4px; padding: 21px; min-width: 0; transition: border-color .18s ease, transform .18s ease; }
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 18px; }
+.agent-card { display: block; overflow: hidden; color: inherit; text-decoration: none; background: linear-gradient(145deg, rgba(24,29,26,.96), rgba(16,20,18,.96)); border: 1px solid var(--line); border-radius: 4px; padding: 21px; min-width: 0; transition: border-color .18s ease, transform .18s ease; }
 .agent-card:hover { border-color: #455149; transform: translateY(-1px); }
 .agent-card:focus-visible { outline: 2px solid var(--acid); outline-offset: 2px; }
 .agent-card-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; }
-.agent-card-state { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
+.agent-card-heading > div:first-child { min-width: 0; }
+.agent-card-state { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 1 auto; min-width: 0; max-width: 48%; }
 .card-update { color: var(--faint); font: 9px ui-monospace, monospace; white-space: nowrap; }
+.agent-card-state > * { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card-heading h2 { font-size: 20px; }
 .agent-card-heading .kicker { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card-description { color: var(--muted); min-height: 42px; margin: 15px 0 18px; font-size: 12px; line-height: 1.6; }
@@ -348,6 +359,26 @@ dialog::backdrop { background: #050706d9; backdrop-filter: blur(4px); }
 .dialog-heading { display: flex; align-items: start; justify-content: space-between; margin-bottom: 15px; }
 .dialog-copy { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 0 0 20px; }
 .dialog-actions { justify-content: flex-end; }
+.access-policy-dialog { width: min(720px, calc(100vw - 32px)); }
+.access-identity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 22px; border: 1px solid var(--line); background: #0d110f; }
+.access-identity > div { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--line); }
+.access-identity > div:last-child { border-right: 0; }
+.access-identity span, .access-identity small { display: block; color: var(--faint); font: 9px/1.4 ui-monospace, monospace; letter-spacing: .1em; }
+.access-identity strong { display: block; margin: 6px 0 3px; overflow: hidden; font: 650 14px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.access-identity small { color: var(--muted); letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.access-config { padding: 16px; background: #151a16; border-left: 2px solid var(--acid); }
+.access-config h3 { font-size: 14px; }
+.access-config p { margin: 8px 0 14px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.access-config code { color: var(--aqua); font: 10px ui-monospace, monospace; overflow-wrap: anywhere; }
+.access-config dl { display: grid; gap: 7px; margin: 0; }
+.access-config dl div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; }
+.access-config dt { color: var(--faint); font: 9px ui-monospace, monospace; text-transform: uppercase; }
+.access-config dd { min-width: 0; margin: 0; }
+.access-roles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin: 18px 0; }
+.access-roles article { min-width: 0; padding: 13px; border: 1px solid var(--line); }
+.access-roles span { color: var(--acid); font: 8px ui-monospace, monospace; letter-spacing: .12em; }
+.access-roles strong { display: block; margin: 5px 0 7px; font-size: 12px; }
+.access-roles p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1px solid var(--line); color: var(--faint); display: flex; justify-content: space-between; font: 9px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
 
 @media (max-width: 760px) {
@@ -363,7 +394,6 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .runtime-detail-grid { grid-template-columns: 1fr; }
   .boundary-card { min-width: 0; }
   .grid { grid-template-columns: 1fr; }
-  .agent-grid { grid-template-columns: 1fr; }
   .jobs-header { align-items: stretch; flex-direction: column; }
   .jobs-header-actions { justify-content: space-between; }
   .job-summary-grid { grid-template-columns: 1fr; }
@@ -408,3 +438,20 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
 .credential-hosts { color: var(--muted); font: 10px ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
 .credential-hint { color: var(--aqua); font: 11px ui-monospace, monospace; }
 .credential-actions { display: flex; gap: 8px; }
+@media (max-width: 540px) {
+  .topbar { padding: 0 14px; }
+  .brand { gap: 8px; }
+  .brand small, .connection { display: none; }
+  .topbar-right { min-width: 0; gap: 9px; }
+  .operator-account { min-width: 0; padding-left: 9px; }
+  .operator-account strong { max-width: 92px; }
+  main { padding: 38px 16px 70px; }
+  .agent-card { padding: 16px; }
+  .agent-card-heading { display: grid; gap: 10px; }
+  .agent-card-state { max-width: 100%; flex-direction: row; align-items: center; justify-content: space-between; }
+  .card-quota-windows { grid-template-columns: 1fr; }
+  .access-identity, .access-roles { grid-template-columns: 1fr; }
+  .access-identity > div { border-right: 0; border-bottom: 1px solid var(--line); }
+  .access-identity > div:last-child { border-bottom: 0; }
+  .access-config dl div { grid-template-columns: 1fr; gap: 3px; }
+}

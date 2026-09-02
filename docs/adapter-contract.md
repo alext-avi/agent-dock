@@ -21,7 +21,7 @@ Current protocol version: `agent-wrapper/v1`.
 | `GET` | `/v1/usage` | Read cached request and account usage |
 | `POST` | `/v1/usage/refresh` | Ask the adapter to refresh available usage sources |
 | `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "...", "modelPolicy": {...} }` and stream canonical NDJSON events |
-| `POST` | `/v1/tasks/cancel` | Cancel the active task on this single-agent worker |
+| `POST` | `/v1/tasks/cancel` | Cancel `{ "taskId": "..." }` only when it still identifies the active task |
 | `GET` | `/v1/conversations` | List conversations this worker can continue |
 | `GET`, `DELETE` | `/v1/conversations/:id` | Read one conversation, or forget the worker's mapping for it |
 
@@ -69,6 +69,8 @@ One provider asymmetry is worth recording because it is not visible from the fla
 - `usage`: normalized request totals/history, `quotaWindows[]`, an optional `account` activity summary, `pollErrorKind` classifying why an account-usage source last failed, and `lastSuccessAt` recording when the quota data itself was last read successfully. `lastPollAt` advances on failed and skipped attempts, so it cannot be used to judge how old a reading is.
 
 Provider-specific fields belong inside a future explicitly versioned extension object; the control plane must not require them.
+
+Safe targeted cancellation is advertised as `capabilities.tasks.targetedCancellation: true`. A control plane must read status, require that positive capability, and confirm `task.active.id` before posting the same ID to `/v1/tasks/cancel`. It must not send an ID-bearing cancellation to an older worker that omits the flag: older wrappers may interpret cancellation as "kill whatever is active."
 
 ## Canonical task stream
 

@@ -87,6 +87,7 @@ export function normalizeDataSource(input, { existingIds = new Set(), roots = ne
     name,
     description: text(input.description ?? defaults.description ?? '', 'description', { max: 1000 }),
     kind,
+    scope: defaults.scope === 'attachment' ? 'attachment' : 'shared',
     rootId: null,
     relativePath: null,
     volumeName: defaults.volumeName ?? null,

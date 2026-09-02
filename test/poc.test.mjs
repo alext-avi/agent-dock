@@ -298,8 +298,8 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const agentPage = await (await fetch(`${controlUrl}/agents/${created.id}`)).text();
   assert.doesNotMatch(agentPage, /Worker URL|Worker token/);
   assert.match(agentPage, /Tools &amp; MCP/);
-  assert.match(agentPage, /Approved data sources/);
-  assert.match(agentPage, /Attach data/);
+  assert.match(agentPage, /Mapped folders/);
+  assert.match(agentPage, /Map folder/);
 
   const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
     method: 'DELETE',
@@ -879,7 +879,8 @@ test('data-source registry applies scoped mounts, persists them, and enforces ex
 
   response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      dataSourceId: project.id, mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+      source: { name: 'Direct project mapping', rootId: 'projects', relativePath: 'agent-dock' },
+      mountName: 'repo', access: 'read-write', purpose: 'working-directory'
     })
   });
   assert.equal(response.status, 201);
@@ -895,12 +896,15 @@ test('data-source registry applies scoped mounts, persists them, and enforces ex
   const recreatesBeforeConflict = manager.recreated.length;
   response = await fetch(`${controlUrl}/api/v1/agents/${second.id}/attachments`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      dataSourceId: child.id, mountName: 'child', access: 'read-write', purpose: 'data'
+      source: { name: 'Rejected direct mapping', rootId: 'projects', relativePath: 'agent-dock/packages/ui' },
+      mountName: 'child', access: 'read-write', purpose: 'data'
     })
   });
   assert.equal(response.status, 409);
   assert.match((await response.json()).error, /agent/);
   assert.equal(manager.recreated.length, recreatesBeforeConflict, 'a rejected write lease replaced a container');
+  const sourcesAfterConflict = await (await fetch(`${controlUrl}/api/v1/data-sources`)).json();
+  assert.equal(sourcesAfterConflict.dataSources.some((source) => source.name === 'Rejected direct mapping'), false);
 
   response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments/${firstAttachment.id}`, {
     method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access: 'read-only' })
@@ -926,6 +930,8 @@ test('data-source registry applies scoped mounts, persists them, and enforces ex
   const afterDetach = await (await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`)).json();
   assert.deepEqual(afterDetach.attachments, []);
   assert.equal(afterDetach.workingDirectory, '/workspace');
+  const sourcesAfterDetach = await (await fetch(`${controlUrl}/api/v1/data-sources`)).json();
+  assert.equal(sourcesAfterDetach.dataSources.some((source) => source.name === 'Direct project mapping'), false);
 
   const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
   assert.equal(persisted.schemaVersion, 4);

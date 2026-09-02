@@ -355,7 +355,6 @@ textarea.instructions { color: #c1cac3; }
 .empty-capability h3 { margin: 13px 0 8px; }
 .empty-capability p { color: var(--muted); margin: 0; font-size: 12px; line-height: 1.65; }
 .empty-icon { width: 38px; height: 38px; display: grid; place-items: center; color: var(--acid); background: #c7ff4a0a; border: 1px solid #50662a; font: 18px ui-monospace, monospace; }
-.data-source-panel { grid-column: 1 / -1; }
 .data-record-list { display: grid; gap: 10px; min-height: 92px; }
 .data-record { min-width: 0; padding: 13px; background: #0d110f; border: 1px solid var(--line); }
 .data-record-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
@@ -454,7 +453,6 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .timing-choice, .job-policy-grid, .schedule-builder-grid { grid-template-columns: 1fr; }
   .card-quota-windows { grid-template-columns: 1fr; }
   .capability-grid, .data-grid { grid-template-columns: 1fr; }
-  .data-source-panel { grid-column: auto; }
   .data-card-footer { align-items: stretch; flex-direction: column; }
   .data-card-footer .button { align-self: start; }
   .mcp-toolbar { grid-template-columns: 1fr; }

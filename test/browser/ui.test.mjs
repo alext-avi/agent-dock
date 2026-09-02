@@ -363,30 +363,25 @@ test('a deferred one-off job is configured without scheduling notation', async (
   assert.match(await page.locator(`.job-card[data-schedule-id="${schedule.id}"]`).textContent(), /Run once/);
 });
 
-test('the Data tab registers a scoped folder and applies an explicit read-write working directory', async (t) => {
+test('the Data tab maps a chosen folder with explicit access in one flow', async (t) => {
   const agent = app.agents['claude-code'];
   const page = await openPage(`/agents/${agent.id}#data`);
   t.after(() => page.close());
   await page.waitForFunction(() => document.querySelector('#attachment-count')?.textContent === '0 attached');
 
-  await page.click('#new-data-source');
-  await page.fill('#data-source-name', 'Browser project');
-  await page.fill('#data-source-description', 'Scoped source created by the browser test');
-  await page.selectOption('#data-source-root', 'projects');
-  assert.match(await page.locator('#data-source-root-policy').textContent(), /exclusive read\/write/);
-  await page.click('#browse-data-source');
+  await page.click('#new-attachment');
+  await page.selectOption('#attachment-root', 'projects');
+  assert.match(await page.locator('#attachment-root-policy').textContent(), /Choose read-only or exclusive read\/write/);
+  assert.equal(await page.locator('#attachment-access').inputValue(), 'read-only');
+  await page.click('#browse-attachment');
   const projectFolder = page.locator('.folder-browser-row').filter({ hasText: 'agent-container' });
   await projectFolder.waitFor({ state: 'visible' });
   await projectFolder.click();
   await page.waitForFunction(() => document.querySelector('#folder-browser-selection')?.textContent === 'agent-container');
   assert.match(await page.locator('#folder-browser-breadcrumbs').textContent(), /Projects\/agent-container/);
   await page.click('#choose-folder');
-  assert.equal(await page.locator('#data-source-path').getAttribute('readonly'), '');
-  assert.equal(await page.locator('#data-source-path').evaluate((input) => input.value), 'agent-container');
-  await page.click('#save-data-source');
-  await page.waitForFunction(() => [...document.querySelectorAll('#data-source-list strong')].some((node) => node.textContent === 'Browser project'));
-
-  await page.click('#new-attachment');
+  assert.equal(await page.locator('#attachment-path').getAttribute('readonly'), '');
+  assert.equal(await page.locator('#attachment-path').inputValue(), 'agent-container');
   await page.fill('#attachment-name', 'project');
   await page.selectOption('#attachment-access', 'read-write');
   await page.selectOption('#attachment-purpose', 'working-directory');
@@ -400,7 +395,7 @@ test('the Data tab registers a scoped folder and applies an explicit read-write 
   assert.match(await attachmentCard.textContent(), /\/data\/project/);
   assert.equal(await page.locator('#workspace-root').textContent(), '/data/project');
   assert.equal(await page.locator('#workspace-access').textContent(), 'read / write');
-  assert.match(await page.locator('#workspace-description').textContent(), /Browser project/);
+  assert.match(await page.locator('#workspace-description').textContent(), /agent-container/);
 
   const attachmentState = await (await fetch(`${app.url}/api/v1/agents/${agent.id}/attachments`)).json();
   assert.equal(attachmentState.workingDirectory, '/data/project');

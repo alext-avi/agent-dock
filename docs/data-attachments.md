@@ -1,6 +1,6 @@
 # Scoped data attachments
 
-Agent Dock keeps each managed agent's CLI installation, provider login, telemetry, and default `/workspace` in four private Docker volumes. Data attachments add an explicit fifth-or-later mount without weakening that baseline: an administrator registers a source, then attaches it to one idle managed runtime as read-only or read/write.
+Agent Dock keeps each managed agent's CLI installation, provider login, telemetry, and default `/workspace` in four private Docker volumes. A folder mapping adds an explicit fifth-or-later mount without weakening that baseline. From the agent's **Data** tab, an administrator chooses a folder and maps it read-only or read/write in one operation. The control plane creates the underlying attachment-scoped source record internally.
 
 ## Source types
 
@@ -19,13 +19,13 @@ ATTACHMENT_ROOTS_JSON={"projects":{"label":"Projects","hostPath":"/Users/you/Pro
 
 ## Applying an attachment
 
-Open an agent's **Data** tab, create or reuse a source, then choose:
+Open an agent's **Data** tab, select **Map folder**, and choose:
 
 - `read-only` or `read-write`;
 - additional data or the task working directory;
 - a container-safe mount name, rendered under `/data/<name>`.
 
-The host-source form includes an administrator-only folder picker. It enumerates readable directories only beneath the selected configured root, as the target harness user, and stores the chosen relative path. The response contains the root label and relative directory names only—never the deployment's absolute host path. Symlinked folders are excluded and every breadcrumb navigation request is validated again inside the locked-down helper container.
+The mapping form includes an administrator-only folder picker. It enumerates readable directories only beneath the selected configured root, as the target harness user, and stores the chosen relative path. The response contains the root label and relative directory names only—never the deployment's absolute host path. Symlinked folders are excluded and every breadcrumb navigation request is validated again inside the locked-down helper container.
 
 An agent may have one attachment designated as its task working directory. The wrapper receives that target as `WORKSPACE_PATH`; its private `/workspace` volume remains mounted and available. This makes a read/write project source appropriate for an intentionally live coding workflow, while a self-contained clone in the private workspace remains the safer default when live host edits are unnecessary.
 
@@ -47,9 +47,9 @@ The control plane currently holds the Docker socket, which is host-level authori
 |---|---|---|
 | `GET` | `/api/v1/attachment-roots` | List safe root IDs, labels, and write eligibility; never host paths |
 | `GET` | `/api/v1/attachment-roots/:rootId/directories?agentId=:id&path=:relativePath` | Browse readable folders beneath one configured root as the target agent user |
-| `GET`, `POST` | `/api/v1/data-sources` | List or create reusable sources |
+| `GET`, `POST` | `/api/v1/data-sources` | Low-level compatibility surface for reusable sources; not exposed in the normal agent UI |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/data-sources/:id` | Read, rename/repoint when detached, or delete a source |
-| `GET`, `POST` | `/api/v1/agents/:id/attachments` | List or attach sources to one runtime |
+| `GET`, `POST` | `/api/v1/agents/:id/attachments` | List mappings or map an inline approved folder in one operation; reusable `dataSourceId` payloads remain supported |
 | `PATCH`, `DELETE` | `/api/v1/agents/:id/attachments/:attachmentId` | Change policy or detach and replace the idle runtime |
 
-Deleting a managed volume requires `deleteVolume: true` plus exact source-ID confirmation. Detaching never deletes source data. An agent cannot be deleted until all of its additional attachments have been removed.
+Deleting a managed volume requires `deleteVolume: true` plus exact source-ID confirmation. Unmapping an attachment-scoped folder removes only its internal registry record; it never deletes host data. An agent cannot be deleted until all of its additional attachments have been removed.

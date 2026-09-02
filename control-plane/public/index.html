@@ -263,16 +263,10 @@
               <p id="workspace-list-message" class="workspace-list-message" role="status"></p>
             </article>
             <article class="panel capability-card">
-              <div class="panel-heading"><div><p class="kicker">RUNTIME MOUNTS</p><h2>Additional attachments</h2></div><span id="attachment-count" class="pill neutral">checking</span></div>
-              <p class="capability-copy">Attach an approved host folder or managed volume. Changing an attachment safely replaces the idle container while preserving its private login and workspace volumes.</p>
+              <div class="panel-heading"><div><p class="kicker">RUNTIME MOUNTS</p><h2>Mapped folders</h2></div><span id="attachment-count" class="pill neutral">checking</span></div>
+              <p class="capability-copy">Map an approved host folder directly into this agent. Choose read-only or read/write access; the agent's private login and workspace volumes remain isolated.</p>
               <div id="attachment-list" class="data-record-list"><p class="empty">Loading attachments…</p></div>
-              <div class="data-card-footer"><span id="attachment-message" class="run-message" role="status"></span><button id="new-attachment" class="button secondary" type="button">Attach data</button></div>
-            </article>
-            <article class="panel data-source-panel">
-              <div class="panel-heading"><div><p class="kicker">CONTROL PLANE REGISTRY</p><h2>Approved data sources</h2></div><span id="data-source-count" class="pill neutral">checking</span></div>
-              <p class="capability-copy">The registry names exact subfolders beneath operator-configured roots. Raw host paths stay deployment-side; agents see only their assigned container targets.</p>
-              <div id="data-source-list" class="data-record-list"><p class="empty">Loading data sources…</p></div>
-              <div class="data-card-footer"><span id="data-source-message" class="run-message" role="status"></span><button id="new-data-source" class="button secondary" type="button">New data source</button></div>
+              <div class="data-card-footer"><span id="attachment-message" class="run-message" role="status"></span><button id="new-attachment" class="button secondary" type="button">Map folder</button></div>
             </article>
           </div>
         </section>
@@ -398,22 +392,17 @@
       </form>
     </dialog>
 
-    <dialog id="data-source-dialog" aria-labelledby="data-source-dialog-title">
-      <form id="data-source-form" method="dialog">
-        <input id="data-source-id" type="hidden">
-        <div class="dialog-heading"><div><p class="kicker">APPROVED STORAGE</p><h2 id="data-source-dialog-title">New data source</h2></div><button id="close-data-source-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
-        <p class="dialog-copy">A source is reusable control-plane configuration. It is not visible inside an agent until you explicitly attach it.</p>
-        <div class="form-grid">
-          <label class="field">Name<input id="data-source-name" required maxlength="120" placeholder="Project repository"></label>
-          <label class="field">Source type<select id="data-source-kind"><option value="host-directory">Approved host folder</option><option value="managed-volume">Managed Docker volume</option></select></label>
-        </div>
-        <label class="field">Description<input id="data-source-description" maxlength="1000" placeholder="Working copy for the current project"></label>
-        <section id="host-source-fields" class="data-source-fields">
+    <dialog id="attachment-dialog" aria-labelledby="attachment-dialog-title">
+      <form id="attachment-form" method="dialog">
+        <input id="attachment-id" type="hidden">
+        <div class="dialog-heading"><div><p class="kicker">ISOLATED RUNTIME</p><h2 id="attachment-dialog-title">Map folder</h2></div><button id="close-attachment-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
+        <p class="dialog-copy">Choose a host folder and how this agent may use it. The agent must be idle because saving safely replaces its container.</p>
+        <section id="attachment-location-fields">
           <div class="form-grid">
-            <label class="field">Approved root<select id="data-source-root"></select></label>
-            <label class="field">Subfolder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="data-source-path" maxlength="1000" value="." readonly><button id="browse-data-source" class="button secondary" type="button">Browse…</button></div></label>
+            <label class="field">Approved root<select id="attachment-root"></select></label>
+            <label class="field">Folder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="attachment-path" maxlength="1000" value="." readonly><button id="browse-attachment" class="button secondary" type="button">Browse…</button></div></label>
           </div>
-          <p id="data-source-root-policy" class="schedule-note"></p>
+          <p id="attachment-root-policy" class="schedule-note"></p>
           <section id="host-folder-browser" class="host-folder-browser hidden" aria-label="Approved host folders">
             <div class="folder-browser-heading"><div><span>FOLDER PICKER</span><strong id="folder-browser-root">Approved root</strong></div><button id="close-folder-browser" class="icon-button" type="button" aria-label="Close folder picker">×</button></div>
             <nav id="folder-browser-breadcrumbs" class="folder-browser-breadcrumbs" aria-label="Selected folder"></nav>
@@ -422,20 +411,7 @@
             <p id="folder-browser-message" class="workspace-list-message" role="status"></p>
           </section>
         </section>
-        <section id="managed-source-fields" class="data-source-fields hidden">
-          <p class="data-safety-note">Agent Dock creates and labels a private Docker volume. Removing its registry entry requires an explicit destructive confirmation.</p>
-        </section>
-        <p id="data-source-form-message" class="usage-error hidden"></p>
-        <div class="actions dialog-actions"><button id="delete-data-source" class="button danger hidden" type="button">Delete source</button><span class="dialog-spacer"></span><button id="cancel-data-source" class="button secondary" type="button">Cancel</button><button id="save-data-source" class="button primary" type="submit">Create source</button></div>
-      </form>
-    </dialog>
-
-    <dialog id="attachment-dialog" aria-labelledby="attachment-dialog-title">
-      <form id="attachment-form" method="dialog">
-        <input id="attachment-id" type="hidden">
-        <div class="dialog-heading"><div><p class="kicker">ISOLATED RUNTIME</p><h2 id="attachment-dialog-title">Attach data</h2></div><button id="close-attachment-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
-        <p class="dialog-copy">The agent must be idle. Saving replaces its container with the selected source mounted at a generated <code>/data/…</code> path.</p>
-        <label class="field">Data source<select id="attachment-source" required></select></label>
+        <p id="attachment-existing-location" class="data-safety-note hidden"></p>
         <div class="form-grid">
           <label class="field">Container name <span>becomes /data/name</span><input id="attachment-name" required maxlength="80" placeholder="project"></label>
           <label class="field">Access<select id="attachment-access"><option value="read-only">Read only</option><option value="read-write">Read and write</option></select></label>
@@ -443,7 +419,7 @@
         </div>
         <p id="attachment-policy" class="data-safety-note"></p>
         <p id="attachment-form-message" class="usage-error hidden"></p>
-        <div class="actions dialog-actions"><button id="detach-data-source" class="button danger hidden" type="button">Detach</button><span class="dialog-spacer"></span><button id="cancel-attachment" class="button secondary" type="button">Cancel</button><button id="save-attachment" class="button primary" type="submit">Attach and restart</button></div>
+        <div class="actions dialog-actions"><button id="detach-data-source" class="button danger hidden" type="button">Unmap folder</button><span class="dialog-spacer"></span><button id="cancel-attachment" class="button secondary" type="button">Cancel</button><button id="save-attachment" class="button primary" type="submit">Map and restart</button></div>
       </form>
     </dialog>
 
@@ -472,6 +448,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=14"></script>
+    <script type="module" src="/app.js?v=15"></script>
   </body>
 </html>

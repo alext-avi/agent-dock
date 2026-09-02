@@ -1145,7 +1145,11 @@ export function createControlPlane(options = {}) {
 
     if (url.pathname === '/api/v1/data-sources') {
       if (req.method === 'GET') {
-        return json(res, 200, { dataSources: [...dataSources.values()].map((source) => publicDataSource(source, attachmentRoots)) });
+        return json(res, 200, {
+          dataSources: [...dataSources.values()]
+            .filter((source) => source.scope !== 'attachment')
+            .map((source) => publicDataSource(source, attachmentRoots))
+        });
       }
       if (req.method === 'POST') {
         const body = await readJson(req);
@@ -1243,12 +1247,34 @@ export function createControlPlane(options = {}) {
     }
     if (!attachmentId && req.method === 'POST') {
       const body = await readJson(req);
-      const source = dataSources.get(body.dataSourceId);
-      if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
-      const attachment = normalizeAttachment(body, { agentId: agent.id, source, existing: current });
-      assertWriteLease(attachment, [...dataAttachments.values()], dataSources, attachmentRoots);
-      await commitAttachmentSet(agent, [...current, attachment]);
-      return json(res, 201, { attachment: publicAttachment(attachment, source, attachmentRoots) });
+      if (body.source && body.dataSourceId) {
+        throw Object.assign(new Error('Provide either source or dataSourceId, not both'), { status: 400 });
+      }
+      let source;
+      let attachmentScoped = false;
+      if (body.source) {
+        source = normalizeDataSource({
+          ...body.source,
+          id: `mapping-${randomUUID()}`,
+          kind: 'host-directory',
+          name: body.source.name ?? body.mountName ?? 'Mapped folder'
+        }, { existingIds: new Set(dataSources.keys()), roots: attachmentRoots });
+        source.scope = 'attachment';
+        attachmentScoped = true;
+        dataSources.set(source.id, source);
+      } else {
+        source = dataSources.get(body.dataSourceId);
+        if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
+      }
+      try {
+        const attachment = normalizeAttachment(body, { agentId: agent.id, source, existing: current });
+        assertWriteLease(attachment, [...dataAttachments.values()], dataSources, attachmentRoots);
+        await commitAttachmentSet(agent, [...current, attachment]);
+        return json(res, 201, { attachment: publicAttachment(attachment, source, attachmentRoots) });
+      } catch (error) {
+        if (attachmentScoped) dataSources.delete(source.id);
+        throw error;
+      }
     }
     const existing = dataAttachments.get(attachmentId);
     if (!existing || existing.agentId !== agent.id) throw Object.assign(new Error('Attachment not found'), { status: 404 });
@@ -1269,6 +1295,13 @@ export function createControlPlane(options = {}) {
     }
     if (req.method === 'DELETE') {
       await commitAttachmentSet(agent, current.filter((attachment) => attachment.id !== existing.id));
+      const source = dataSources.get(existing.dataSourceId);
+      if (source?.scope === 'attachment'
+        && ![...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id)) {
+        dataSources.delete(source.id);
+        try { await persistAgents(); }
+        catch { dataSources.set(source.id, source); }
+      }
       res.writeHead(204, { 'cache-control': 'no-store' });
       return res.end();
     }

@@ -179,22 +179,6 @@ const ui = {
   attachmentCount: $('#attachment-count'),
   attachmentList: $('#attachment-list'),
   attachmentMessage: $('#attachment-message'),
-  dataSourceCount: $('#data-source-count'),
-  dataSourceList: $('#data-source-list'),
-  dataSourceMessage: $('#data-source-message'),
-  dataSourceDialog: $('#data-source-dialog'),
-  dataSourceForm: $('#data-source-form'),
-  dataSourceId: $('#data-source-id'),
-  dataSourceDialogTitle: $('#data-source-dialog-title'),
-  dataSourceName: $('#data-source-name'),
-  dataSourceKind: $('#data-source-kind'),
-  dataSourceDescription: $('#data-source-description'),
-  hostSourceFields: $('#host-source-fields'),
-  managedSourceFields: $('#managed-source-fields'),
-  dataSourceRoot: $('#data-source-root'),
-  dataSourcePath: $('#data-source-path'),
-  browseDataSource: $('#browse-data-source'),
-  dataSourceRootPolicy: $('#data-source-root-policy'),
   hostFolderBrowser: $('#host-folder-browser'),
   folderBrowserRoot: $('#folder-browser-root'),
   folderBrowserBreadcrumbs: $('#folder-browser-breadcrumbs'),
@@ -202,14 +186,16 @@ const ui = {
   folderBrowserSelection: $('#folder-browser-selection'),
   folderBrowserMessage: $('#folder-browser-message'),
   chooseFolder: $('#choose-folder'),
-  dataSourceFormMessage: $('#data-source-form-message'),
-  deleteDataSource: $('#delete-data-source'),
-  saveDataSource: $('#save-data-source'),
   attachmentDialog: $('#attachment-dialog'),
   attachmentForm: $('#attachment-form'),
   attachmentId: $('#attachment-id'),
   attachmentDialogTitle: $('#attachment-dialog-title'),
-  attachmentSource: $('#attachment-source'),
+  attachmentLocationFields: $('#attachment-location-fields'),
+  attachmentRoot: $('#attachment-root'),
+  attachmentPath: $('#attachment-path'),
+  browseAttachment: $('#browse-attachment'),
+  attachmentRootPolicy: $('#attachment-root-policy'),
+  attachmentExistingLocation: $('#attachment-existing-location'),
   attachmentName: $('#attachment-name'),
   attachmentAccess: $('#attachment-access'),
   attachmentPurpose: $('#attachment-purpose'),
@@ -244,7 +230,6 @@ let mcpDefinitions = [];
 let mcpBindings = [];
 let mcpRefreshInFlight = false;
 let attachmentRoots = [];
-let dataSources = [];
 let agentAttachments = [];
 let dataRefreshInFlight = false;
 let workspaceEntries = [];
@@ -1545,54 +1530,6 @@ function renderWorkspaceSummary(workingDirectory = '/workspace') {
     : 'Private durable task workspace';
 }
 
-function renderDataSources() {
-  ui.dataSourceCount.textContent = `${dataSources.length} source${dataSources.length === 1 ? '' : 's'}`;
-  ui.dataSourceCount.className = `pill ${dataSources.length ? 'ready' : 'neutral'}`;
-  ui.dataSourceList.replaceChildren();
-  if (!dataSources.length) {
-    const empty = document.createElement('p');
-    empty.className = 'empty';
-    empty.textContent = 'No approved sources yet. Register a host subfolder or create a managed volume.';
-    ui.dataSourceList.append(empty);
-  }
-  for (const source of dataSources) {
-    const row = document.createElement('article');
-    row.className = 'data-record';
-    const heading = document.createElement('div');
-    heading.className = 'data-record-heading';
-    const title = document.createElement('div');
-    const name = document.createElement('strong');
-    name.textContent = source.name;
-    const kind = document.createElement('small');
-    kind.textContent = source.kind === 'host-directory' ? 'HOST FOLDER' : 'MANAGED VOLUME';
-    title.append(name, kind);
-    const badge = document.createElement('span');
-    badge.className = 'pill neutral';
-    badge.textContent = source.kind === 'managed-volume'
-      || attachmentRoots.find((root) => root.id === source.root?.id)?.allowWrite
-      ? 'write eligible'
-      : 'read only';
-    heading.append(title, badge);
-    const location = document.createElement('code');
-    location.className = 'data-record-path';
-    location.textContent = dataSourceLocation(source);
-    const copy = document.createElement('p');
-    copy.className = 'data-record-copy';
-    copy.textContent = source.description || 'No description provided.';
-    const actions = document.createElement('div');
-    actions.className = 'data-record-actions';
-    const edit = document.createElement('button');
-    edit.className = 'text-button';
-    edit.type = 'button';
-    edit.textContent = 'Configure';
-    edit.addEventListener('click', () => openDataSourceDialog(source));
-    actions.append(edit);
-    row.append(heading, location, copy, actions);
-    ui.dataSourceList.append(row);
-  }
-  $('#new-attachment').disabled = !dataSources.length || currentAgent?.runtime?.managed !== true || currentAgent?.runtime?.dedicated !== true;
-}
-
 function renderAttachments(workingDirectory = '/workspace') {
   renderWorkspaceSummary(workingDirectory);
   ui.attachmentCount.textContent = `${agentAttachments.length} attached`;
@@ -1601,7 +1538,7 @@ function renderAttachments(workingDirectory = '/workspace') {
   if (!agentAttachments.length) {
     const empty = document.createElement('p');
     empty.className = 'empty';
-    empty.textContent = 'No additional data is mounted in this runtime.';
+    empty.textContent = 'No host folders are mapped into this runtime.';
     ui.attachmentList.append(empty);
     return;
   }
@@ -1643,27 +1580,20 @@ async function refreshData() {
   if (!currentAgent || dataRefreshInFlight) return;
   dataRefreshInFlight = true;
   try {
-    const [rootsResult, sourcesResult, attachmentsResult] = await Promise.all([
+    const [rootsResult, attachmentsResult] = await Promise.all([
       api(`${API_ROOT}/attachment-roots`),
-      api(`${API_ROOT}/data-sources`),
       api(agentApi('attachments'))
     ]);
     attachmentRoots = rootsResult.roots ?? [];
-    dataSources = sourcesResult.dataSources ?? [];
     agentAttachments = attachmentsResult.attachments ?? [];
-    renderDataSources();
     renderAttachments(attachmentsResult.workingDirectory);
-    ui.dataSourceMessage.textContent = '';
     ui.attachmentMessage.textContent = currentAgent.runtime?.managed && currentAgent.runtime?.dedicated
-      ? ''
+      ? (attachmentRoots.length ? '' : 'No approved host roots are configured for this deployment.')
       : 'Additional mounts require a managed dedicated runtime; legacy bootstrap workers remain unchanged.';
-    $('#new-data-source').disabled = false;
+    $('#new-attachment').disabled = !attachmentRoots.length || currentAgent.runtime?.managed !== true || currentAgent.runtime?.dedicated !== true;
   } catch (error) {
-    ui.dataSourceMessage.textContent = error.message;
     ui.attachmentMessage.textContent = 'Storage configuration requires administrator access.';
-    ui.dataSourceCount.textContent = 'unavailable';
     ui.attachmentCount.textContent = 'unavailable';
-    $('#new-data-source').disabled = true;
     $('#new-attachment').disabled = true;
   } finally {
     dataRefreshInFlight = false;
@@ -1693,7 +1623,7 @@ function renderFolderBreadcrumbs(root, relativePath) {
 
 async function browseHostFolder(relativePath = '.') {
   if (!currentAgent) return;
-  const rootId = ui.dataSourceRoot.value;
+  const rootId = ui.attachmentRoot.value;
   if (!rootId) return;
   const requestId = ++folderBrowserRequestId;
   ui.folderBrowserList.innerHTML = '<p class="empty">Loading approved folders…</p>';
@@ -1742,7 +1672,7 @@ async function browseHostFolder(relativePath = '.') {
 
 function openHostFolderBrowser() {
   ui.hostFolderBrowser.classList.remove('hidden');
-  void browseHostFolder(ui.dataSourcePath.value || '.');
+  void browseHostFolder(ui.attachmentPath.value || '.');
 }
 
 function closeHostFolderBrowser() {
@@ -1751,115 +1681,32 @@ function closeHostFolderBrowser() {
 }
 
 function chooseHostFolder() {
-  ui.dataSourcePath.value = folderBrowserPath;
+  ui.attachmentPath.value = folderBrowserPath;
+  if (!ui.attachmentName.value) {
+    ui.attachmentName.value = folderBrowserPath === '.' ? 'data' : folderBrowserPath.split('/').at(-1);
+  }
   closeHostFolderBrowser();
-  ui.dataSourceRootPolicy.textContent = `Selected ${ui.folderBrowserRoot.textContent} / ${folderBrowserPath}`;
+  syncAttachmentRootPolicy();
 }
 
-function syncDataSourceFields() {
-  const host = ui.dataSourceKind.value === 'host-directory';
-  ui.hostSourceFields.classList.toggle('hidden', !host);
-  ui.managedSourceFields.classList.toggle('hidden', host);
-  ui.dataSourceRoot.required = host;
-  ui.dataSourcePath.required = host;
-  const root = attachmentRoots.find((candidate) => candidate.id === ui.dataSourceRoot.value);
-  ui.dataSourceRootPolicy.textContent = !host ? '' : !root
-    ? 'No host roots are configured for this control plane.'
+function syncAttachmentRootPolicy() {
+  const root = attachmentRoots.find((candidate) => candidate.id === ui.attachmentRoot.value);
+  ui.attachmentRootPolicy.textContent = !root
+    ? 'No approved host roots are configured for this control plane.'
     : root.allowWrite
-      ? 'This deployment root permits both read-only and exclusive read/write attachments.'
-      : 'This deployment root permits read-only attachments only.';
-  ui.browseDataSource.disabled = !host || !root;
-  ui.saveDataSource.disabled = host && !root;
-}
-
-function openDataSourceDialog(source = null) {
-  ui.dataSourceForm.reset();
-  ui.dataSourceId.value = source?.id ?? '';
-  ui.dataSourceDialogTitle.textContent = source ? `Configure ${source.name}` : 'New data source';
-  ui.dataSourceName.value = source?.name ?? '';
-  ui.dataSourceDescription.value = source?.description ?? '';
-  ui.dataSourceKind.value = source?.kind ?? 'host-directory';
-  ui.dataSourceKind.disabled = Boolean(source);
-  ui.dataSourceRoot.replaceChildren();
-  for (const root of attachmentRoots) {
-    const option = document.createElement('option');
-    option.value = root.id;
-    option.textContent = `${root.label}${root.allowWrite ? ' · read/write eligible' : ' · read only'}`;
-    ui.dataSourceRoot.append(option);
-  }
-  if (source?.kind === 'host-directory' && !attachmentRoots.some((root) => root.id === source.root?.id)) {
-    const unavailable = document.createElement('option');
-    unavailable.value = source.root?.id ?? '';
-    unavailable.textContent = `${source.root?.label ?? source.root?.id} · not configured`;
-    ui.dataSourceRoot.append(unavailable);
-  }
-  ui.dataSourceRoot.value = source?.root?.id ?? attachmentRoots[0]?.id ?? '';
-  folderBrowserPath = source?.root?.relativePath ?? '.';
-  ui.dataSourcePath.value = folderBrowserPath;
-  closeHostFolderBrowser();
-  ui.dataSourceFormMessage.textContent = '';
-  ui.dataSourceFormMessage.classList.add('hidden');
-  ui.deleteDataSource.classList.toggle('hidden', !source);
-  ui.saveDataSource.textContent = source ? 'Save source' : 'Create source';
-  syncDataSourceFields();
-  ui.dataSourceDialog.showModal();
-}
-
-async function saveDataSource(event) {
-  event.preventDefault();
-  ui.saveDataSource.disabled = true;
-  ui.dataSourceFormMessage.classList.add('hidden');
-  try {
-    const id = ui.dataSourceId.value;
-    const kind = ui.dataSourceKind.value;
-    const payload = {
-      name: ui.dataSourceName.value.trim(),
-      description: ui.dataSourceDescription.value.trim(),
-      kind,
-      ...(kind === 'host-directory' ? {
-        rootId: ui.dataSourceRoot.value,
-        relativePath: ui.dataSourcePath.value.trim() || '.'
-      } : {})
-    };
-    await api(id ? `${API_ROOT}/data-sources/${encodeURIComponent(id)}` : `${API_ROOT}/data-sources`, {
-      method: id ? 'PATCH' : 'POST',
-      body: JSON.stringify(payload)
-    });
-    ui.dataSourceDialog.close();
-    await refreshData();
-    ui.dataSourceMessage.textContent = id ? 'Data source updated.' : 'Data source created; attach it to make it visible to an agent.';
-  } catch (error) {
-    ui.dataSourceFormMessage.textContent = error.message;
-    ui.dataSourceFormMessage.classList.remove('hidden');
-  } finally {
-    syncDataSourceFields();
-  }
-}
-
-async function deleteDataSource() {
-  const source = dataSources.find((candidate) => candidate.id === ui.dataSourceId.value);
-  if (!source || !window.confirm(`Delete the data source “${source.name}”?${source.kind === 'managed-volume' ? ' Its managed Docker volume and all data in it will be permanently removed.' : ''}`)) return;
-  ui.deleteDataSource.disabled = true;
-  try {
-    await api(`${API_ROOT}/data-sources/${encodeURIComponent(source.id)}`, {
-      method: 'DELETE',
-      body: JSON.stringify(source.kind === 'managed-volume' ? { deleteVolume: true, confirmation: source.id } : {})
-    });
-    ui.dataSourceDialog.close();
-    await refreshData();
-  } catch (error) {
-    ui.dataSourceFormMessage.textContent = error.message;
-    ui.dataSourceFormMessage.classList.remove('hidden');
-  } finally {
-    ui.deleteDataSource.disabled = false;
-  }
+      ? `Selected ${root.label} / ${ui.attachmentPath.value || '.'}. Choose read-only or exclusive read/write access below.`
+      : `Selected ${root.label} / ${ui.attachmentPath.value || '.'}. This root permits read-only access only.`;
+  ui.browseAttachment.disabled = !root;
+  if (!ui.attachmentId.value) ui.saveAttachment.disabled = !root;
 }
 
 function syncAttachmentPolicy() {
-  const source = dataSources.find((candidate) => candidate.id === ui.attachmentSource.value);
+  const attachment = agentAttachments.find((candidate) => candidate.id === ui.attachmentId.value);
+  const source = attachment?.source;
   const root = source?.kind === 'host-directory' ? attachmentRoots.find((candidate) => candidate.id === source.root?.id) : null;
+  const selectedRoot = attachmentRoots.find((candidate) => candidate.id === ui.attachmentRoot.value);
   const writeOption = ui.attachmentAccess.querySelector('option[value="read-write"]');
-  const writeAllowed = source?.kind === 'managed-volume' || root?.allowWrite === true;
+  const writeAllowed = source?.kind === 'managed-volume' || (attachment ? root?.allowWrite === true : selectedRoot?.allowWrite === true);
   writeOption.disabled = !writeAllowed;
   if (!writeAllowed && ui.attachmentAccess.value === 'read-write') ui.attachmentAccess.value = 'read-only';
   const write = ui.attachmentAccess.value === 'read-write';
@@ -1874,22 +1721,31 @@ function syncAttachmentPolicy() {
 function openAttachmentDialog(attachment = null) {
   ui.attachmentForm.reset();
   ui.attachmentId.value = attachment?.id ?? '';
-  ui.attachmentDialogTitle.textContent = attachment ? `Configure ${attachment.source.name}` : 'Attach data';
-  ui.attachmentSource.replaceChildren();
-  for (const source of dataSources) {
+  ui.attachmentDialogTitle.textContent = attachment ? `Configure ${attachment.source.name}` : 'Map folder';
+  ui.attachmentRoot.replaceChildren();
+  for (const root of attachmentRoots) {
     const option = document.createElement('option');
-    option.value = source.id;
-    option.textContent = `${source.name} · ${dataSourceLocation(source)}`;
-    ui.attachmentSource.append(option);
+    option.value = root.id;
+    option.textContent = `${root.label} · ${root.allowWrite ? 'read-only or read/write' : 'read-only'}`;
+    ui.attachmentRoot.append(option);
   }
-  ui.attachmentSource.value = attachment?.dataSourceId ?? dataSources[0]?.id ?? '';
+  ui.attachmentRoot.value = attachment?.source?.root?.id ?? attachmentRoots[0]?.id ?? '';
+  folderBrowserPath = attachment?.source?.root?.relativePath ?? '.';
+  ui.attachmentPath.value = folderBrowserPath;
+  closeHostFolderBrowser();
+  ui.attachmentLocationFields.classList.toggle('hidden', Boolean(attachment));
+  ui.attachmentExistingLocation.classList.toggle('hidden', !attachment);
+  ui.attachmentExistingLocation.textContent = attachment
+    ? `Mapped folder: ${dataSourceLocation(attachment.source)}. Unmap it first if you need to choose a different folder.`
+    : '';
   ui.attachmentName.value = attachment?.mountName ?? '';
   ui.attachmentAccess.value = attachment?.access ?? 'read-only';
   ui.attachmentPurpose.value = attachment?.purpose ?? 'data';
   ui.attachmentFormMessage.textContent = '';
   ui.attachmentFormMessage.classList.add('hidden');
   ui.detachDataSource.classList.toggle('hidden', !attachment);
-  ui.saveAttachment.textContent = attachment ? 'Save and restart' : 'Attach and restart';
+  ui.saveAttachment.textContent = attachment ? 'Save and restart' : 'Map and restart';
+  syncAttachmentRootPolicy();
   syncAttachmentPolicy();
   ui.attachmentDialog.showModal();
 }
@@ -1904,7 +1760,13 @@ async function saveAttachment(event) {
     await api(id ? agentApi(`attachments/${encodeURIComponent(id)}`) : agentApi('attachments'), {
       method: id ? 'PATCH' : 'POST',
       body: JSON.stringify({
-        dataSourceId: ui.attachmentSource.value,
+        ...(!id ? {
+          source: {
+            rootId: ui.attachmentRoot.value,
+            relativePath: ui.attachmentPath.value.trim() || '.',
+            name: (ui.attachmentPath.value === '.' ? ui.attachmentRoot.selectedOptions[0]?.textContent.split(' · ')[0] : ui.attachmentPath.value.split('/').at(-1)) || ui.attachmentName.value.trim()
+          }
+        } : {}),
         mountName: ui.attachmentName.value.trim(),
         access: ui.attachmentAccess.value,
         purpose: ui.attachmentPurpose.value
@@ -1912,7 +1774,7 @@ async function saveAttachment(event) {
     });
     ui.attachmentDialog.close();
     await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
-    ui.attachmentMessage.textContent = 'Attachment applied. The replacement runtime is starting.';
+    ui.attachmentMessage.textContent = id ? 'Folder access updated. The replacement runtime is starting.' : 'Folder mapped. The replacement runtime is starting.';
   } catch (error) {
     ui.attachmentFormMessage.textContent = error.message;
   } finally {
@@ -1922,7 +1784,7 @@ async function saveAttachment(event) {
 
 async function detachDataSource() {
   const attachment = agentAttachments.find((candidate) => candidate.id === ui.attachmentId.value);
-  if (!attachment || !window.confirm(`Detach “${attachment.source.name}” and restart this agent runtime? No source data will be deleted.`)) return;
+  if (!attachment || !window.confirm(`Unmap “${attachment.source.name}” and restart this agent runtime? Files in the host folder will not be deleted.`)) return;
   ui.detachDataSource.disabled = true;
   ui.attachmentFormMessage.textContent = 'Removing the mount and replacing the idle runtime…';
   ui.attachmentFormMessage.classList.remove('hidden');
@@ -1930,7 +1792,7 @@ async function detachDataSource() {
     await api(agentApi(`attachments/${encodeURIComponent(attachment.id)}`), { method: 'DELETE' });
     ui.attachmentDialog.close();
     await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
-    ui.attachmentMessage.textContent = 'Attachment removed; source data was left intact.';
+    ui.attachmentMessage.textContent = 'Folder unmapped; its host files were left intact.';
   } catch (error) {
     ui.attachmentFormMessage.textContent = error.message;
   } finally {
@@ -2706,23 +2568,17 @@ $('#apply-mcp').addEventListener('click', applyMcp);
 $('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
 $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
-ui.dataSourceForm.addEventListener('submit', saveDataSource);
-ui.dataSourceKind.addEventListener('change', syncDataSourceFields);
-ui.dataSourceRoot.addEventListener('change', () => {
+ui.attachmentRoot.addEventListener('change', () => {
   folderBrowserPath = '.';
-  ui.dataSourcePath.value = '.';
-  syncDataSourceFields();
+  ui.attachmentPath.value = '.';
+  syncAttachmentRootPolicy();
+  syncAttachmentPolicy();
   if (!ui.hostFolderBrowser.classList.contains('hidden')) void browseHostFolder('.');
 });
-ui.browseDataSource.addEventListener('click', openHostFolderBrowser);
+ui.browseAttachment.addEventListener('click', openHostFolderBrowser);
 $('#close-folder-browser').addEventListener('click', closeHostFolderBrowser);
 ui.chooseFolder.addEventListener('click', chooseHostFolder);
-$('#new-data-source').addEventListener('click', () => openDataSourceDialog());
-$('#close-data-source-dialog').addEventListener('click', () => ui.dataSourceDialog.close());
-$('#cancel-data-source').addEventListener('click', () => ui.dataSourceDialog.close());
-ui.deleteDataSource.addEventListener('click', deleteDataSource);
 ui.attachmentForm.addEventListener('submit', saveAttachment);
-ui.attachmentSource.addEventListener('change', syncAttachmentPolicy);
 ui.attachmentAccess.addEventListener('change', syncAttachmentPolicy);
 ui.attachmentPurpose.addEventListener('change', syncAttachmentPolicy);
 $('#new-attachment').addEventListener('click', () => openAttachmentDialog());

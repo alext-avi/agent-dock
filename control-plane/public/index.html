@@ -255,7 +255,12 @@
                 <span id="workspace-access" class="pill ready">read / write</span>
               </div>
               <div class="mount-summary"><code id="workspace-root">/workspace</code><span id="workspace-description">Private durable task workspace</span><button id="refresh-files" class="icon-button" title="Refresh workspace">↻</button></div>
-              <div id="file-list" class="file-list"><p class="empty">No artifacts yet.</p></div>
+              <div class="workspace-navigator-toolbar">
+                <label class="workspace-search"><span class="sr-only">Filter workspace files</span><input id="workspace-search" type="search" placeholder="Filter files…" autocomplete="off"></label>
+                <div class="workspace-tree-actions"><button id="expand-workspace" class="text-button" type="button">Expand all</button><button id="collapse-workspace" class="text-button" type="button">Collapse</button></div>
+              </div>
+              <div id="file-list" class="file-list" role="tree" aria-label="Workspace files"><p class="empty">No artifacts yet.</p></div>
+              <p id="workspace-list-message" class="workspace-list-message" role="status"></p>
             </article>
             <article class="panel capability-card">
               <div class="panel-heading"><div><p class="kicker">RUNTIME MOUNTS</p><h2>Additional attachments</h2></div><span id="attachment-count" class="pill neutral">checking</span></div>
@@ -460,6 +465,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=12"></script>
+    <script type="module" src="/app.js?v=13"></script>
   </body>
 </html>

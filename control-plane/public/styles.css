@@ -275,14 +275,25 @@ button.pill.warn:disabled { opacity: .6; cursor: default; }
 .icon-button { width: 32px; height: 32px; font-size: 18px; }
 .text-button { padding: 6px 9px; }
 
-.workspace-panel { min-height: 330px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.workspace-panel { min-height: 430px; }
 .mount-summary { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; margin: -6px 0 16px; padding: 12px; background: #0d110f; border: 1px solid var(--line); }
 .mount-summary code { color: var(--acid); font-size: 12px; }
 .mount-summary > span { color: var(--muted); font-size: 11px; }
-.file-list { max-height: 230px; overflow: auto; }
-.file { display: grid; grid-template-columns: 20px 1fr auto; gap: 7px; align-items: center; padding: 7px 0; border-bottom: 1px solid #222824; font: 11px ui-monospace, monospace; }
-.file .kind { color: var(--acid); }
-.file .size { color: var(--faint); }
+.workspace-navigator-toolbar { display: grid; grid-template-columns: minmax(120px, 1fr) auto; gap: 8px; margin-bottom: 9px; }
+.workspace-search input { padding: 8px 10px; font: 10px ui-monospace, monospace; }
+.workspace-tree-actions { display: flex; gap: 6px; }
+.workspace-tree-actions .text-button { padding: 6px 8px; font-size: 10px; }
+.file-list { min-height: 180px; max-height: 340px; overflow: auto; background: #0a0d0b; border: 1px solid var(--line); }
+.file-tree-item { min-width: 0; }
+.file-tree-row { display: grid; grid-template-columns: 14px 14px minmax(0, 1fr) auto; width: 100%; min-width: 0; gap: 6px; align-items: center; padding: 7px 9px 7px calc(9px + var(--tree-indent)); color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid #1d231f; border-radius: 0; text-align: left; font: 11px ui-monospace, monospace; }
+button.file-tree-row { cursor: pointer; }
+button.file-tree-row:hover, button.file-tree-row:focus-visible { background: #141a16; outline: none; }
+.file-tree-disclosure, .file-tree-icon { color: var(--acid); text-align: center; }
+.file-tree-item.file .file-tree-icon { color: var(--faint); }
+.file-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-meta { margin-left: 12px; color: var(--faint); font-size: 9px; white-space: nowrap; }
+.workspace-list-message { min-height: 14px; margin: 7px 0 0; color: var(--faint); font: 9px ui-monospace, monospace; text-align: right; }
 .empty { color: var(--faint); font-size: 12px; }
 
 .config-panel { margin-bottom: 0; }
@@ -444,6 +455,8 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .tab-list { margin-left: -8px; margin-right: -8px; }
   .mount-summary { grid-template-columns: 1fr auto; }
   .mount-summary > span { grid-column: 1 / -1; grid-row: 2; }
+  .workspace-navigator-toolbar { grid-template-columns: 1fr; }
+  .workspace-tree-actions { justify-content: flex-end; }
   footer { gap: 12px; flex-direction: column; }
 }
 

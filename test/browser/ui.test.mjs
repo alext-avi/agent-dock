@@ -401,6 +401,23 @@ test('the Data tab registers a scoped folder and applies an explicit read-write 
   });
 });
 
+test('the workspace navigator expands folders and filters nested files', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#data`);
+  t.after(() => page.close());
+  const folder = page.locator('[data-path="control-plane"] > .file-tree-row');
+  await folder.waitFor({ state: 'visible' });
+  assert.equal(await folder.getAttribute('aria-expanded'), 'false');
+  await folder.click();
+  assert.equal(await folder.getAttribute('aria-expanded'), 'true');
+  await page.locator('[data-path="control-plane/auth.mjs"] > .file-tree-row').waitFor({ state: 'visible' });
+
+  await page.fill('#workspace-search', 'docker-runtime.mjs');
+  await page.locator('[data-path="control-plane/docker-runtime.mjs"] > .file-tree-row').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#workspace-list-message').textContent(), /item/);
+  assert.equal(await page.locator('#file-list').getAttribute('role'), 'tree');
+});
+
 test('a weekly job uses plain-language controls while the API receives cron internally', async (t) => {
   const page = await openPage('/jobs');
   t.after(() => page.close());

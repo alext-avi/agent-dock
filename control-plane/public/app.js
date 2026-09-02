@@ -171,6 +171,8 @@ const ui = {
   conversation: $('#conversation'),
   rawOutput: $('#raw-output'),
   fileList: $('#file-list'),
+  workspaceSearch: $('#workspace-search'),
+  workspaceListMessage: $('#workspace-list-message'),
   workspaceRoot: $('#workspace-root'),
   workspaceAccess: $('#workspace-access'),
   workspaceDescription: $('#workspace-description'),
@@ -237,6 +239,11 @@ let attachmentRoots = [];
 let dataSources = [];
 let agentAttachments = [];
 let dataRefreshInFlight = false;
+let workspaceEntries = [];
+let workspaceTree = null;
+let workspaceTruncated = false;
+let currentWorkspaceRoot = null;
+const expandedWorkspaceDirectories = new Set();
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -1805,7 +1812,7 @@ async function saveAttachment(event) {
       })
     });
     ui.attachmentDialog.close();
-    await Promise.all([refreshData(), refreshStatus()]);
+    await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
     ui.attachmentMessage.textContent = 'Attachment applied. The replacement runtime is starting.';
   } catch (error) {
     ui.attachmentFormMessage.textContent = error.message;
@@ -1823,7 +1830,7 @@ async function detachDataSource() {
   try {
     await api(agentApi(`attachments/${encodeURIComponent(attachment.id)}`), { method: 'DELETE' });
     ui.attachmentDialog.close();
-    await Promise.all([refreshData(), refreshStatus()]);
+    await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
     ui.attachmentMessage.textContent = 'Attachment removed; source data was left intact.';
   } catch (error) {
     ui.attachmentFormMessage.textContent = error.message;
@@ -2298,36 +2305,152 @@ async function refreshAuthentication() {
   }
 }
 
+function buildWorkspaceTree(entries) {
+  const root = { name: '', path: '', type: 'directory', children: new Map() };
+  for (const entry of entries) {
+    if (!entry || !['directory', 'file'].includes(entry.type) || typeof entry.path !== 'string') continue;
+    const normalized = entry.path.replace(/\/+$/, '');
+    const segments = normalized.split('/').filter(Boolean);
+    if (!segments.length || segments.some((segment) => segment === '.' || segment === '..')) continue;
+    let parent = root;
+    for (let index = 0; index < segments.length; index += 1) {
+      const name = segments[index];
+      const path = segments.slice(0, index + 1).join('/');
+      const last = index === segments.length - 1;
+      const type = last ? entry.type : 'directory';
+      let node = parent.children.get(name);
+      if (!node) {
+        node = { name, path, type, size: last ? entry.size ?? null : null, children: new Map() };
+        parent.children.set(name, node);
+      } else if (last) {
+        node.type = type;
+        node.size = entry.size ?? null;
+      }
+      parent = node;
+    }
+  }
+  return root;
+}
+
+function sortedWorkspaceChildren(node) {
+  return [...node.children.values()].sort((left, right) => (
+    left.type === right.type
+      ? left.name.localeCompare(right.name)
+      : left.type === 'directory' ? -1 : 1
+  ));
+}
+
+function workspaceNodeMatches(node, query) {
+  if (!query || node.path.toLowerCase().includes(query)) return true;
+  return node.type === 'directory' && sortedWorkspaceChildren(node).some((child) => workspaceNodeMatches(child, query));
+}
+
+function renderWorkspaceNode(node, depth, query) {
+  const item = document.createElement('div');
+  item.className = `file-tree-item ${node.type === 'directory' ? 'directory' : 'file'}`;
+  item.dataset.path = node.path;
+  item.setAttribute('role', 'treeitem');
+  item.setAttribute('aria-level', String(depth + 1));
+
+  const row = document.createElement(node.type === 'directory' ? 'button' : 'div');
+  row.className = 'file-tree-row';
+  row.style.setProperty('--tree-indent', `${depth * 17}px`);
+  row.title = node.path;
+  if (node.type === 'directory') row.type = 'button';
+
+  const forcedOpen = Boolean(query);
+  const open = forcedOpen || expandedWorkspaceDirectories.has(node.path);
+  const disclosure = document.createElement('span');
+  disclosure.className = 'file-tree-disclosure';
+  disclosure.textContent = node.type === 'directory' ? (open ? '▾' : '▸') : '·';
+  const icon = document.createElement('span');
+  icon.className = 'file-tree-icon';
+  icon.textContent = node.type === 'directory' ? '□' : '–';
+  const name = document.createElement('span');
+  name.className = 'file-tree-name';
+  name.textContent = node.name;
+  const meta = document.createElement('span');
+  meta.className = 'file-tree-meta';
+  meta.textContent = node.type === 'directory' ? `${node.children.size} item${node.children.size === 1 ? '' : 's'}` : formatBytes(node.size);
+  row.append(disclosure, icon, name, meta);
+  item.append(row);
+
+  if (node.type === 'directory') {
+    row.setAttribute('aria-expanded', String(open));
+    row.addEventListener('click', () => {
+      if (expandedWorkspaceDirectories.has(node.path)) expandedWorkspaceDirectories.delete(node.path);
+      else expandedWorkspaceDirectories.add(node.path);
+      renderWorkspaceNavigator();
+    });
+    if (open) {
+      const group = document.createElement('div');
+      group.className = 'file-tree-group';
+      group.setAttribute('role', 'group');
+      for (const child of sortedWorkspaceChildren(node)) {
+        if (workspaceNodeMatches(child, query)) group.append(renderWorkspaceNode(child, depth + 1, query));
+      }
+      item.append(group);
+    }
+  }
+  return item;
+}
+
+function renderWorkspaceNavigator() {
+  ui.fileList.replaceChildren();
+  const query = ui.workspaceSearch.value.trim().toLowerCase();
+  const visible = workspaceTree ? sortedWorkspaceChildren(workspaceTree).filter((node) => workspaceNodeMatches(node, query)) : [];
+  if (!visible.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = workspaceEntries.length ? 'No files match this filter.' : 'No artifacts yet.';
+    ui.fileList.append(empty);
+  } else {
+    for (const node of visible) ui.fileList.append(renderWorkspaceNode(node, 0, query));
+  }
+  const count = `${workspaceEntries.length} item${workspaceEntries.length === 1 ? '' : 's'}`;
+  ui.workspaceListMessage.textContent = workspaceTruncated
+    ? `${count} shown · listing limit reached`
+    : count;
+}
+
+function setAllWorkspaceDirectories(expanded) {
+  expandedWorkspaceDirectories.clear();
+  if (expanded && workspaceTree) {
+    const visit = (node) => {
+      for (const child of node.children.values()) {
+        if (child.type === 'directory') {
+          expandedWorkspaceDirectories.add(child.path);
+          visit(child);
+        }
+      }
+    };
+    visit(workspaceTree);
+  }
+  renderWorkspaceNavigator();
+}
+
 async function refreshWorkspace() {
   if (!currentAgent) return;
   try {
     const { workspace } = await api(agentApi('workspace'));
-    renderWorkspaceSummary(workspace?.root ?? currentAgent?.runtime?.workingDirectory ?? '/workspace');
-    const entries = workspace?.entries ?? [];
-    ui.fileList.replaceChildren();
-    if (!entries.length) {
-      const empty = document.createElement('p');
-      empty.className = 'empty';
-      empty.textContent = 'No artifacts yet.';
-      ui.fileList.append(empty);
-      return;
+    const configuredWorkingDirectory = agentAttachments.find((attachment) => attachment.purpose === 'working-directory')?.target;
+    const root = configuredWorkingDirectory ?? workspace?.root ?? currentAgent?.runtime?.workingDirectory ?? '/workspace';
+    renderWorkspaceSummary(root);
+    if (currentWorkspaceRoot !== root) {
+      currentWorkspaceRoot = root;
+      expandedWorkspaceDirectories.clear();
+      ui.workspaceSearch.value = '';
     }
-    for (const entry of entries) {
-      const row = document.createElement('div');
-      row.className = 'file';
-      const kind = document.createElement('span');
-      kind.className = 'kind';
-      kind.textContent = entry.type === 'directory' ? '▸' : '·';
-      const name = document.createElement('span');
-      name.textContent = entry.path;
-      const size = document.createElement('span');
-      size.className = 'size';
-      size.textContent = entry.type === 'file' ? formatBytes(entry.size) : '';
-      row.append(kind, name, size);
-      ui.fileList.append(row);
-    }
+    workspaceEntries = Array.isArray(workspace?.entries) ? workspace.entries : [];
+    workspaceTruncated = workspace?.truncated === true;
+    workspaceTree = buildWorkspaceTree(workspaceEntries);
+    renderWorkspaceNavigator();
   } catch {
+    workspaceEntries = [];
+    workspaceTree = null;
+    workspaceTruncated = false;
     ui.fileList.innerHTML = '<p class="empty">Workspace unavailable until a runtime is attached.</p>';
+    ui.workspaceListMessage.textContent = '';
   }
 }
 
@@ -2516,6 +2639,9 @@ ui.accessPolicyButton.addEventListener('click', () => ui.accessPolicyDialog.show
 $('#close-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
 $('#dismiss-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
 $('#refresh-files').addEventListener('click', refreshWorkspace);
+ui.workspaceSearch.addEventListener('input', renderWorkspaceNavigator);
+$('#expand-workspace').addEventListener('click', () => setAllWorkspaceDirectories(true));
+$('#collapse-workspace').addEventListener('click', () => setAllWorkspaceDirectories(false));
 $('#clear-output').addEventListener('click', () => {
   ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';
   ui.rawOutput.textContent = '';

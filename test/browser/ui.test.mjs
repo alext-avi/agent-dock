@@ -411,6 +411,26 @@ test('the Data tab maps a chosen folder with explicit access in one flow', async
   });
 });
 
+test('streaming task submission uses the authenticated CSRF request path', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  let requestHeaders;
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    requestHeaders = route.request().headers();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: '{"type":"task.completed","taskId":"browser-csrf-test","data":{"status":"completed"}}\n'
+    });
+  });
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'Verify the authenticated streaming request.');
+  await page.click('#run-button');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  assert.equal(requestHeaders?.['x-agent-dock-csrf'], '1');
+});
+
 test('the workspace navigator expands folders and filters nested files', async (t) => {
   const agent = app.agents['claude-code'];
   const page = await openPage(`/agents/${agent.id}#data`);

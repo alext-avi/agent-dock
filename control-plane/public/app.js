@@ -247,7 +247,7 @@ function setConnection(state, label) {
   ui.connectionLabel.textContent = label;
 }
 
-async function api(path, options = {}) {
+async function authenticatedFetch(path, options = {}) {
   const method = (options.method ?? 'GET').toUpperCase();
   const response = await fetch(path, {
     ...options,
@@ -267,6 +267,11 @@ async function api(path, options = {}) {
     window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
     throw new Error('Authentication required');
   }
+  return response;
+}
+
+async function api(path, options = {}) {
+  const response = await authenticatedFetch(path, options);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
@@ -2475,7 +2480,7 @@ async function runTask() {
   ui.workerState.className = 'pill busy';
   ui.runMessage.textContent = 'Opening event stream…';
   try {
-    const response = await fetch(agentApi('tasks'), {
+    const response = await authenticatedFetch(agentApi('tasks'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt })

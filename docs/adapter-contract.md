@@ -22,6 +22,8 @@ Current protocol version: `agent-wrapper/v1`.
 | `POST` | `/v1/usage/refresh` | Ask the adapter to refresh available usage sources |
 | `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "...", "modelPolicy": {...} }` and stream canonical NDJSON events |
 | `POST` | `/v1/tasks/cancel` | Cancel `{ "taskId": "..." }` only when it still identifies the active task |
+| `GET` | `/v1/conversations` | List conversations this worker can continue |
+| `GET`, `DELETE` | `/v1/conversations/:id` | Read one conversation, or forget the worker's mapping for it |
 
 Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. Errors use the same envelope with an `error` string.
 
@@ -34,6 +36,26 @@ MCP management uses one round-trippable `servers[]` DTO in both directions; prov
 `PUT /v1/mcp` carries an optional second field alongside `servers[]`: `credentials`, a map from credential id to `{ header, value }`, resolved by the control plane for this apply. A definition opts into it with `credentialId` instead of `secretHeaders`. The two are additive fields inside `agent-wrapper/v1`, but they are **not safely ignorable**: a worker that drops `credentials` and renders a `credentialId` definition anyway would configure a connector with no authentication at all while reporting success, turning "no secret headers" from *unauthenticated by design* into *silently unauthenticated*. So the capability is gated in both directions. A worker that understands delivery advertises `credentialDelivery: true` in the `capabilities` of `GET /v1/mcp`, and the control plane refuses to apply a `credentialId` definition to a runtime that does not. A worker that receives a `credentialId` with no matching delivery fails the apply with `missing_credential` rather than applying it bare.
 
 `GET /v1/mcp` also reports `pendingCredentials[]`: the names of configured connectors whose credential this worker process does not hold. Delivered credentials live in memory only, so a restarted worker is in this state until the next apply, and the field is how the control plane learns its own record of "applied" is ahead of the runtime.
+
+## Conversations
+
+`POST /v1/tasks` accepts an optional `conversationId`. Given one, the worker continues the same exchange instead of starting a fresh one, and emits a `conversation.continued` event carrying `{ conversationId, resumed, turns }` before the task begins. Omitted, a task behaves exactly as it always has.
+
+The field is additive but **not safely ignorable**, and is gated in both directions for the same reason `credentialId` is. An older worker would ignore it, answer without the earlier turns, and report success — which a caller reads as an agent that quietly stopped listening. So a worker advertises `capabilities.tasks.conversations`, the control plane refuses to forward a `conversationId` to a runtime that has not, and a worker handed one it cannot honour returns 409 rather than answering without context.
+
+**Every provider's session identifier stays below the wrapper.** A conversation id is opaque and caller-chosen; the worker keeps the mapping to whatever the harness actually uses. This is what the boundary is absorbing, because no two harnesses agree:
+
+| Adapter | Session identity | How the worker learns it |
+|---|---|---|
+| `claude-code` | accepts an id the worker chooses | nothing to learn — supplied as `--session-id`, resumed with `--resume` |
+| `codex-cli` | mints its own | announced once as `thread_id` on `thread.started` |
+| `opencode` | mints its own | stamped as `sessionID` on every event |
+
+An adapter whose CLI cannot resume advertises `conversations: false` and is never sent a `conversationId`. Nothing is synthesized to paper over the difference.
+
+The mapping is durable, because provider sessions are: a harness records its session on the agent's own volume and can resume it after a restart, so a worker that forgot the mapping would strand recoverable context. A conversation reports `resumable: false` until the harness has given the worker something to resume from — a first turn that failed before announcing its session leaves no continuity, and saying so is better than implying otherwise. `DELETE /v1/conversations/:id` forgets the worker's mapping only; it does not reach into the provider's own session storage.
+
+One provider asymmetry is worth recording because it is not visible from the flags the worker passes: `codex exec resume` accepts neither `-C/--cd` nor `--sandbox`, unlike `codex exec`. The working directory comes from the spawned process instead, and a resumed thread carries the sandbox settings recorded with it. Verified against codex-cli 0.152.1.
 
 ## Status model
 
@@ -108,6 +130,7 @@ A new adapter must implement the following behaviors behind the wrapper:
 10. Keep provider credential files, raw auth responses, raw tokens, and private connection URLs inside the worker boundary.
 11. Validate, apply, inspect, and activate the canonical MCP desired state without returning resolved connector secrets.
 12. Advertise `credentialDelivery` truthfully, and refuse a `credentialId` definition it cannot satisfy rather than applying it without authentication.
+13. Advertise `conversations` truthfully, keep its provider's session identifier below the wrapper, and refuse a `conversationId` it cannot continue rather than answering without the earlier turns.
 
 The Codex, Claude Code, and OpenCode translators live under `worker/adapters/`. All satisfy this contract; the control plane does not branch on provider-specific event, credential, or MCP configuration formats.
 

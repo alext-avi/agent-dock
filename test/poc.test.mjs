@@ -900,36 +900,55 @@ test('every form pattern compiles the way a browser compiles it', async () => {
   }
 });
 
-test('the control-plane image ships every module its entrypoint imports', async () => {
-  const root = new URL('../control-plane/', import.meta.url);
-  const dockerfile = await readFile(new URL('Dockerfile', root), 'utf8');
-  const copied = dockerfile
-    .split('\n')
-    .filter((line) => line.startsWith('COPY '))
-    .flatMap((line) => line.slice(5).trim().split(/\s+/).slice(0, -1));
+// Covers every image, not just the control plane's: the same omission in the
+// three worker Dockerfiles took down the whole fleet after the control-plane
+// case had already been fixed and tested.
+for (const [label, directory, dockerfile] of [
+  ['control plane', '../control-plane/', 'Dockerfile'],
+  ['codex worker', '../worker/', 'Dockerfile'],
+  ['claude worker', '../worker/', 'Dockerfile.claude'],
+  ['opencode worker', '../worker/', 'Dockerfile.opencode']
+]) {
+  test(`the ${label} image ships every module its entrypoint imports`, async () => {
+    const root = new URL(directory, import.meta.url);
+    const recipe = await readFile(new URL(dockerfile, root), 'utf8');
+    const copied = recipe
+      .split('\n')
+      .filter((line) => line.startsWith('COPY '))
+      .flatMap((line) => line.slice(5).trim().split(/\s+/).filter((entry) => !entry.startsWith('--')).slice(0, -1));
 
-  const seen = new Set();
-  const pending = ['server.mjs'];
-  while (pending.length) {
-    const name = pending.pop();
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const source = await readFile(new URL(name, root), 'utf8');
-    for (const [, specifier] of source.matchAll(/from '(\.\/[^']+)'/g)) {
-      pending.push(specifier.slice(2));
+    // Resolve each specifier against the file that imports it, not against the
+    // image root — nested modules reach siblings with ../ and would otherwise
+    // resolve to paths that do not exist.
+    const seen = new Set();
+    const pending = [new URL('server.mjs', root)];
+    while (pending.length) {
+      const moduleUrl = pending.pop();
+      const name = decodeURIComponent(moduleUrl.href.slice(root.href.length));
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const source = await readFile(moduleUrl, 'utf8');
+      for (const [, specifier] of source.matchAll(/from '(\.[^']+)'/g)) {
+        pending.push(new URL(specifier, moduleUrl));
+      }
     }
-  }
 
-  for (const name of seen) {
-    // A COPY entry is root-relative now that the build context is the repo root,
-    // so match on the basename of the glob as well as the literal entry.
-    const shipped = copied.some((entry) => {
-      const tail = entry.split('/').pop();
-      return entry === name || tail === name || (tail === '*.mjs' && name.endsWith('.mjs'));
-    });
-    assert.ok(shipped, `${name} is imported by the control plane but never copied into its image`);
-  }
-});
+    for (const name of seen) {
+      const topLevel = name.includes('/') ? name.split('/')[0] : null;
+      // An entry may be root-relative once a build context is the repository
+      // root, so compare on the basename of the glob as well as the literal
+      // entry, and let a copied directory cover the modules inside it.
+      const shipped = copied.some((entry) => {
+        const tail = entry.split('/').pop();
+        if (entry === name || tail === name) return true;
+        if (tail === '*.mjs' && name.endsWith('.mjs') && !name.includes('/')) return true;
+        if (topLevel && (entry === topLevel || tail === topLevel)) return true;
+        return false;
+      });
+      assert.ok(shipped, `${name} is imported by the ${label} but never copied into its image`);
+    }
+  });
+}
 
 test('the shared container spec carries every setting a worker needs', async () => {
   const manager = new DockerRuntimeManager({

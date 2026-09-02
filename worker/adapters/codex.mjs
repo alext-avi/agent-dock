@@ -7,7 +7,7 @@ export const codexAdapterManifest = Object.freeze({
   displayName: 'Codex',
   capabilities: {
     authentication: { methods: ['device_code'], refresh: true },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     mcp: codexMcpCapabilities,
     usage: { requestTokens: true, accountActivity: true, quotaWindows: true },
     workspace: { list: true }
@@ -76,4 +76,15 @@ export function normalizeCodexEvent(event = {}) {
   }
 
   return { type: 'provider.event', data: { name: event.type || 'unknown' } };
+}
+
+
+// Codex mints its own thread id and announces it once, before the first turn:
+//   {"type":"thread.started","thread_id":"01a062b2-...."}
+// Observed from a real `codex exec --json` run rather than assumed. The worker
+// keeps this against its own conversation id; the value never crosses the wrapper.
+export function observeCodexSessionId(event = {}) {
+  if (event.type !== 'thread.started') return null;
+  const id = event.thread_id;
+  return typeof id === 'string' && id ? id : null;
 }

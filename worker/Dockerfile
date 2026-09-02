@@ -9,7 +9,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /workspace /codex-home /opt/codex
-COPY server.mjs protocol.mjs workload-auth.mjs entrypoint.sh ./
+# Every module, not a list that has to be remembered. An omission here is not
+# a build error: the image starts and dies on its first import at runtime.
+COPY *.mjs entrypoint.sh ./
 COPY adapters ./adapters
 COPY mcp ./mcp
 RUN chmod 0755 /app/entrypoint.sh

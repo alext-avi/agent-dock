@@ -16,7 +16,7 @@ export const opencodeAdapterManifest = Object.freeze({
   displayName: 'OpenCode',
   capabilities: {
     authentication: { methods: ['provider_device_code'], refresh: false },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     providers: { list: true, discovery: true, localConnections: true },
     models: { discovery: true, selection: true, orderedFallback: false },
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
@@ -79,4 +79,12 @@ export function normalizeOpenCodeEvent(event = {}) {
   }
 
   return { type: 'provider.event', data: { name: event.type || part.type || 'unknown' } };
+}
+
+
+// OpenCode stamps sessionID on every event it emits, so any of them identifies
+// the session. Observed from a real `opencode run --format json` run.
+export function observeOpenCodeSessionId(event = {}) {
+  const id = event.sessionID ?? event.part?.sessionID;
+  return typeof id === 'string' && id ? id : null;
 }

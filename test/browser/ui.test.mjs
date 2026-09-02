@@ -44,6 +44,7 @@ function createFakeRuntimeManager(workers) {
     currentImage: 'agent-dock-worker:v1',
     recreateDelay: null,
     provisioned: [],
+    recreated: [],
     async provision({ agentId, adapter }) {
       const worker = workers[adapter];
       const id = `runtime-${this.provisioned.length + 1}`;
@@ -61,6 +62,8 @@ function createFakeRuntimeManager(workers) {
         image: this.currentImage,
         imageId: this.currentImage,
         volumes: { auth: `${id}-auth`, binary: `${id}-bin`, telemetry: `${id}-data`, workspace: `${id}-work` },
+        appliedAttachmentIds: [],
+        workingDirectory: '/workspace',
         state: 'running',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -75,8 +78,9 @@ function createFakeRuntimeManager(workers) {
     async currentImageId() {
       return this.currentImage;
     },
-    async recreate(runtime) {
+    async recreate(runtime, { attachments = [], previousAttachments = attachments } = {}) {
       if (this.recreateDelay) await this.recreateDelay;
+      this.recreated.push({ runtimeId: runtime.id, attachments, previousAttachments });
       return {
         containerId: `${runtime.containerId}-new`,
         containerName: runtime.containerName,
@@ -84,10 +88,28 @@ function createFakeRuntimeManager(workers) {
         image: this.currentImage,
         imageId: this.currentImage,
         volumes: runtime.volumes,
+        appliedAttachmentIds: attachments.map((attachment) => attachment.id),
+        workingDirectory: attachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
         state: 'running',
         updatedAt: new Date().toISOString()
       };
     },
+    async materializeAttachments({ attachments, sources }) {
+      return attachments.map((attachment) => {
+        const source = sources.get(attachment.dataSourceId);
+        return {
+          ...attachment,
+          mount: {
+            Type: source.kind === 'managed-volume' ? 'volume' : 'bind',
+            Source: source.volumeName ?? `/approved/${source.rootId}/${source.relativePath}`,
+            Target: attachment.target,
+            ReadOnly: attachment.access === 'read-only'
+          }
+        };
+      });
+    },
+    async createManagedDataVolume(id) { return `managed-${id}`; },
+    async deleteManagedDataVolume() {},
     async stop() {},
     async start() {},
     async destroy() {}
@@ -138,7 +160,11 @@ async function startApp() {
     workerUrl: workers['codex-cli'].url,
     workerToken: token,
     runtimeManager,
-    dataPath: null
+    dataPath: null,
+    attachmentRoots: {
+      projects: { label: 'Projects', hostPath: '/Users/tester/Projects', allowWrite: true },
+      reference: { label: 'Reference', hostPath: '/Users/tester/Reference', allowWrite: false }
+    }
   });
   const url = await listen(control);
 
@@ -328,6 +354,51 @@ test('a deferred one-off job is configured without scheduling notation', async (
   assert.equal(schedule.timing.kind, 'once');
   assert.equal(schedule.timing.at, new Date('2099-01-02T10:15').toISOString());
   assert.match(await page.locator(`.job-card[data-schedule-id="${schedule.id}"]`).textContent(), /Run once/);
+});
+
+test('the Data tab registers a scoped folder and applies an explicit read-write working directory', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#data`);
+  t.after(() => page.close());
+  await page.waitForFunction(() => document.querySelector('#attachment-count')?.textContent === '0 attached');
+
+  await page.click('#new-data-source');
+  await page.fill('#data-source-name', 'Browser project');
+  await page.fill('#data-source-description', 'Scoped source created by the browser test');
+  await page.selectOption('#data-source-root', 'projects');
+  await page.fill('#data-source-path', 'agent-dock');
+  assert.match(await page.locator('#data-source-root-policy').textContent(), /exclusive read\/write/);
+  await page.click('#save-data-source');
+  await page.waitForFunction(() => [...document.querySelectorAll('#data-source-list strong')].some((node) => node.textContent === 'Browser project'));
+
+  await page.click('#new-attachment');
+  await page.fill('#attachment-name', 'project');
+  await page.selectOption('#attachment-access', 'read-write');
+  await page.selectOption('#attachment-purpose', 'working-directory');
+  assert.match(await page.locator('#attachment-policy').textContent(), /exclusive/);
+  await page.click('#save-attachment');
+  await page.waitForFunction(() => document.querySelector('#attachment-count')?.textContent === '1 attached');
+
+  const attachmentCard = page.locator('#attachment-list .data-record');
+  assert.match(await attachmentCard.textContent(), /WORKING DIRECTORY/);
+  assert.match(await attachmentCard.textContent(), /read \/ write/);
+  assert.match(await attachmentCard.textContent(), /\/data\/project/);
+  assert.equal(await page.locator('#workspace-root').textContent(), '/data/project');
+  assert.equal(await page.locator('#workspace-access').textContent(), 'read / write');
+  assert.match(await page.locator('#workspace-description').textContent(), /Browser project/);
+
+  const attachmentState = await (await fetch(`${app.url}/api/v1/agents/${agent.id}/attachments`)).json();
+  assert.equal(attachmentState.workingDirectory, '/data/project');
+  assert.equal(attachmentState.attachments[0].access, 'read-write');
+  assert.equal(JSON.stringify(attachmentState).includes('/Users/tester/Projects'), false);
+  assert.equal(app.runtimeManager.recreated.at(-1).attachments[0].mount.ReadOnly, false);
+
+  const attachment = attachmentState.attachments[0];
+  const source = attachment.source;
+  await fetch(`${app.url}/api/v1/agents/${agent.id}/attachments/${attachment.id}`, { method: 'DELETE' });
+  await fetch(`${app.url}/api/v1/data-sources/${source.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: '{}'
+  });
 });
 
 test('a weekly job uses plain-language controls while the API receives cron internally', async (t) => {

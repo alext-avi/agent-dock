@@ -8,12 +8,13 @@ flowchart TB
     ControlMcp["Control-plane MCP · official TypeScript SDK\nSafe fleet + durable delegation tools"]
     Auth["Platform identity + policy\nOIDC/PKCE · sessions · roles/scopes"]
     AuthDb[("SQLite\nRevocable browser sessions")]
-    Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
+    Registry["Schema-v4 JSON registry\nAgents · runtimes · MCP · scoped data"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
+    Data["Scoped storage service\nHost subfolders · managed volumes\nRO/RW policy + write leases"]
     Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
     ScheduleDb[("SQLite\nSchedules · occurrence claims · run history")]
     DelegationDb[("SQLite\nTask handles · lineage · results + usage")]
-    Provisioner["Docker runtime manager\nExclusive ownership enforcement"]
+    Provisioner["Docker runtime manager\nValidation · exact mounts · safe replacement"]
   end
 
   Engine["Docker Engine API\nLocal Unix socket"]
@@ -37,7 +38,7 @@ flowchart TB
   Providers["OpenAI · Anthropic · OpenCode providers · host Ollama"]
   MCP["Per-agent MCP servers\nstdio command policy · remote HTTP"]
   Guard["Never exposed as MCP tools\nMCP admin · storage/mount mutation"]
-  Data["Future scoped data attachments"]
+  HostData["Operator-approved host roots\nExact subfolders only"]
   React["Planned web client\nReact + TypeScript + Vite"]
   Database["Planned unified repository\nMigrate JSON registry · Postgres-ready boundary"]
 
@@ -52,11 +53,14 @@ flowchart TB
   Auth <--> AuthDb
   API <--> Registry
   API <--> McpService
+  API <--> Data
+  Data --> Provisioner
   API <--> Scheduler
   Scheduler <--> ScheduleDb
   API --> Provisioner --> Engine
   Engine --> RuntimeA
   Engine --> RuntimeB
+  HostData -->|"validated bind source"| Engine
   API -->|"Short-lived scoped JWT\nworker-specific audience"| WA
   API -->|"Short-lived scoped JWT\nworker-specific audience"| WB
   Scheduler -->|"Claim then dispatch via wrapper"| WA
@@ -71,5 +75,5 @@ flowchart TB
   WA --> MCP
   WB --> MCP
   ControlMcp --- Guard
-  Data -.-> VA
-  Data -.-> VB
+  Engine -->|"RO/RW bind or managed volume"| VA
+  Engine -->|"RO/RW bind or managed volume"| VB

@@ -1,6 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import { hostname } from 'node:os';
+import { resolve } from 'node:path';
+import { parseAttachmentRoots } from './data-attachments.mjs';
 
 const ADAPTERS = {
   'codex-cli': {
@@ -10,6 +12,7 @@ const ADAPTERS = {
     binTarget: '/opt/codex',
     versionEnv: 'CODEX_VERSION',
     version: 'latest',
+    user: '0:0',
     environment: {
       AGENT_ADAPTER: 'codex-cli',
       CODEX_HOME: '/codex-home'
@@ -22,6 +25,7 @@ const ADAPTERS = {
     binTarget: '/opt/claude',
     versionEnv: 'CLAUDE_VERSION',
     version: 'latest',
+    user: '10001:10001',
     environment: {
       AGENT_ADAPTER: 'claude-code',
       HOME: '/claude-home',
@@ -40,6 +44,7 @@ const ADAPTERS = {
     binTarget: '/opt/opencode',
     versionEnv: 'OPENCODE_VERSION',
     version: 'latest',
+    user: '10002:10002',
     environment: {
       AGENT_ADAPTER: 'opencode',
       HOME: '/opencode-home',
@@ -54,6 +59,29 @@ const ADAPTERS = {
     extraHosts: ['host.docker.internal:host-gateway']
   }
 };
+
+const ATTACHMENT_ROOT_LABEL = 'com.agent-dock.data-source-id';
+const ATTACHMENT_VALIDATOR_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const relative = process.env.RELATIVE_PATH;
+const access = process.env.ACCESS_MODE;
+if (!relative || !['read-only', 'read-write'].includes(access)) process.exit(10);
+let current = '/source';
+for (const segment of relative === '.' ? [] : relative.split('/')) {
+  if (!segment || segment === '.' || segment === '..') process.exit(11);
+  current = path.join(current, segment);
+  let metadata;
+  try { metadata = fs.lstatSync(current); } catch { process.exit(12); }
+  if (metadata.isSymbolicLink()) process.exit(13);
+}
+let metadata;
+try { metadata = fs.statSync(current); } catch { process.exit(12); }
+if (!metadata.isDirectory()) process.exit(14);
+try {
+  fs.accessSync(current, fs.constants.R_OK | (access === 'read-write' ? fs.constants.W_OK : 0));
+} catch { process.exit(15); }
+`;
 
 function dockerError(status, body, path) {
   let message = body;
@@ -120,6 +148,10 @@ export class DockerRuntimeManager {
     this.allowUnsandboxed = String(options.allowUnsandboxed ?? process.env.ALLOW_UNSANDBOXED ?? '1');
     this.busyRuntimes = new Map();
     this.mcpAllowedCommands = String(options.mcpAllowedCommands ?? process.env.MCP_ALLOWED_COMMANDS ?? '');
+    this.attachmentRoots = parseAttachmentRoots(options.attachmentRoots ?? process.env.ATTACHMENT_ROOTS_JSON ?? {});
+    this.attachmentValidatorImage = options.attachmentValidatorImage
+      ?? process.env.ATTACHMENT_VALIDATOR_IMAGE
+      ?? 'node:22-bookworm-slim';
   }
 
   // Held for the whole of a destructive operation. Checked and set synchronously
@@ -218,10 +250,124 @@ export class DockerRuntimeManager {
     await this.request('POST', '/volumes/create', { Name: name, Labels: labels });
   }
 
+  async createManagedDataVolume(dataSourceId) {
+    const suffix = randomUUID().slice(0, 8);
+    const base = safeName(`agent-dock-source-${dataSourceId}`).slice(0, 71);
+    const name = `${base}-${suffix}`;
+    await this.createVolume(name, {
+      'com.agent-dock.managed': 'true',
+      [ATTACHMENT_ROOT_LABEL]: dataSourceId,
+      'com.agent-dock.kind': 'data-source'
+    });
+    return name;
+  }
+
+  async deleteManagedDataVolume(dataSourceId, volumeName) {
+    const volume = await this.request('GET', `/volumes/${encodeURIComponent(volumeName)}`);
+    if (volume?.Labels?.[ATTACHMENT_ROOT_LABEL] !== dataSourceId) {
+      throw Object.assign(new Error('Managed volume identity does not match the data source'), { status: 409 });
+    }
+    await this.request('DELETE', `/volumes/${encodeURIComponent(volumeName)}`, undefined, [204, 404]);
+  }
+
+  async validateHostDirectory({ rootId, relativePath, access, adapter }) {
+    const root = this.attachmentRoots.get(rootId);
+    if (!root) throw Object.assign(new Error(`Attachment root ${rootId} is not configured`), { status: 400 });
+    if (access === 'read-write' && !root.allowWrite) {
+      throw Object.assign(new Error(`Attachment root ${rootId} does not allow read-write access`), { status: 403 });
+    }
+    const template = ADAPTERS[adapter];
+    if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
+    const body = {
+      Image: this.attachmentValidatorImage,
+      Cmd: ['node', '-e', ATTACHMENT_VALIDATOR_SCRIPT],
+      User: template.user,
+      Env: [`RELATIVE_PATH=${relativePath}`, `ACCESS_MODE=${access}`],
+      HostConfig: {
+        AutoRemove: false,
+        NetworkMode: 'none',
+        ReadonlyRootfs: true,
+        Memory: 128 * 1024 * 1024,
+        NanoCpus: 500_000_000,
+        PidsLimit: 64,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        Mounts: [{
+          Type: 'bind',
+          Source: root.hostPath,
+          Target: '/source',
+          ReadOnly: access === 'read-only'
+        }]
+      }
+    };
+    let containerId = null;
+    try {
+      const created = await this.request('POST', '/containers/create', body);
+      containerId = created.Id;
+      await this.request('POST', `/containers/${encodeURIComponent(containerId)}/start`, undefined, [204]);
+      const result = await this.request('POST', `/containers/${encodeURIComponent(containerId)}/wait?condition=not-running`);
+      const code = Number(result?.StatusCode ?? -1);
+      if (code !== 0) {
+        const messages = {
+          10: 'Attachment validation input is invalid',
+          11: 'Attachment path contains an unsafe segment',
+          12: 'Attachment folder does not exist',
+          13: 'Attachment path may not contain symbolic links',
+          14: 'Attachment source must be a directory',
+          15: `The ${adapter} worker user does not have ${access} permission for this folder`
+        };
+        throw Object.assign(new Error(messages[code] ?? `Attachment validation failed with status ${code}`), { status: 400 });
+      }
+      return resolve(root.hostPath, relativePath);
+    } finally {
+      if (containerId) {
+        await this.request('DELETE', `/containers/${encodeURIComponent(containerId)}?force=true`, undefined, [204, 404]).catch(() => {});
+      }
+    }
+  }
+
+  async materializeAttachments({ adapter, attachments, sources }) {
+    const materialized = [];
+    for (const attachment of attachments) {
+      const source = sources.get(attachment.dataSourceId);
+      if (!source) throw Object.assign(new Error(`Data source ${attachment.dataSourceId} no longer exists`), { status: 409 });
+      let mount;
+      if (source.kind === 'host-directory') {
+        const sourcePath = await this.validateHostDirectory({
+          rootId: source.rootId,
+          relativePath: source.relativePath,
+          access: attachment.access,
+          adapter
+        });
+        mount = {
+          Type: 'bind',
+          Source: sourcePath,
+          Target: attachment.target,
+          ReadOnly: attachment.access === 'read-only',
+          BindOptions: { Propagation: 'rprivate' }
+        };
+      } else {
+        if (!source.volumeName) throw Object.assign(new Error('Managed data source has no volume'), { status: 409 });
+        const volume = await this.request('GET', `/volumes/${encodeURIComponent(source.volumeName)}`);
+        if (volume?.Labels?.[ATTACHMENT_ROOT_LABEL] !== source.id) {
+          throw Object.assign(new Error('Managed volume identity does not match the data source'), { status: 409 });
+        }
+        mount = {
+          Type: 'volume',
+          Source: source.volumeName,
+          Target: attachment.target,
+          ReadOnly: attachment.access === 'read-only'
+        };
+      }
+      materialized.push({ ...attachment, mount });
+    }
+    return materialized;
+  }
+
   // One definition of what a runtime's container is, shared by provisioning and
   // by replacing one. Two copies would drift, and the whole point of a refresh is
   // that the replacement matches what a fresh provision would produce.
-  async containerSpec({ adapter, workerId, workerToken, volumes, labels }) {
+  async containerSpec({ adapter, workerId, workerToken, volumes, labels, attachments = [] }) {
     const template = ADAPTERS[adapter];
     const network = await this.resolveNetwork();
     const image = this.imageOverrides[adapter] ?? process.env[template.imageEnv] ?? template.defaultImage;
@@ -235,6 +381,7 @@ export class DockerRuntimeManager {
       AGENT_DATA_PATH: '/agent-data/usage.json',
       USAGE_POLL_INTERVAL_MS: this.usagePollIntervalMs,
       MCP_ALLOWED_COMMANDS: this.mcpAllowedCommands,
+      WORKSPACE_PATH: attachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
       // Connector secrets are forwarded by namespace rather than enumerated, so
       // adding one needs no code change. Only this prefix crosses into a runtime;
       // the worker resolves definitions against exactly these and nothing else.
@@ -265,7 +412,8 @@ export class DockerRuntimeManager {
             { Type: 'volume', Source: volumes.auth, Target: template.authTarget },
             { Type: 'volume', Source: volumes.binary, Target: template.binTarget },
             { Type: 'volume', Source: volumes.telemetry, Target: '/agent-data' },
-            { Type: 'volume', Source: volumes.workspace, Target: '/workspace' }
+            { Type: 'volume', Source: volumes.workspace, Target: '/workspace' },
+            ...attachments.map((attachment) => attachment.mount)
           ]
         }
       }
@@ -313,6 +461,8 @@ export class DockerRuntimeManager {
         image,
         imageId: inspected?.Image ?? null,
         volumes,
+        appliedAttachmentIds: [],
+        workingDirectory: '/workspace',
         state: 'starting',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -330,7 +480,7 @@ export class DockerRuntimeManager {
   // image, keeping its identity, its worker token, and all four volumes. The
   // volumes are never deleted, so the agent stays authenticated: this is the
   // difference between picking up new worker code and re-running an OAuth flow.
-  async recreate(runtime, { agentId = null } = {}) {
+  async recreate(runtime, { agentId = null, attachments = [], previousAttachments = attachments } = {}) {
     const template = ADAPTERS[runtime.adapter];
     if (!template) throw Object.assign(new Error(`No runtime template exists for ${runtime.adapter}`), { status: 400 });
     if (!runtime.containerName) {
@@ -338,13 +488,13 @@ export class DockerRuntimeManager {
     }
     const release = this.claimRuntime(runtime.id, 'refreshed');
     try {
-      return await this.#recreate(runtime, agentId);
+      return await this.#recreate(runtime, agentId, attachments, previousAttachments);
     } finally {
       release();
     }
   }
 
-  async #recreate(runtime, agentId) {
+  async #recreate(runtime, agentId, attachments, previousAttachments) {
     const volumes = runtime.volumes ?? runtimeVolumes(runtime.id);
     const labels = {
       'com.agent-dock.managed': 'true',
@@ -354,13 +504,49 @@ export class DockerRuntimeManager {
     };
     // Build the spec before removing anything: an unresolvable network or image
     // should fail while the existing container is still running.
-    const { image, body } = await this.containerSpec({
+    const desired = await this.containerSpec({
       adapter: runtime.adapter,
       workerId: runtime.workerId,
       workerToken: runtime.workerToken,
       volumes,
-      labels
+      labels,
+      attachments
     });
+    const previous = await this.containerSpec({
+      adapter: runtime.adapter,
+      workerId: runtime.workerId,
+      workerToken: runtime.workerToken,
+      volumes,
+      labels,
+      attachments: previousAttachments
+    });
+    const createReplacement = async (spec, appliedAttachments) => {
+      let createdId = null;
+      try {
+        const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(runtime.containerName)}`, spec.body);
+        createdId = created.Id;
+        await this.request('POST', `/containers/${encodeURIComponent(createdId)}/start`);
+        const inspected = await this.request('GET', `/containers/${encodeURIComponent(createdId)}/json`).catch(() => null);
+        return {
+          containerId: createdId,
+          containerName: runtime.containerName,
+          workerUrl: `http://${runtime.containerName}:7777`,
+          image: spec.image,
+          imageId: inspected?.Image ?? null,
+          workerAuthMode: 'jwt',
+          volumes,
+          appliedAttachmentIds: appliedAttachments.map((attachment) => attachment.id),
+          workingDirectory: appliedAttachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
+          state: 'starting',
+          updatedAt: new Date().toISOString()
+        };
+      } catch (error) {
+        if (createdId) {
+          await this.request('DELETE', `/containers/${encodeURIComponent(createdId)}?force=true`, undefined, [204, 404]).catch(() => {});
+        }
+        throw error;
+      }
+    };
     const resolved = await this.resolveContainer(runtime, { requireIdentity: true });
     if (resolved) {
       await this.request('DELETE', `/containers/${encodeURIComponent(resolved.id)}?force=true`, undefined, [204, 404]);
@@ -375,20 +561,16 @@ export class DockerRuntimeManager {
         );
       }
     }
-    const created = await this.request('POST', `/containers/create?name=${encodeURIComponent(runtime.containerName)}`, body);
-    await this.request('POST', `/containers/${encodeURIComponent(created.Id)}/start`);
-    const inspected = await this.request('GET', `/containers/${encodeURIComponent(created.Id)}/json`).catch(() => null);
-    return {
-      containerId: created.Id,
-      containerName: runtime.containerName,
-      workerUrl: `http://${runtime.containerName}:7777`,
-      image,
-      imageId: inspected?.Image ?? null,
-      workerAuthMode: 'jwt',
-      volumes,
-      state: 'starting',
-      updatedAt: new Date().toISOString()
-    };
+    try {
+      return await createReplacement(desired, attachments);
+    } catch (error) {
+      try {
+        error.rollbackRuntime = await createReplacement(previous, previousAttachments);
+      } catch (rollbackError) {
+        error.message = `${error.message}; restoring the previous runtime also failed: ${rollbackError.message}`;
+      }
+      throw error;
+    }
   }
 
   async inspect(runtime) {

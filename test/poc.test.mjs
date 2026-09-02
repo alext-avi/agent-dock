@@ -50,6 +50,10 @@ class FakeRuntimeManager {
     this.stopped = [];
     this.destroyed = [];
     this.recreated = [];
+    this.createdDataVolumes = [];
+    this.deletedDataVolumes = [];
+    this.recreateDelay = null;
+    this.onRecreate = null;
     this.image = 'agent-dock-worker:v1';
   }
 
@@ -76,6 +80,8 @@ class FakeRuntimeManager {
         telemetry: `telemetry-${suffix}`,
         workspace: `workspace-${suffix}`
       },
+      appliedAttachmentIds: [],
+      workingDirectory: '/workspace',
       state: 'running',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -95,8 +101,10 @@ class FakeRuntimeManager {
 
   // Mirrors the real manager: a new container id, the same name and volumes, and
   // the currently configured image. Volumes are never touched.
-  async recreate(runtime, { agentId = null } = {}) {
-    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes });
+  async recreate(runtime, { agentId = null, attachments = [], previousAttachments = attachments } = {}) {
+    this.onRecreate?.();
+    if (this.recreateDelay) await this.recreateDelay;
+    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes, attachments, previousAttachments });
     return {
       containerId: `container-${runtime.id}-${this.recreated.length}`,
       containerName: runtime.containerName,
@@ -104,9 +112,34 @@ class FakeRuntimeManager {
       image: this.image,
       imageId: this.image,
       volumes: runtime.volumes,
+      appliedAttachmentIds: attachments.map((attachment) => attachment.id),
+      workingDirectory: attachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
       state: 'starting',
       updatedAt: new Date().toISOString()
     };
+  }
+  async materializeAttachments({ attachments, sources }) {
+    return attachments.map((attachment) => {
+      const source = sources.get(attachment.dataSourceId);
+      if (!source) throw new Error('Data source missing');
+      return {
+        ...attachment,
+        mount: {
+          Type: source.kind === 'managed-volume' ? 'volume' : 'bind',
+          Source: source.volumeName ?? `/approved/${source.rootId}/${source.relativePath}`,
+          Target: attachment.target,
+          ReadOnly: attachment.access === 'read-only'
+        }
+      };
+    });
+  }
+  async createManagedDataVolume(dataSourceId) {
+    const volume = `managed-${dataSourceId}`;
+    this.createdDataVolumes.push(volume);
+    return volume;
+  }
+  async deleteManagedDataVolume(dataSourceId, volumeName) {
+    this.deletedDataVolumes.push({ dataSourceId, volumeName });
   }
   async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
   async stop(runtime) { runtime.state = 'stopped'; this.stopped.push(runtime.id); }
@@ -153,7 +186,7 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   assert.equal(initialAgents[0].runtime.dedicated, false);
   assert.equal(initialAgents[0].runtime.credentials, 'shared-worker-local');
   assert.deepEqual(initialAgents[0].runtime.storage, {
-    auth: 'shared', binary: 'shared', telemetry: 'shared', workspace: 'shared'
+    auth: 'shared', binary: 'shared', telemetry: 'shared', workspace: 'shared', attachments: 0
   });
   assert.deepEqual(initialAgents[0].modelPolicy, {
     mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false
@@ -255,7 +288,8 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const agentPage = await (await fetch(`${controlUrl}/agents/${created.id}`)).text();
   assert.doesNotMatch(agentPage, /Worker URL|Worker token/);
   assert.match(agentPage, /Tools &amp; MCP/);
-  assert.match(agentPage, /Attach data or volume/);
+  assert.match(agentPage, /Approved data sources/);
+  assert.match(agentPage, /Attach data/);
 
   const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
     method: 'DELETE',
@@ -356,7 +390,7 @@ test('two same-adapter agents receive exclusive runtimes and different authentic
   assert.equal(second.runtime.binding, 'dedicated');
   assert.equal(first.runtime.credentials, 'isolated-worker-local');
   assert.deepEqual(first.runtime.storage, {
-    auth: 'isolated', binary: 'isolated', telemetry: 'isolated', workspace: 'isolated'
+    auth: 'isolated', binary: 'isolated', telemetry: 'isolated', workspace: 'isolated', attachments: 0
   });
   assert.doesNotMatch(JSON.stringify([first, second]), /token-one|token-two|auth-1|auth-2|container-1|container-2|127\.0\.0\.1/);
   for (const volumeType of ['auth', 'binary', 'telemetry', 'workspace']) {
@@ -465,7 +499,7 @@ test('schema-v1 singleton records migrate to one explicitly shared legacy runtim
   assert.doesNotMatch(JSON.stringify(migrated), /legacy-secret|shared-claude/);
 
   const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
-  assert.equal(persisted.schemaVersion, 3);
+  assert.equal(persisted.schemaVersion, 4);
   assert.ok(Array.isArray(persisted.runtimes));
   assert.equal(persisted.agents.filter((agent) => agent.adapter === 'claude-code').every((agent) => !('workerToken' in agent)), true);
 });
@@ -743,6 +777,292 @@ test('OpenCode discovers Ollama and executes a durable pinned model policy', asy
     totalTokens: 207
   });
   assert.equal(normalizeOpenCodeEvent({ type: 'text', part: { type: 'text', text: 'hello' } }).data.text, 'hello');
+});
+
+test('data-source registry applies scoped mounts, persists them, and enforces exclusive writes', async (t) => {
+  const token = 'storage-worker-secret';
+  const worker = createStatusWorker({ workerId: 'storage-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'storage-worker', workerUrl, token },
+    { workerId: 'storage-worker', workerUrl, token }
+  ]);
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-storage-'));
+  const dataPath = join(temporary, 'agents.json');
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath,
+    schedulerEnabled: false,
+    attachmentRoots: {
+      projects: { label: 'Projects', hostPath: '/Users/operator/Projects', allowWrite: true },
+      reference: { label: 'Reference', hostPath: '/Users/operator/Reference', allowWrite: false }
+    }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve)),
+    rm(temporary, { recursive: true, force: true })
+  ]));
+
+  const createAgent = async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, adapter: 'claude-code', runtime: { mode: 'provision' } })
+    });
+    assert.equal(response.status, 201);
+    return (await response.json()).agent;
+  };
+  const first = await createAgent('Writer one');
+  const second = await createAgent('Writer two');
+
+  let response = await fetch(`${controlUrl}/api/v1/attachment-roots`);
+  assert.equal(response.status, 200);
+  const rootPayload = await response.json();
+  assert.deepEqual(rootPayload.roots, [
+    { id: 'projects', label: 'Projects', allowWrite: true },
+    { id: 'reference', label: 'Reference', allowWrite: false }
+  ]);
+  assert.equal(JSON.stringify(rootPayload).includes('/Users/operator'), false);
+
+  const createSource = async (body) => {
+    const result = await fetch(`${controlUrl}/api/v1/data-sources`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    assert.equal(result.status, 201);
+    return (await result.json()).dataSource;
+  };
+  const project = await createSource({
+    id: 'project', name: 'Project', kind: 'host-directory', rootId: 'projects', relativePath: 'agent-dock'
+  });
+  const child = await createSource({
+    id: 'project-child', name: 'Project child', kind: 'host-directory', rootId: 'projects', relativePath: 'agent-dock/packages/ui'
+  });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/${project.id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'renamed-behind-the-registry' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /id cannot be changed/);
+  const scratch = await createSource({ id: 'scratch', name: 'Scratch', kind: 'managed-volume' });
+  assert.deepEqual(manager.createdDataVolumes, ['managed-scratch']);
+  response = await fetch(`${controlUrl}/api/v1/data-sources/${scratch.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ deleteVolume: true, confirmation: scratch.id })
+  });
+  assert.equal(response.status, 204);
+  assert.deepEqual(manager.deletedDataVolumes, [{ dataSourceId: 'scratch', volumeName: 'managed-scratch' }]);
+  assert.equal(JSON.stringify(project).includes('/Users/operator'), false);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: project.id, mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  assert.equal(response.status, 201);
+  const firstAttachment = (await response.json()).attachment;
+  assert.equal(firstAttachment.target, '/data/repo');
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.Source, '/approved/projects/agent-dock');
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.ReadOnly, false);
+
+  const firstAfterMount = (await (await fetch(`${controlUrl}/api/v1/agents/${first.id}`)).json()).agent;
+  assert.equal(firstAfterMount.runtime.storage.attachments, 1);
+  assert.equal(firstAfterMount.runtime.workingDirectory, '/data/repo');
+
+  const recreatesBeforeConflict = manager.recreated.length;
+  response = await fetch(`${controlUrl}/api/v1/agents/${second.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: child.id, mountName: 'child', access: 'read-write', purpose: 'data'
+    })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /agent/);
+  assert.equal(manager.recreated.length, recreatesBeforeConflict, 'a rejected write lease replaced a container');
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments/${firstAttachment.id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access: 'read-only' })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.ReadOnly, true);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${second.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: child.id, mountName: 'child', access: 'read-write', purpose: 'data'
+    })
+  });
+  assert.equal(response.status, 201, 'a read-only overlapping mount incorrectly held the write lease');
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runtimeAction: 'retain' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /Detach every data source/);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments/${firstAttachment.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 204);
+  const afterDetach = await (await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`)).json();
+  assert.deepEqual(afterDetach.attachments, []);
+  assert.equal(afterDetach.workingDirectory, '/workspace');
+
+  const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
+  assert.equal(persisted.schemaVersion, 4);
+  assert.equal(persisted.dataSources.length, 2);
+  assert.equal(persisted.dataAttachments.length, 1);
+  assert.equal(JSON.stringify(persisted).includes('/Users/operator/Projects'), false, 'deployment roots leaked into the registry');
+});
+
+test('an attachment persistence failure restores the previous live mount set', async (t) => {
+  const token = 'storage-rollback-secret';
+  const worker = createStatusWorker({ workerId: 'rollback-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'rollback-worker', workerUrl, token }]);
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-storage-rollback-'));
+  const registryDirectory = join(temporary, 'registry');
+  const dataPath = join(registryDirectory, 'agents.json');
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve)),
+    rm(temporary, { recursive: true, force: true })
+  ]));
+
+  let response = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Rollback agent', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  });
+  const agent = (await response.json()).agent;
+  response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'rollback-source', name: 'Rollback source', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  await rm(registryDirectory, { recursive: true, force: true });
+  await writeFile(registryDirectory, 'blocks the registry directory');
+  response = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: 'rollback-source', mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  assert.equal(response.status, 500);
+  assert.equal(manager.recreated.length, 2, 'the live runtime was not rolled back after the registry write failed');
+  assert.equal(manager.recreated[0].attachments.length, 1);
+  assert.equal(manager.recreated[1].attachments.length, 0);
+
+  const state = await (await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`)).json();
+  assert.deepEqual(state.attachments, []);
+  assert.equal(state.workingDirectory, '/workspace');
+});
+
+test('simultaneous attachment requests cannot both acquire one write lease', async (t) => {
+  const token = 'storage-concurrency-secret';
+  const worker = createStatusWorker({ workerId: 'concurrency-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'concurrency-worker', workerUrl, token },
+    { workerId: 'concurrency-worker', workerUrl, token }
+  ]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const agents = await Promise.all(['One', 'Two'].map(async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, adapter: 'claude-code', runtime: { mode: 'provision' }
+      })
+    });
+    return (await response.json()).agent;
+  }));
+  let response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'shared-repo', name: 'Shared repo', kind: 'host-directory', rootId: 'projects', relativePath: 'shared'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  const results = await Promise.all(agents.map((agent, index) => fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: 'shared-repo', mountName: `repo-${index}`, access: 'read-write', purpose: 'data'
+    })
+  })));
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  assert.equal(manager.recreated.length, 1, 'both concurrent requests replaced a runtime');
+});
+
+test('a task cannot start while its runtime mount set is being replaced', async (t) => {
+  const token = 'storage-task-race-secret';
+  const worker = createStatusWorker({ workerId: 'task-race-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'task-race-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  let response = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Task race', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  });
+  const agent = (await response.json()).agent;
+  response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'task-race-source', name: 'Task race source', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  let releaseRecreate;
+  let markStarted;
+  t.after(() => releaseRecreate?.());
+  manager.recreateDelay = new Promise((resolve) => { releaseRecreate = resolve; });
+  const recreateStarted = new Promise((resolve) => { markStarted = resolve; });
+  manager.onRecreate = markStarted;
+  const attachmentRequest = fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: 'task-race-source', mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  await recreateStarted;
+
+  const taskResponse = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/tasks`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'must not start' })
+  });
+  assert.equal(taskResponse.status, 409);
+  assert.match((await taskResponse.json()).error, /runtime storage reconfiguration/);
+  releaseRecreate();
+  assert.equal((await attachmentRequest).status, 201);
 });
 
 

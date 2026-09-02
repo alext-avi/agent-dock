@@ -231,7 +231,7 @@ test('control-plane MCP definitions and bindings persist without credential valu
   const afterRestart = await (await fetch(`${controlUrl}/api/v1/agents/worker-01/mcp`)).json();
   assert.deepEqual(afterRestart.bindings[0].server, created);
   const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
-  assert.equal(persisted.schemaVersion, 3);
+  assert.equal(persisted.schemaVersion, 4);
   assert.equal(persisted.mcpServers.length, 1);
   assert.equal(persisted.mcpBindings.length, 1);
 });

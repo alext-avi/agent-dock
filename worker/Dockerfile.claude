@@ -16,7 +16,9 @@ RUN apt-get update \
     && chown -R agent:agent /app /workspace /claude-home /opt/claude /agent-data
 
 WORKDIR /app
-COPY --chown=agent:agent server.mjs protocol.mjs entrypoint-claude.sh ./
+# Every module, not a list that has to be remembered. An omission here is not
+# a build error: the image starts and dies on its first import at runtime.
+COPY --chown=agent:agent *.mjs entrypoint-claude.sh ./
 COPY --chown=agent:agent adapters ./adapters
 COPY --chown=agent:agent mcp ./mcp
 RUN chmod 0755 /app/entrypoint-claude.sh

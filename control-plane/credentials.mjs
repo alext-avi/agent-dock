@@ -243,8 +243,11 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       }
 
       Object.assign(record, fields, { updatedAt: new Date().toISOString() });
-      // A value is replaced, never read back and edited.
-      if (sealed) Object.assign(record, { sealed, hint: hintFor(value) });
+      // A value is replaced, never read back and edited. Keyed off the value
+      // rather than the sealed result: a key provider that returned something
+      // falsy would otherwise skip this write and leave the hint and ciphertext
+      // describing the old value, which is the bug this ordering exists to close.
+      if (value !== undefined) Object.assign(record, { sealed, hint: hintFor(value) });
       await persist();
       return publicCredential(record);
     },

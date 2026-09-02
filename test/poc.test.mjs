@@ -759,10 +759,14 @@ test('a runtime refresh is refused while a task is running and for unmanaged run
 // turn "protects a copied backup" into protecting nothing.
 test('the credential wrapping key is never given to a container that runs an agent', async () => {
   const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
-  const services = compose.split(/\n  (?=[a-z][a-z-]*:\n)/);
+  // Split on the characters Compose actually allows in a service key. A narrower
+  // pattern silently absorbs an unmatched service into the chunk before it, and
+  // since control-plane is first in the file, a service declared after it lands
+  // inside the one chunk this loop skips — so the key would go unseen.
+  const services = compose.split(/\n  (?=[A-Za-z0-9][A-Za-z0-9_.-]*:\n)/);
   for (const service of services) {
     const name = service.trimStart().split(':')[0];
-    if (name === 'services' || name.startsWith('control-plane')) continue;
+    if (name === 'services' || name === 'control-plane') continue;
     assert.ok(
       !service.includes('CREDENTIAL_ENCRYPTION_KEY'),
       `${name} is given CREDENTIAL_ENCRYPTION_KEY; only the control plane may hold it`

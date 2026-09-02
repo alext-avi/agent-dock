@@ -4,6 +4,13 @@ services:
     build:
       context: .
       dockerfile: control-plane/Dockerfile
+    # Connector secrets are named MCP_SECRET_<NAME> and cannot be enumerated here,
+    # so they come from a file. Deliberately not .env: this component holds the
+    # Docker socket, and env_file is not prefix-scoped, so pointing it at the file
+    # used for Compose substitution would put every unrelated value in there too.
+    env_file:
+      - path: .env.mcp-secrets
+        required: false
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"

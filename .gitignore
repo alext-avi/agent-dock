@@ -9,3 +9,4 @@ workspace/*
 !workspace/.gitkeep
 .worktrees/
 .claude/worktrees/
+.env.mcp-secrets

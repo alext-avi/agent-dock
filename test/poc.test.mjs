@@ -787,6 +787,30 @@ test('the shared container spec carries every setting a worker needs', async () 
     assert.ok(key in env, `${key} is missing from the container environment`);
   }
   assert.equal(env.MCP_ALLOWED_COMMANDS, 'npx,uvx');
+
+  // Connector secrets reach a runtime by namespace; nothing outside it does.
+  // Without this the MCP_SECRET_ namespace has no delivery path and a connector
+  // credential cannot be provisioned at all.
+  process.env.MCP_SECRET_TEST_CONNECTOR = 'connector-value';
+  process.env.NOT_A_CONNECTOR_SECRET = 'should-not-cross';
+  try {
+    const { body: forwarded } = await manager.containerSpec({
+      adapter: 'claude-code',
+      workerId: 'worker-abc',
+      workerToken: 'token-abc',
+      volumes,
+      labels: {}
+    });
+    const forwardedEnv = Object.fromEntries(forwarded.Env.map((entry) => {
+      const index = entry.indexOf('=');
+      return [entry.slice(0, index), entry.slice(index + 1)];
+    }));
+    assert.equal(forwardedEnv.MCP_SECRET_TEST_CONNECTOR, 'connector-value');
+    assert.equal(forwardedEnv.NOT_A_CONNECTOR_SECRET, undefined, 'a non-namespaced variable crossed into a runtime');
+  } finally {
+    delete process.env.MCP_SECRET_TEST_CONNECTOR;
+    delete process.env.NOT_A_CONNECTOR_SECRET;
+  }
   assert.equal(env.WORKER_TOKEN, 'token-abc');
   assert.equal(env.WORKER_AUTH_MODE, 'jwt');
   assert.equal(env.AGENT_ID, 'worker-abc');

@@ -31,10 +31,47 @@ async function atomicJson(file, value) {
   await rename(temporary, file);
 }
 
-function missingSecret(pathname) {
-  const error = new Error(`Worker secret ${pathname} is not configured in this agent container`);
+function missingSecret(name) {
+  const error = new Error(
+    `Connector secret ${name} is not configured in this agent container. `
+    + `Provide it as ${CONNECTOR_SECRET_PREFIX}${name}; only that namespace is resolvable.`
+  );
   error.status = 409;
   return error;
+}
+
+// Connector secrets live in their own namespace, separate from the worker's own
+// control variables. A definition names the logical secret; the worker resolves
+// it from CONNECTOR_SECRET_PREFIX + that name and can see nothing else. This is
+// why a definition cannot name WORKER_TOKEN, HOME, or OLLAMA_BASE_URL: they are
+// not in the map at all, so there is nothing to validate against and nothing to
+// get wrong.
+export const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
+
+// Reduce a process environment to the connector secrets it carries, keyed by the
+// logical name a definition uses.
+export function connectorSecrets(environment = {}) {
+  const secrets = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (!key.startsWith(CONNECTOR_SECRET_PREFIX)) continue;
+    const name = key.slice(CONNECTOR_SECRET_PREFIX.length);
+    if (name) secrets[name] = value;
+  }
+  return secrets;
+}
+
+// Reference names a definition uses that the connector-secret map cannot satisfy.
+// Silent about the reason on purpose: an unprovisioned name and an illegitimate
+// one are both simply absent from the map.
+export function unresolvedSecretReferences(servers, environment = {}) {
+  const names = (server) => [
+    ...Object.values(server?.secretEnvironment ?? {}),
+    ...Object.values(server?.secretHeaders ?? {})
+  ].map((reference) => (typeof reference === 'string' ? reference : reference?.sourceEnv));
+
+  return (servers ?? []).flatMap((server) => names(server)
+    .filter((name) => name && environment[name] === undefined)
+    .map((name) => ({ server: server.name ?? server.id, name })));
 }
 
 function resolveServers(servers, environment, { requireSecrets }) {
@@ -96,7 +133,13 @@ function openCodeServerNames(output) {
 
 export function createMcpManager(options) {
   const adapterId = options.adapterId;
+  // Two different things, conflated until this was caught: the narrow map a
+  // definition's secret references resolve against, and the full process
+  // environment a spawned harness command needs to run at all. Passing the
+  // narrow one to spawn() left codex with no PATH; passing the full one to the
+  // resolver was the vulnerability. They must stay separate.
   const environment = options.environment ?? process.env;
+  const execEnvironment = options.execEnvironment ?? process.env;
   const workspace = options.workspace ?? '/workspace';
   const allowedCommands = new Set(options.allowedCommands ?? []);
   const statePath = options.statePath;
@@ -126,15 +169,27 @@ export function createMcpManager(options) {
     if (statePath) await atomicJson(statePath, { ...state, health });
   }
 
+  // Adapter validators only check the shape of a secret reference, so a preview
+  // could report "valid" for a definition apply would refuse. Say so instead.
+  function withMissingSecrets(result, servers) {
+    const warnings = unresolvedSecretReferences(servers, environment).map(({ server, name }) => ({
+      field: 'secret',
+      code: 'unresolved_connector_secret',
+      message: `${server} references connector secret ${name}; set MCP_SECRET_${name} or applying will fail`
+    }));
+    if (!warnings.length) return result;
+    return { ...result, warnings: [...(result.warnings ?? []), ...warnings] };
+  }
+
   function validate(servers, { requireSecrets = false } = {}) {
     if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
     let resolved;
     try { resolved = resolveServers(servers, environment, { requireSecrets }); }
     catch (error) { return { valid: false, errors: [{ field: 'secret', code: 'missing_worker_secret', message: error.message }], warnings: [] }; }
     const context = { workspace, allowedCommands };
-    if (adapterId === 'claude-code') return validateClaudeMcpServers(resolved, context);
-    if (adapterId === 'opencode') return validateOpenCodeMcpServers(resolved, context);
-    return validateCodexMcpServers(resolved, context);
+    if (adapterId === 'claude-code') return withMissingSecrets(validateClaudeMcpServers(resolved, context), servers);
+    if (adapterId === 'opencode') return withMissingSecrets(validateOpenCodeMcpServers(resolved, context), servers);
+    return withMissingSecrets(validateCodexMcpServers(resolved, context), servers);
   }
 
   async function apply(servers) {
@@ -158,7 +213,7 @@ export function createMcpManager(options) {
       await applyCodexMcpServers(resolved, {
         previousServers: resolveServers(state.servers, environment, { requireSecrets: false }),
         allowedCommands,
-        env: environment,
+        env: execEnvironment,
         run,
         demoMode
       });
@@ -176,7 +231,7 @@ export function createMcpManager(options) {
     await ready;
     if (probe && adapterId === 'opencode' && !demoMode && typeof run === 'function') {
       const resolved = resolveServers(state.servers, environment, { requireSecrets: false });
-      const taskEnv = openCodeMcpTaskEnvironment(environment, resolved, { allowedCommands });
+      const taskEnv = openCodeMcpTaskEnvironment(execEnvironment, resolved, { allowedCommands });
       const result = await run('opencode', ['mcp', 'list'], { env: taskEnv, timeout: 30_000 });
       health = { checkedAt: new Date().toISOString(), ...parseOpenCodeMcpList(result.output, resolved) };
       await persist();

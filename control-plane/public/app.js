@@ -1270,7 +1270,7 @@ function renderMcp(result, definitions) {
     const meta = document.createElement('p');
     meta.className = 'mcp-meta';
     meta.textContent = refs.length
-      ? `Worker secret reference${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`
+      ? `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`
       : `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
     const actions = document.createElement('div');
     actions.className = 'mcp-row-actions';

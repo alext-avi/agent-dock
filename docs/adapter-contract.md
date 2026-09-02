@@ -29,7 +29,7 @@ Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. 
 
 `GET /v1/providers` returns `connections[]` with a stable ID, type, display name, coarse location, credential mode, health, last-check time, and discoverable `models[]`. It must not return credentials or private connection URLs. For Ollama, the model data may include context length, capabilities, family, parameter size, and quantization.
 
-MCP management uses one round-trippable `servers[]` DTO in both directions; provider configuration is never used as the control-plane data model. See [`mcp-contract.md`](./mcp-contract.md). Secret fields contain worker-environment references, not values.
+MCP management uses one round-trippable `servers[]` DTO in both directions; provider configuration is never used as the control-plane data model. See [`mcp-contract.md`](./mcp-contract.md). Secret fields contain references, not values, and a reference names a connector secret rather than an arbitrary worker environment variable — see the connector-secret namespace in [`mcp-contract.md`](./mcp-contract.md).
 
 ## Status model
 

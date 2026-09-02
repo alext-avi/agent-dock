@@ -30,7 +30,7 @@ The control plane serves an authenticated MCP endpoint at `/mcp`. Its small safe
 
 Use **Tools & MCP** on an agent page to create a remote HTTP or local stdio MCP definition, attach a reusable definition, validate it against the selected harness, and apply the complete desired state. The control plane and all three workers use the same canonical payload in both directions; only the isolated worker translates it into Codex, Claude Code, or OpenCode configuration. Connector credentials are referenced by worker environment-variable name and never returned to the control plane. Local stdio MCP is denied unless its exact executable appears in `MCP_ALLOWED_COMMANDS` (comma-separated in `.env`).
 
-Use **Data** to register a host subfolder beneath an operator-configured allowlist root or create a managed Docker volume, then attach it read-only or read/write to an idle managed agent. One attachment can become the agent's task working directory; `/workspace` remains its private durable volume. Raw host roots and Docker volume names never reach the browser, overlapping read/write leases are rejected, and storage mutation is administrator-only REST/UI functionality that is not registered as a control-plane MCP tool. Configure the narrowest practical roots with `ATTACHMENT_ROOTS_JSON`; see [`docs/data-attachments.md`](./docs/data-attachments.md).
+Use **Data** to browse and register a host subfolder beneath an operator-configured allowlist root or create a managed Docker volume, then attach it read-only or read/write to an idle managed agent. One attachment can become the agent's task working directory; `/workspace` remains its private durable volume. The folder picker returns only root labels and relative directories, while raw host roots and Docker volume names never reach the browser. Overlapping read/write leases are rejected, and storage mutation is administrator-only REST/UI functionality that is not registered as a control-plane MCP tool. Configure the narrowest practical roots with `ATTACHMENT_ROOTS_JSON`; see [`docs/data-attachments.md`](./docs/data-attachments.md).
 
 Claude Code is always launched with a worker-owned strict MCP file, including an empty file before its first connector is configured. OpenCode resolves its merged configuration before task start and disables MCP entries introduced outside Agent Dock's managed set; an unreadable or invalid merged configuration prevents the task from starting.
 
@@ -111,6 +111,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET`, `PATCH`, `DELETE` | `/api/v1/agents/:id` | Read, edit, or delete one agent record |
 | `GET` | `/api/v1/runtimes` | List safe runtime identities, lifecycle state, isolation mode, and attachment counts |
 | `GET` | `/api/v1/attachment-roots` | List safe root IDs, labels, and write eligibility without returning host paths |
+| `GET` | `/api/v1/attachment-roots/:rootId/directories` | Browse relative folders beneath one approved root as a selected agent's runtime user |
 | `GET`, `POST` | `/api/v1/data-sources` | List or create reusable host-folder or managed-volume sources |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/data-sources/:id` | Read, update, or explicitly delete an unattached source |
 | `GET`, `POST` | `/api/v1/agents/:id/attachments` | List or apply scoped mounts to an idle managed runtime |

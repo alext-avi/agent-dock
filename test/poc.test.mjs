@@ -52,6 +52,7 @@ class FakeRuntimeManager {
     this.recreated = [];
     this.createdDataVolumes = [];
     this.deletedDataVolumes = [];
+    this.directoryListings = [];
     this.recreateDelay = null;
     this.onRecreate = null;
     this.image = 'agent-dock-worker:v1';
@@ -140,6 +141,15 @@ class FakeRuntimeManager {
   }
   async deleteManagedDataVolume(dataSourceId, volumeName) {
     this.deletedDataVolumes.push({ dataSourceId, volumeName });
+  }
+  async listHostDirectories(request) {
+    this.directoryListings.push(request);
+    const prefix = request.relativePath === '.' ? '' : `${request.relativePath}/`;
+    return {
+      relativePath: request.relativePath,
+      directories: [{ name: 'child', relativePath: `${prefix}child` }],
+      truncated: false
+    };
   }
   async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
   async stop(runtime) { runtime.state = 'stopped'; this.stopped.push(runtime.id); }
@@ -827,6 +837,18 @@ test('data-source registry applies scoped mounts, persists them, and enforces ex
     { id: 'reference', label: 'Reference', allowWrite: false }
   ]);
   assert.equal(JSON.stringify(rootPayload).includes('/Users/operator'), false);
+
+  response = await fetch(`${controlUrl}/api/v1/attachment-roots/projects/directories?agentId=${encodeURIComponent(first.id)}&path=agent-dock`);
+  assert.equal(response.status, 200);
+  const directoryPayload = await response.json();
+  assert.deepEqual(directoryPayload, {
+    root: { id: 'projects', label: 'Projects', allowWrite: true },
+    relativePath: 'agent-dock',
+    directories: [{ name: 'child', relativePath: 'agent-dock/child' }],
+    truncated: false
+  });
+  assert.deepEqual(manager.directoryListings, [{ rootId: 'projects', relativePath: 'agent-dock', adapter: 'claude-code' }]);
+  assert.equal(JSON.stringify(directoryPayload).includes('/Users/operator'), false);
 
   const createSource = async (body) => {
     const result = await fetch(`${controlUrl}/api/v1/data-sources`, {

@@ -127,15 +127,17 @@ test('managed volume names retain a collision-resistant suffix at Docker length 
 
 test('host validation uses a no-network, least-privilege helper and rejects symlinks', async () => {
   class RecordingManager extends DockerRuntimeManager {
-    constructor(statusCode) {
+    constructor(statusCode, logPayload = null) {
       super({ attachmentRoots: roots, attachmentValidatorImage: 'node:test' });
       this.statusCode = statusCode;
+      this.logPayload = logPayload;
       this.calls = [];
     }
     async request(method, path, body) {
       this.calls.push({ method, path, body });
       if (method === 'POST' && path === '/containers/create') return { Id: 'validator-1' };
       if (path.includes('/wait?')) return { StatusCode: this.statusCode };
+      if (path.includes('/logs?')) return this.logPayload;
       return null;
     }
   }
@@ -167,4 +169,21 @@ test('host validation uses a no-network, least-privilege helper and rejects syml
     allowed.validateHostDirectory({ rootId: 'reference', relativePath: '.', access: 'read-write', adapter: 'claude-code' }),
     (error) => error.status === 403
   );
+
+  const folderBrowser = new RecordingManager(0, {
+    directories: ['agent-container', '../escape', 'nested/name'],
+    truncated: false
+  });
+  const listing = await folderBrowser.listHostDirectories({ rootId: 'projects', relativePath: '.', adapter: 'claude-code' });
+  assert.deepEqual(listing, {
+    relativePath: '.',
+    directories: [{ name: 'agent-container', relativePath: 'agent-container' }],
+    truncated: false
+  });
+  const browserCreate = folderBrowser.calls.find((call) => call.path === '/containers/create').body;
+  assert.equal(browserCreate.User, '10001:10001');
+  assert.equal(browserCreate.Tty, true);
+  assert.equal(browserCreate.HostConfig.NetworkMode, 'none');
+  assert.equal(browserCreate.HostConfig.Mounts[0].ReadOnly, true);
+  assert.equal(browserCreate.HostConfig.Mounts[0].Source, '/srv/projects');
 });

@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 import { hostname } from 'node:os';
-import { resolve } from 'node:path';
-import { parseAttachmentRoots } from './data-attachments.mjs';
+import { posix, resolve } from 'node:path';
+import { normalizeRelativePath, parseAttachmentRoots } from './data-attachments.mjs';
 
 const ADAPTERS = {
   'codex-cli': {
@@ -81,6 +81,38 @@ if (!metadata.isDirectory()) process.exit(14);
 try {
   fs.accessSync(current, fs.constants.R_OK | (access === 'read-write' ? fs.constants.W_OK : 0));
 } catch { process.exit(15); }
+`;
+
+const ATTACHMENT_DIRECTORY_BROWSER_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const relative = process.env.RELATIVE_PATH;
+if (!relative) process.exit(10);
+let current = '/source';
+for (const segment of relative === '.' ? [] : relative.split('/')) {
+  if (!segment || segment === '.' || segment === '..') process.exit(11);
+  current = path.join(current, segment);
+  let metadata;
+  try { metadata = fs.lstatSync(current); } catch { process.exit(12); }
+  if (metadata.isSymbolicLink()) process.exit(13);
+}
+let metadata;
+try { metadata = fs.statSync(current); } catch { process.exit(12); }
+if (!metadata.isDirectory()) process.exit(14);
+let children;
+try { children = fs.readdirSync(current, { withFileTypes: true }); } catch { process.exit(15); }
+const directories = [];
+for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
+  if (directories.length >= 500 || !child.isDirectory() || child.isSymbolicLink()) continue;
+  const candidate = path.join(current, child.name);
+  try {
+    const candidateMetadata = fs.lstatSync(candidate);
+    if (candidateMetadata.isSymbolicLink() || !candidateMetadata.isDirectory()) continue;
+    fs.accessSync(candidate, fs.constants.R_OK | fs.constants.X_OK);
+    directories.push(child.name);
+  } catch {}
+}
+process.stdout.write(JSON.stringify({ directories, truncated: directories.length >= 500 }));
 `;
 
 function dockerError(status, body, path) {
@@ -319,6 +351,68 @@ export class DockerRuntimeManager {
         throw Object.assign(new Error(messages[code] ?? `Attachment validation failed with status ${code}`), { status: 400 });
       }
       return resolve(root.hostPath, relativePath);
+    } finally {
+      if (containerId) {
+        await this.request('DELETE', `/containers/${encodeURIComponent(containerId)}?force=true`, undefined, [204, 404]).catch(() => {});
+      }
+    }
+  }
+
+  async listHostDirectories({ rootId, relativePath = '.', adapter }) {
+    const root = this.attachmentRoots.get(rootId);
+    if (!root) throw Object.assign(new Error(`Attachment root ${rootId} is not configured`), { status: 400 });
+    const template = ADAPTERS[adapter];
+    if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
+    relativePath = normalizeRelativePath(relativePath);
+    const body = {
+      Image: this.attachmentValidatorImage,
+      Cmd: ['node', '-e', ATTACHMENT_DIRECTORY_BROWSER_SCRIPT],
+      User: template.user,
+      Tty: true,
+      Env: [`RELATIVE_PATH=${relativePath}`],
+      HostConfig: {
+        AutoRemove: false,
+        NetworkMode: 'none',
+        ReadonlyRootfs: true,
+        Memory: 128 * 1024 * 1024,
+        NanoCpus: 500_000_000,
+        PidsLimit: 64,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        Mounts: [{ Type: 'bind', Source: root.hostPath, Target: '/source', ReadOnly: true }]
+      }
+    };
+    let containerId = null;
+    try {
+      const created = await this.request('POST', '/containers/create', body);
+      containerId = created.Id;
+      await this.request('POST', `/containers/${encodeURIComponent(containerId)}/start`, undefined, [204]);
+      const result = await this.request('POST', `/containers/${encodeURIComponent(containerId)}/wait?condition=not-running`);
+      const code = Number(result?.StatusCode ?? -1);
+      if (code !== 0) {
+        const messages = {
+          10: 'Folder browser input is invalid',
+          11: 'Folder path contains an unsafe segment',
+          12: 'Folder does not exist',
+          13: 'Folder path may not contain symbolic links',
+          14: 'Folder browser target must be a directory',
+          15: `The ${adapter} worker user cannot read this folder`
+        };
+        throw Object.assign(new Error(messages[code] ?? `Folder browser failed with status ${code}`), { status: 400 });
+      }
+      const output = await this.request(
+        'GET',
+        `/containers/${encodeURIComponent(containerId)}/logs?stdout=1&stderr=1`,
+        undefined,
+        [200]
+      );
+      const parsed = typeof output === 'string' ? JSON.parse(output) : output;
+      if (!parsed || !Array.isArray(parsed.directories)) throw new Error('Folder browser returned an invalid response');
+      const directories = parsed.directories.flatMap((name) => {
+        if (typeof name !== 'string' || !name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') return [];
+        return [{ name, relativePath: normalizeRelativePath(posix.join(relativePath, name)) }];
+      });
+      return { relativePath, directories, truncated: parsed.truncated === true };
     } finally {
       if (containerId) {
         await this.request('DELETE', `/containers/${encodeURIComponent(containerId)}?force=true`, undefined, [204, 404]).catch(() => {});

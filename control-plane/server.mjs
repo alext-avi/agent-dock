@@ -1115,6 +1115,29 @@ export function createControlPlane(options = {}) {
     if (!mutationLocked && storagePath && ['POST', 'PATCH', 'DELETE'].includes(req.method)) {
       return withStorageMutation(() => handleDataAttachments(req, res, url, { mutationLocked: true }));
     }
+    const rootBrowserMatch = url.pathname.match(/^\/api\/v1\/attachment-roots\/([^/]+)\/directories$/);
+    if (rootBrowserMatch) {
+      if (req.method !== 'GET') return false;
+      if (!runtimeManager?.listHostDirectories) {
+        throw Object.assign(new Error('Host folder browsing is unavailable'), { status: 503 });
+      }
+      const rootId = decodeURIComponent(rootBrowserMatch[1]);
+      const root = attachmentRoots.get(rootId);
+      if (!root) throw Object.assign(new Error('Attachment root not found'), { status: 404 });
+      const agentId = url.searchParams.get('agentId');
+      if (!agentId) throw Object.assign(new Error('agentId is required'), { status: 400 });
+      const agent = requireAgent(agentId);
+      requireManagedRuntime(agent);
+      const listing = await runtimeManager.listHostDirectories({
+        rootId,
+        relativePath: url.searchParams.get('path') ?? '.',
+        adapter: agent.adapter
+      });
+      return json(res, 200, {
+        root: { id: root.id, label: root.label, allowWrite: root.allowWrite },
+        ...listing
+      });
+    }
     if (url.pathname === '/api/v1/attachment-roots') {
       if (req.method === 'GET') return json(res, 200, { roots: publicAttachmentRoots(attachmentRoots) });
       return false;

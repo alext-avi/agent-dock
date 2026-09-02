@@ -304,6 +304,7 @@ test('route policy explicitly separates reads, execution, and privileged mutatio
   assert.equal(permission('DELETE', '/api/v1/agents/example/mcp/bindings/docs'), 'mcp:manage');
   assert.equal(permission('POST', '/api/v1/agents/example/mcp/apply'), 'mcp:manage');
   assert.equal(permission('GET', '/api/v1/attachment-roots'), 'storage:manage');
+  assert.equal(permission('GET', '/api/v1/attachment-roots/projects/directories'), 'storage:manage');
   assert.equal(permission('POST', '/api/v1/data-sources'), 'storage:manage');
   assert.equal(permission('PATCH', '/api/v1/data-sources/project'), 'storage:manage');
   assert.equal(permission('POST', '/api/v1/agents/example/attachments'), 'storage:manage');

@@ -110,6 +110,13 @@ function createFakeRuntimeManager(workers) {
     },
     async createManagedDataVolume(id) { return `managed-${id}`; },
     async deleteManagedDataVolume() {},
+    async listHostDirectories({ relativePath }) {
+      const listings = {
+        '.': [{ name: 'agent-container', relativePath: 'agent-container' }, { name: 'reference', relativePath: 'reference' }],
+        'agent-container': [{ name: 'control-plane', relativePath: 'agent-container/control-plane' }]
+      };
+      return { relativePath, directories: listings[relativePath] ?? [], truncated: false };
+    },
     async stop() {},
     async start() {},
     async destroy() {}
@@ -366,8 +373,16 @@ test('the Data tab registers a scoped folder and applies an explicit read-write 
   await page.fill('#data-source-name', 'Browser project');
   await page.fill('#data-source-description', 'Scoped source created by the browser test');
   await page.selectOption('#data-source-root', 'projects');
-  await page.fill('#data-source-path', 'agent-dock');
   assert.match(await page.locator('#data-source-root-policy').textContent(), /exclusive read\/write/);
+  await page.click('#browse-data-source');
+  const projectFolder = page.locator('.folder-browser-row').filter({ hasText: 'agent-container' });
+  await projectFolder.waitFor({ state: 'visible' });
+  await projectFolder.click();
+  await page.waitForFunction(() => document.querySelector('#folder-browser-selection')?.textContent === 'agent-container');
+  assert.match(await page.locator('#folder-browser-breadcrumbs').textContent(), /Projects\/agent-container/);
+  await page.click('#choose-folder');
+  assert.equal(await page.locator('#data-source-path').getAttribute('readonly'), '');
+  assert.equal(await page.locator('#data-source-path').evaluate((input) => input.value), 'agent-container');
   await page.click('#save-data-source');
   await page.waitForFunction(() => [...document.querySelectorAll('#data-source-list strong')].some((node) => node.textContent === 'Browser project'));
 

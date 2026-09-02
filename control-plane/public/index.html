@@ -411,9 +411,16 @@
         <section id="host-source-fields" class="data-source-fields">
           <div class="form-grid">
             <label class="field">Approved root<select id="data-source-root"></select></label>
-            <label class="field">Subfolder <span>relative path only; no symlinks</span><input id="data-source-path" maxlength="1000" placeholder="agent-container"></label>
+            <label class="field">Subfolder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="data-source-path" maxlength="1000" value="." readonly><button id="browse-data-source" class="button secondary" type="button">Browse…</button></div></label>
           </div>
           <p id="data-source-root-policy" class="schedule-note"></p>
+          <section id="host-folder-browser" class="host-folder-browser hidden" aria-label="Approved host folders">
+            <div class="folder-browser-heading"><div><span>FOLDER PICKER</span><strong id="folder-browser-root">Approved root</strong></div><button id="close-folder-browser" class="icon-button" type="button" aria-label="Close folder picker">×</button></div>
+            <nav id="folder-browser-breadcrumbs" class="folder-browser-breadcrumbs" aria-label="Selected folder"></nav>
+            <div id="folder-browser-list" class="folder-browser-list"><p class="empty">Choose Browse to load folders.</p></div>
+            <div class="folder-browser-footer"><span>Selected <code id="folder-browser-selection">.</code></span><button id="choose-folder" class="button primary" type="button">Choose this folder</button></div>
+            <p id="folder-browser-message" class="workspace-list-message" role="status"></p>
+          </section>
         </section>
         <section id="managed-source-fields" class="data-source-fields hidden">
           <p class="data-safety-note">Agent Dock creates and labels a private Docker volume. Removing its registry entry requires an explicit destructive confirmation.</p>
@@ -465,6 +472,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=13"></script>
+    <script type="module" src="/app.js?v=14"></script>
   </body>
 </html>

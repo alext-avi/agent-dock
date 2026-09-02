@@ -193,7 +193,15 @@ const ui = {
   managedSourceFields: $('#managed-source-fields'),
   dataSourceRoot: $('#data-source-root'),
   dataSourcePath: $('#data-source-path'),
+  browseDataSource: $('#browse-data-source'),
   dataSourceRootPolicy: $('#data-source-root-policy'),
+  hostFolderBrowser: $('#host-folder-browser'),
+  folderBrowserRoot: $('#folder-browser-root'),
+  folderBrowserBreadcrumbs: $('#folder-browser-breadcrumbs'),
+  folderBrowserList: $('#folder-browser-list'),
+  folderBrowserSelection: $('#folder-browser-selection'),
+  folderBrowserMessage: $('#folder-browser-message'),
+  chooseFolder: $('#choose-folder'),
   dataSourceFormMessage: $('#data-source-form-message'),
   deleteDataSource: $('#delete-data-source'),
   saveDataSource: $('#save-data-source'),
@@ -244,6 +252,8 @@ let workspaceTree = null;
 let workspaceTruncated = false;
 let currentWorkspaceRoot = null;
 const expandedWorkspaceDirectories = new Set();
+let folderBrowserPath = '.';
+let folderBrowserRequestId = 0;
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
@@ -1660,6 +1670,92 @@ async function refreshData() {
   }
 }
 
+function renderFolderBreadcrumbs(root, relativePath) {
+  ui.folderBrowserBreadcrumbs.replaceChildren();
+  const rootButton = document.createElement('button');
+  rootButton.type = 'button';
+  rootButton.textContent = root.label;
+  rootButton.addEventListener('click', () => browseHostFolder('.'));
+  ui.folderBrowserBreadcrumbs.append(rootButton);
+  if (relativePath === '.') return;
+  const segments = relativePath.split('/');
+  for (let index = 0; index < segments.length; index += 1) {
+    const separator = document.createElement('span');
+    separator.textContent = '/';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = segments[index];
+    const target = segments.slice(0, index + 1).join('/');
+    button.addEventListener('click', () => browseHostFolder(target));
+    ui.folderBrowserBreadcrumbs.append(separator, button);
+  }
+}
+
+async function browseHostFolder(relativePath = '.') {
+  if (!currentAgent) return;
+  const rootId = ui.dataSourceRoot.value;
+  if (!rootId) return;
+  const requestId = ++folderBrowserRequestId;
+  ui.folderBrowserList.innerHTML = '<p class="empty">Loading approved folders…</p>';
+  ui.folderBrowserMessage.textContent = '';
+  ui.chooseFolder.disabled = true;
+  let succeeded = false;
+  try {
+    const query = new URLSearchParams({ agentId: currentAgent.id, path: relativePath || '.' });
+    const result = await api(`${API_ROOT}/attachment-roots/${encodeURIComponent(rootId)}/directories?${query}`);
+    if (requestId !== folderBrowserRequestId) return;
+    folderBrowserPath = result.relativePath;
+    ui.folderBrowserRoot.textContent = result.root.label;
+    ui.folderBrowserSelection.textContent = folderBrowserPath;
+    renderFolderBreadcrumbs(result.root, folderBrowserPath);
+    ui.folderBrowserList.replaceChildren();
+    if (!result.directories.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'This folder has no readable child folders.';
+      ui.folderBrowserList.append(empty);
+    }
+    for (const directory of result.directories) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'folder-browser-row';
+      const icon = document.createElement('span');
+      icon.textContent = '□';
+      const name = document.createElement('strong');
+      name.textContent = directory.name;
+      const arrow = document.createElement('span');
+      arrow.textContent = '→';
+      button.append(icon, name, arrow);
+      button.addEventListener('click', () => browseHostFolder(directory.relativePath));
+      ui.folderBrowserList.append(button);
+    }
+    ui.folderBrowserMessage.textContent = result.truncated ? 'Showing the first 500 readable folders.' : `${result.directories.length} child folder${result.directories.length === 1 ? '' : 's'}`;
+    succeeded = true;
+  } catch (error) {
+    if (requestId !== folderBrowserRequestId) return;
+    ui.folderBrowserList.innerHTML = '<p class="empty">Unable to browse this folder.</p>';
+    ui.folderBrowserMessage.textContent = error.message;
+  } finally {
+    if (requestId === folderBrowserRequestId) ui.chooseFolder.disabled = !succeeded;
+  }
+}
+
+function openHostFolderBrowser() {
+  ui.hostFolderBrowser.classList.remove('hidden');
+  void browseHostFolder(ui.dataSourcePath.value || '.');
+}
+
+function closeHostFolderBrowser() {
+  folderBrowserRequestId += 1;
+  ui.hostFolderBrowser.classList.add('hidden');
+}
+
+function chooseHostFolder() {
+  ui.dataSourcePath.value = folderBrowserPath;
+  closeHostFolderBrowser();
+  ui.dataSourceRootPolicy.textContent = `Selected ${ui.folderBrowserRoot.textContent} / ${folderBrowserPath}`;
+}
+
 function syncDataSourceFields() {
   const host = ui.dataSourceKind.value === 'host-directory';
   ui.hostSourceFields.classList.toggle('hidden', !host);
@@ -1672,6 +1768,7 @@ function syncDataSourceFields() {
     : root.allowWrite
       ? 'This deployment root permits both read-only and exclusive read/write attachments.'
       : 'This deployment root permits read-only attachments only.';
+  ui.browseDataSource.disabled = !host || !root;
   ui.saveDataSource.disabled = host && !root;
 }
 
@@ -1697,7 +1794,9 @@ function openDataSourceDialog(source = null) {
     ui.dataSourceRoot.append(unavailable);
   }
   ui.dataSourceRoot.value = source?.root?.id ?? attachmentRoots[0]?.id ?? '';
-  ui.dataSourcePath.value = source?.root?.relativePath ?? '';
+  folderBrowserPath = source?.root?.relativePath ?? '.';
+  ui.dataSourcePath.value = folderBrowserPath;
+  closeHostFolderBrowser();
   ui.dataSourceFormMessage.textContent = '';
   ui.dataSourceFormMessage.classList.add('hidden');
   ui.deleteDataSource.classList.toggle('hidden', !source);
@@ -2609,7 +2708,15 @@ $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
 ui.dataSourceForm.addEventListener('submit', saveDataSource);
 ui.dataSourceKind.addEventListener('change', syncDataSourceFields);
-ui.dataSourceRoot.addEventListener('change', syncDataSourceFields);
+ui.dataSourceRoot.addEventListener('change', () => {
+  folderBrowserPath = '.';
+  ui.dataSourcePath.value = '.';
+  syncDataSourceFields();
+  if (!ui.hostFolderBrowser.classList.contains('hidden')) void browseHostFolder('.');
+});
+ui.browseDataSource.addEventListener('click', openHostFolderBrowser);
+$('#close-folder-browser').addEventListener('click', closeHostFolderBrowser);
+ui.chooseFolder.addEventListener('click', chooseHostFolder);
 $('#new-data-source').addEventListener('click', () => openDataSourceDialog());
 $('#close-data-source-dialog').addEventListener('click', () => ui.dataSourceDialog.close());
 $('#cancel-data-source').addEventListener('click', () => ui.dataSourceDialog.close());

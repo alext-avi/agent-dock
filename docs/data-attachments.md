@@ -25,6 +25,8 @@ Open an agent's **Data** tab, create or reuse a source, then choose:
 - additional data or the task working directory;
 - a container-safe mount name, rendered under `/data/<name>`.
 
+The host-source form includes an administrator-only folder picker. It enumerates readable directories only beneath the selected configured root, as the target harness user, and stores the chosen relative path. The response contains the root label and relative directory names only—never the deployment's absolute host path. Symlinked folders are excluded and every breadcrumb navigation request is validated again inside the locked-down helper container.
+
 An agent may have one attachment designated as its task working directory. The wrapper receives that target as `WORKSPACE_PATH`; its private `/workspace` volume remains mounted and available. This makes a read/write project source appropriate for an intentionally live coding workflow, while a self-contained clone in the private workspace remains the safer default when live host edits are unnecessary.
 
 Applying, changing, or removing a mount requires an idle, managed, dedicated runtime. The control plane validates every source, replaces the container, and reattaches the same four private volumes, so provider authentication survives. If replacement fails it attempts to restore the previous mount set. If registry persistence fails after replacement it also attempts to restore the previous container state.
@@ -44,6 +46,7 @@ The control plane currently holds the Docker socket, which is host-level authori
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/attachment-roots` | List safe root IDs, labels, and write eligibility; never host paths |
+| `GET` | `/api/v1/attachment-roots/:rootId/directories?agentId=:id&path=:relativePath` | Browse readable folders beneath one configured root as the target agent user |
 | `GET`, `POST` | `/api/v1/data-sources` | List or create reusable sources |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/data-sources/:id` | Read, rename/repoint when detached, or delete a source |
 | `GET`, `POST` | `/api/v1/agents/:id/attachments` | List or attach sources to one runtime |

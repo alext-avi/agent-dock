@@ -1239,7 +1239,18 @@ export function createWorkerServer(options = {}) {
         if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'Wait for the active task to finish before changing MCP configuration' }));
         const body = await readJson(req);
         if (!Array.isArray(body.servers)) return json(res, 400, wrapperResponse({ error: 'servers must be an array' }));
-        return json(res, 200, wrapperResponse({ mcp: await mcpManager.apply(body.servers) }));
+        try {
+          return json(res, 200, wrapperResponse({ mcp: await mcpManager.apply(body.servers, body.credentials) }));
+        } catch (error) {
+          // Apply rejects for the same reasons validate does. Report them the same
+          // way, so a caller can tell an undelivered credential from a bad command
+          // instead of reading a joined message.
+          if (!error.validation) throw error;
+          return json(res, error.status ?? 400, wrapperResponse({
+            error: error.message,
+            mcp: { servers: body.servers, validation: error.validation }
+          }));
+        }
       }
 
       if (req.method === 'GET' && route === '/v1/status') {

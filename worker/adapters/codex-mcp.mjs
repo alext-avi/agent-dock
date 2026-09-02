@@ -13,6 +13,9 @@ export const codexMcpCapabilities = Object.freeze({
   restartRequired: false,
   healthObservation: 'provider-inspection',
   secretDelivery: 'worker-resolved-environment',
+  // Advertised so the control plane can refuse to send a credentialId
+  // definition to a worker that would apply it with no header at all.
+  credentialDelivery: true,
   localCommandPolicy: 'allowlist'
 });
 

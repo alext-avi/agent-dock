@@ -11,7 +11,7 @@ Current protocol version: `agent-wrapper/v1`.
 | `GET` | `/v1/health` | Unauthenticated liveness and adapter identity |
 | `GET` | `/v1/status` | Agent, capability, authentication, task, execution, and cached usage state |
 | `GET` | `/v1/providers` | Safe provider-connection health and model discovery metadata |
-| `GET` | `/v1/mcp` | Read the canonical managed MCP payload, generation, capabilities, and sanitized health |
+| `GET` | `/v1/mcp` | Read the canonical managed MCP payload, generation, capabilities, pending credential deliveries, and sanitized health |
 | `POST` | `/v1/mcp/validate` | Validate a canonical MCP payload against adapter and worker policy without executing it |
 | `PUT` | `/v1/mcp` | Atomically replace the worker's complete managed MCP desired state |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
@@ -30,6 +30,10 @@ Every JSON response and NDJSON event includes `apiVersion: "agent-wrapper/v1"`. 
 `GET /v1/providers` returns `connections[]` with a stable ID, type, display name, coarse location, credential mode, health, last-check time, and discoverable `models[]`. It must not return credentials or private connection URLs. For Ollama, the model data may include context length, capabilities, family, parameter size, and quantization.
 
 MCP management uses one round-trippable `servers[]` DTO in both directions; provider configuration is never used as the control-plane data model. See [`mcp-contract.md`](./mcp-contract.md). Secret fields contain references, not values, and a reference names a connector secret rather than an arbitrary worker environment variable — see the connector-secret namespace in [`mcp-contract.md`](./mcp-contract.md).
+
+`PUT /v1/mcp` carries an optional second field alongside `servers[]`: `credentials`, a map from credential id to `{ header, value }`, resolved by the control plane for this apply. A definition opts into it with `credentialId` instead of `secretHeaders`. The two are additive fields inside `agent-wrapper/v1`, but they are **not safely ignorable**: a worker that drops `credentials` and renders a `credentialId` definition anyway would configure a connector with no authentication at all while reporting success, turning "no secret headers" from *unauthenticated by design* into *silently unauthenticated*. So the capability is gated in both directions. A worker that understands delivery advertises `credentialDelivery: true` in the `capabilities` of `GET /v1/mcp`, and the control plane refuses to apply a `credentialId` definition to a runtime that does not. A worker that receives a `credentialId` with no matching delivery fails the apply with `missing_credential` rather than applying it bare.
+
+`GET /v1/mcp` also reports `pendingCredentials[]`: the names of configured connectors whose credential this worker process does not hold. Delivered credentials live in memory only, so a restarted worker is in this state until the next apply, and the field is how the control plane learns its own record of "applied" is ahead of the runtime.
 
 ## Status model
 
@@ -103,6 +107,7 @@ A new adapter must implement the following behaviors behind the wrapper:
 9. Normalize request usage, quota windows, and account activity only where the provider exposes them.
 10. Keep provider credential files, raw auth responses, raw tokens, and private connection URLs inside the worker boundary.
 11. Validate, apply, inspect, and activate the canonical MCP desired state without returning resolved connector secrets.
+12. Advertise `credentialDelivery` truthfully, and refuse a `credentialId` definition it cannot satisfy rather than applying it without authentication.
 
 The Codex, Claude Code, and OpenCode translators live under `worker/adapters/`. All satisfy this contract; the control plane does not branch on provider-specific event, credential, or MCP configuration formats.
 

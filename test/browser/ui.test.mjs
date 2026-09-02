@@ -20,6 +20,7 @@ import { after, before, test } from 'node:test';
 import { chromium } from 'playwright';
 import { createControlPlane } from '../../control-plane/server.mjs';
 import { createWorkerServer } from '../../worker/server.mjs';
+import { environmentKeyProvider } from '../../control-plane/credentials.mjs';
 
 const USAGE_PAYLOAD = {
   limits: [
@@ -138,7 +139,10 @@ async function startApp() {
     workerUrl: workers['codex-cli'].url,
     workerToken: token,
     runtimeManager,
-    dataPath: null
+    dataPath: null,
+    credentialKeyProvider: environmentKeyProvider({
+      CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64')
+    })
   });
   const url = await listen(control);
 
@@ -179,6 +183,21 @@ async function openPage(path = '/') {
   const page = await browser.newPage();
   await page.goto(`${app.url}${path}`);
   return page;
+}
+
+// Collect what the browser complains about. Some of these never surface in the
+// DOM at all: an input `pattern` that fails to compile is reported here and the
+// constraint is then silently dropped, so the field validates nothing and looks
+// completely normal.
+function collectBrowserErrors(page) {
+  const errors = [];
+  const record = (text) => {
+    if (text.includes('favicon.ico')) return;
+    errors.push(text);
+  };
+  page.on('console', (message) => { if (message.type() === 'error') record(message.text()); });
+  page.on('pageerror', (error) => record(String(error)));
+  return errors;
 }
 
 test('the whole fleet card is the link into its agent', async (t) => {
@@ -508,4 +527,103 @@ test('no connection detail reaches the browser', async (t) => {
   // The worker's own port must not be discoverable from the client either.
   const workerPort = new URL(app.runtimeManager.provisioned[0].workerUrl).port;
   assert.ok(!html.includes(`:${workerPort}`), 'a worker endpoint reached the DOM');
+});
+
+
+test('a credential can be added from the UI and its value never comes back', async (t) => {
+  const page = await openPage('/credentials');
+  t.after(() => page.close());
+  await page.waitForFunction(() => document.querySelector('#credential-list')?.textContent?.includes('No credentials yet'));
+
+  // The page states what encryption at rest actually protects, rather than
+  // letting the phrase imply more than it does.
+  const note = await page.locator('#credential-storage-detail').textContent();
+  assert.match(note, /Anyone able to read this host can read them/);
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'company-docs');
+  await page.fill('#credential-header', 'X-Api-Key');
+  await page.fill('#credential-hosts', 'mcp.example.com');
+  await page.fill('#credential-value', 'sk-browser-secret-9999');
+  await page.click('#credential-form button[type="submit"]');
+
+  await page.waitForFunction(() => document.querySelectorAll('.credential-row').length === 1);
+  const row = page.locator('.credential-row').first();
+  assert.match(await row.textContent(), /company-docs/);
+  assert.match(await row.textContent(), /…9999/);
+
+  // Nothing on the page carries the value, including after a save.
+  assert.ok(!(await page.content()).includes('sk-browser-secret-9999'), 'the value reached the page');
+
+  // Reopening for edit offers to replace the value rather than showing it.
+  await page.click('.credential-edit');
+  assert.equal(await page.inputValue('#credential-value'), '');
+  assert.match(await page.locator('#credential-value-hint').textContent(), /leave blank to keep it/);
+  assert.equal(await page.inputValue('#credential-hosts'), 'mcp.example.com');
+});
+
+test('a connector offers stored credentials instead of asking for a variable name', async (t) => {
+  const page = await openPage('/credentials');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-credential');
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'picker-key');
+  await page.fill('#credential-header', 'X-Api-Key');
+  await page.fill('#credential-hosts', 'mcp.example.com');
+  await page.fill('#credential-value', 'sk-picker-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.waitForFunction(() => document.querySelectorAll('.credential-row').length >= 1);
+
+  const agentPage = await browser.newPage();
+  t.after(() => agentPage.close());
+  await agentPage.goto(`${app.url}/agents/${app.agents['claude-code'].id}#tools`);
+  await agentPage.waitForSelector('#new-mcp');
+  await agentPage.click('#new-mcp');
+
+  // The picker lists the stored credential with the hosts it is limited to, so
+  // the operator can see where it would be sent before choosing it.
+  await agentPage.waitForFunction(() => [...document.querySelectorAll('#mcp-credential option')].some((o) => o.textContent.includes('picker-key')));
+  const option = await agentPage.locator('#mcp-credential option', { hasText: 'picker-key' }).textContent();
+  assert.match(option, /X-Api-Key/);
+  assert.match(option, /mcp\.example\.com/);
+
+  // Once attached, the row has to say which credential it uses. It read "no
+  // credential references" on a connector that plainly had one, which reads as a
+  // bug in the thing the operator just configured.
+  await agentPage.fill('#mcp-name', 'picker-connector');
+  await agentPage.fill('#mcp-url', 'https://mcp.example.com/mcp');
+  await agentPage.selectOption('#mcp-credential', { label: option.trim() });
+  await agentPage.click('#mcp-form button[type="submit"]');
+  await agentPage.waitForFunction(() => document.querySelectorAll('.mcp-row').length >= 1);
+
+  const meta = await agentPage.locator('.mcp-row .mcp-meta').first().textContent();
+  assert.match(meta, /picker-key/);
+  assert.doesNotMatch(meta, /no credential references/);
+  // Still never the value itself.
+  assert.doesNotMatch(await agentPage.content(), /sk-picker-000011112222/);
+});
+
+test('every page opens its dialogs without a browser error', async (t) => {
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  const errors = collectBrowserErrors(page);
+
+  // Dialogs carry most of the markup that never renders until someone opens it,
+  // which is exactly where a broken attribute survives a passing test suite.
+  await page.goto(`${app.url}/credentials`);
+  await page.click('#new-credential');
+  await page.waitForSelector('#credential-dialog[open]');
+  // Constraint validation is when the browser compiles a pattern attribute, so
+  // a broken one is invisible until something asks the form whether it is valid.
+  await page.evaluate(() => document.querySelector('#credential-form').checkValidity());
+  await page.click('#close-credential-dialog');
+
+  await page.goto(`${app.url}/agents/${app.agents['claude-code'].id}#tools`);
+  await page.waitForSelector('#new-mcp');
+  await page.click('#new-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.evaluate(() => document.querySelector('#mcp-form').checkValidity());
+
+  assert.deepEqual(errors, [], `the browser reported errors: ${errors.join(' | ')}`);
 });

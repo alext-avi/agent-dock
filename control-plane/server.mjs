@@ -9,6 +9,7 @@ import { createControlMcp } from './control-mcp.mjs';
 import { createDelegationService } from './delegation-service.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
+import { createCredentialStore, environmentKeyProvider } from './credentials.mjs';
 import { createScheduler } from './scheduler.mjs';
 import { createWorkloadToken, workloadScopeForRequest } from './workload-token.mjs';
 
@@ -261,6 +262,7 @@ export function createControlPlane(options = {}) {
   const runtimes = new Map();
   const mcpServers = new Map();
   const mcpBindings = new Map();
+  const credentialRecords = new Map();
   let persistQueue = Promise.resolve();
   const defaultAgent = () => {
     const preferred = agents.get(config.defaultAgentId);
@@ -273,11 +275,14 @@ export function createControlPlane(options = {}) {
   async function persistAgents() {
     if (!config.dataPath) return;
     const payload = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       agents: [...agents.values()],
       runtimes: [...runtimes.values()],
       mcpServers: [...mcpServers.values()],
-      mcpBindings: [...mcpBindings.values()]
+      mcpBindings: [...mcpBindings.values()],
+      // Sealed envelopes only. Without the wrapping key these are inert, which is
+      // the whole and only thing encryption at rest buys in this deployment.
+      credentials: [...credentialRecords.values()]
     };
     persistQueue = persistQueue.then(async () => {
       await mkdir(dirname(config.dataPath), { recursive: true });
@@ -345,6 +350,11 @@ export function createControlPlane(options = {}) {
           }
           for (const agent of stored.agents) {
             if (agent?.id && agent?.name) agents.set(agent.id, normalizeStoredAgent(agent));
+          }
+          if (stored.schemaVersion >= 4) {
+            for (const record of stored.credentials ?? []) {
+              if (record?.id && record?.name && record?.sealed) credentialRecords.set(record.id, record);
+            }
           }
           if (stored.schemaVersion >= 3) {
             for (const server of stored.mcpServers ?? []) {
@@ -474,12 +484,19 @@ export function createControlPlane(options = {}) {
     return value;
   }
 
+  const credentials = createCredentialStore({
+    records: credentialRecords,
+    persist: persistAgents,
+    keyProvider: options.credentialKeyProvider ?? environmentKeyProvider()
+  });
+
   const mcpService = createMcpService({
     servers: mcpServers,
     bindings: mcpBindings,
     agents,
     persist: persistAgents,
-    workerRequest
+    workerRequest,
+    credentials
   });
 
   async function proxyJson(req, res, agent, pathname, timeout = 15_000) {
@@ -928,6 +945,21 @@ export function createControlPlane(options = {}) {
   // Replace a managed runtime's container with one built from the current image,
   // keeping its volumes so the agent stays authenticated. Without this the only
   // way to get new worker code onto an agent is to destroy its credentials.
+  // A recreated container is running before its worker is listening. Poll health
+  // rather than sleeping on a guess, and give up rather than hold the request open.
+  async function workerReady(agent, { attempts = 30, intervalMs = 500 } = {}) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const { response } = await workerFetch(agent, '/v1/health', { timeout: 2_000 });
+        if (response.ok) return true;
+      } catch {
+        // Not listening yet.
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw Object.assign(new Error('The replacement runtime did not become reachable'), { status: 504 });
+  }
+
   async function refreshAgentRuntime(req, res, agent) {
     if (!runtimeManager) {
       throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
@@ -965,10 +997,67 @@ export function createControlPlane(options = {}) {
     const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
     runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
     await persistAgents();
+    // The replacement process holds no delivered credentials, and MCP state on
+    // disk still names them. Re-applying restores the agent to the configuration
+    // the registry already claims it has — but the container has only just been
+    // started, so wait for it to answer before asking it to do anything.
+    let reapplied = null;
+    try {
+      await workerReady(agent);
+      await mcpService.applyAgent(agent.id);
+      reapplied = true;
+    } catch (error) {
+      reapplied = false;
+      runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+      await persistAgents();
+    }
     return json(res, 200, {
       runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
-      refreshed: true
+      refreshed: true,
+      mcpReapplied: reapplied
     });
+  }
+
+  // Operator-facing credential management. A value goes in and never comes back;
+  // resolution for a worker happens elsewhere and is never reachable from here.
+  async function handleCredentials(req, res, url) {
+    if (url.pathname === '/api/v1/credentials') {
+      if (req.method === 'GET') {
+        return json(res, 200, { credentials: credentials.list(), storage: credentials.keyProviderStatus() });
+      }
+      if (req.method === 'POST') return json(res, 201, { credential: await credentials.create(await readJson(req)) });
+      return false;
+    }
+
+    const match = url.pathname.match(/^\/api\/v1\/credentials\/([^/]+)$/);
+    if (!match) return false;
+    const id = decodeURIComponent(match[1]);
+    if (req.method === 'GET') return json(res, 200, { credential: credentials.get(id) });
+    if (req.method === 'PATCH') return json(res, 200, { credential: await credentials.update(id, await readJson(req)) });
+    if (req.method === 'DELETE') {
+      const record = credentials.get(id);
+      // Report the recoverable objection first: being told to confirm a deletion
+      // that would have been refused anyway is a worse error than being told why.
+      const inUse = [...mcpServers.values()].filter((server) => server.credentialId === id).map((server) => server.name);
+      if (inUse.length) {
+        throw Object.assign(
+          new Error(`Credential is still used by ${inUse.join(', ')}; detach it from those connectors first`),
+          { status: 409 }
+        );
+      }
+      // Unrecoverable: the value exists nowhere else in Agent Dock, so deleting
+      // takes the same exact-name confirmation as destroying a runtime.
+      if (url.searchParams.get('confirmation') !== record.name) {
+        throw Object.assign(
+          new Error(`Deleting a credential is unrecoverable: its value exists nowhere else. Confirm with ?confirmation=${record.name}`),
+          { status: 400 }
+        );
+      }
+      await credentials.remove(id);
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
+    return false;
   }
 
   async function handleAgentOperation(req, res, url) {
@@ -1135,6 +1224,8 @@ export function createControlPlane(options = {}) {
 
       const scheduled = await handleSchedules(req, res, url);
       if (scheduled !== false) return scheduled;
+      const credential = await handleCredentials(req, res, url);
+      if (credential !== false) return credential;
       const mcp = await handleMcp(req, res, url);
       if (mcp !== false) return mcp;
       const crud = await handleAgentCrud(req, res, url);

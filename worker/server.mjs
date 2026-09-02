@@ -4,12 +4,13 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promi
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows } from './adapters/codex.mjs';
-import { claudeAdapterManifest, normalizeClaudeEvent } from './adapters/claude.mjs';
-import { opencodeAdapterManifest, normalizeOpenCodeEvent } from './adapters/opencode.mjs';
+import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows, observeCodexSessionId } from './adapters/codex.mjs';
+import { claudeAdapterManifest, normalizeClaudeEvent, observeClaudeSessionId } from './adapters/claude.mjs';
+import { opencodeAdapterManifest, normalizeOpenCodeEvent, observeOpenCodeSessionId } from './adapters/opencode.mjs';
 import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
 import { connectorSecrets, createMcpManager } from './mcp/manager.mjs';
+import { createConversationStore, normalizeConversationId } from './conversations.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
@@ -190,6 +191,12 @@ export function createWorkerServer(options = {}) {
   const normalizeProviderQuotaWindows = adapterId === 'claude-code'
     ? normalizeClaudeQuotaWindows
     : adapterId === 'codex-cli' ? normalizeCodexQuotaWindows : () => [];
+  // How this provider tells us which session it is speaking in. Codex and
+  // OpenCode mint their own and announce it; Claude Code takes one from us and
+  // therefore announces nothing.
+  const observeProviderSessionId = adapterId === 'claude-code'
+    ? observeClaudeSessionId
+    : adapterId === 'opencode' ? observeOpenCodeSessionId : observeCodexSessionId;
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
     port: Number(options.port ?? process.env.PORT ?? 7777),
@@ -264,6 +271,12 @@ export function createWorkerServer(options = {}) {
           BROWSER: process.env.BROWSER ?? 'echo'
         }
       : { ...process.env, CODEX_HOME: config.codexHome };
+
+  const conversations = createConversationStore({
+    statePath: options.conversationStatePath
+      ?? process.env.CONVERSATION_STATE_PATH
+      ?? (config.dataPath ? path.join(path.dirname(config.dataPath), 'conversations.json') : null)
+  });
 
   const mcpManager = createMcpManager({
     adapterId: config.adapterId,
@@ -1021,6 +1034,12 @@ export function createWorkerServer(options = {}) {
 
   function emitProviderEvent(res, event, job) {
     mcpManager.observe(event).catch(() => {});
+    // Learn the provider's session id the moment it is announced, so a task that
+    // fails later still leaves a resumable conversation behind.
+    if (job.conversationId) {
+      const session = observeProviderSessionId(event);
+      if (session) conversations.attachSession(job.conversationId, session).catch(() => {});
+    }
     const normalized = normalizeProviderEvent(event);
     if (!normalized) return;
     observeUsage(job, normalized);
@@ -1042,9 +1061,16 @@ export function createWorkerServer(options = {}) {
     const fullPrompt = instructions
       ? `Agent profile instructions:\n${instructions}\n\nTask:\n${prompt}`
       : prompt;
-    const args = ['exec', '--json', '--skip-git-repo-check', '-C', config.workspace];
+    // `codex exec resume` is a distinct subcommand and, unlike `codex exec`,
+    // accepts neither -C/--cd nor --sandbox. The working directory still comes
+    // from the spawn below, and a resumed thread carries the sandbox settings
+    // recorded with it, so the flags are only passed on the path that takes them.
+    const resumeSession = job.providerSession;
+    const args = resumeSession
+      ? ['exec', 'resume', resumeSession, '--json', '--skip-git-repo-check']
+      : ['exec', '--json', '--skip-git-repo-check', '-C', config.workspace];
     if (config.allowUnsandboxed) args.push('--dangerously-bypass-approvals-and-sandbox');
-    else args.push('--sandbox', 'workspace-write');
+    else if (!resumeSession) args.push('--sandbox', 'workspace-write');
     args.push('-');
 
     const child = spawn('codex', args, {
@@ -1094,6 +1120,10 @@ export function createWorkerServer(options = {}) {
 
   async function runClaude(res, job, prompt, instructions) {
     const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+    // Claude Code accepts a session id, so the worker supplies one on the first
+    // turn and resumes it afterwards. Nothing has to be observed from the stream.
+    if (job.providerSession) args.push('--resume', job.providerSession);
+    else if (job.mintedSession) args.push('--session-id', job.mintedSession);
     const mcpContext = await mcpManager.taskContext(providerEnv);
     args.push(...mcpContext.args);
     if (instructions) args.push('--append-system-prompt', instructions);
@@ -1147,6 +1177,7 @@ export function createWorkerServer(options = {}) {
       ? `Agent profile instructions:\n${instructions}\n\nTask:\n${prompt}`
       : prompt;
     const args = ['run', '--format', 'json', '--dir', config.workspace];
+    if (job.providerSession) args.push('--session', job.providerSession);
     const mcpContext = await mcpManager.taskContext(providerEnv);
     if (job.model) args.push('--model', job.model);
     if (config.allowUnsandboxed) args.push('--auto');
@@ -1307,6 +1338,27 @@ export function createWorkerServer(options = {}) {
         }
       }
 
+      if (req.method === 'GET' && route === '/v1/conversations') {
+        return json(res, 200, wrapperResponse({ conversations: await conversations.list() }));
+      }
+
+      if (route.startsWith('/v1/conversations/')) {
+        const id = decodeURIComponent(route.slice('/v1/conversations/'.length));
+        if (req.method === 'GET') {
+          const record = await conversations.get(id);
+          if (!record) return json(res, 404, wrapperResponse({ error: 'Conversation not found' }));
+          return json(res, 200, wrapperResponse({ conversation: record }));
+        }
+        if (req.method === 'DELETE') {
+          // Forgetting our mapping, not deleting the harness's own session files.
+          // The distinction matters: a caller cannot use this to erase provider
+          // state it should not be able to reach.
+          await conversations.forget(id);
+          res.writeHead(204, { 'cache-control': 'no-store' });
+          return res.end();
+        }
+      }
+
       if (req.method === 'GET' && route === '/v1/workspace') {
         return json(res, 200, wrapperResponse({
           workspace: { root: config.workspace, ...await listWorkspace(config.workspace) }
@@ -1330,6 +1382,15 @@ export function createWorkerServer(options = {}) {
         const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
         const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : '';
         if (!prompt) return json(res, 400, wrapperResponse({ error: 'prompt is required' }));
+        let conversationId;
+        try { conversationId = normalizeConversationId(body.conversationId); }
+        catch (error) { return json(res, error.status ?? 400, wrapperResponse({ error: error.message })); }
+        // Refusing is the point. A worker that accepted a conversation it cannot
+        // continue would run a context-free task and report success, which reads
+        // to the caller as an agent that quietly stopped listening.
+        if (conversationId && !adapterManifest.capabilities.tasks.conversations) {
+          return json(res, 409, wrapperResponse({ error: 'This adapter cannot continue a conversation' }));
+        }
         if (prompt.length > 100_000 || instructions.length > 50_000) return json(res, 413, wrapperResponse({ error: 'Prompt or instructions are too large' }));
         const resolvedModel = await resolveTaskModel(body.modelPolicy);
         const login = await authStatus();
@@ -1340,6 +1401,17 @@ export function createWorkerServer(options = {}) {
         }));
 
         const job = { id: randomUUID(), status: 'running', startedAt: new Date().toISOString(), child: null, cancelled: false, tokenUsage: null, exitCode: null, model: resolvedModel.model };
+        job.conversationId = conversationId;
+        if (conversationId) {
+          const record = await conversations.open(conversationId, { taskId: job.id });
+          job.providerSession = record.providerSession;
+          // A harness that takes an id from us needs one before it starts, and it
+          // is recorded now so a crashed first turn still leaves it resumable.
+          if (!job.providerSession && config.adapterId === 'claude-code') {
+            job.mintedSession = conversations.mintSession();
+            await conversations.attachSession(conversationId, job.mintedSession);
+          }
+        }
         state.activeJob = job;
         res.writeHead(200, {
           'content-type': 'application/x-ndjson; charset=utf-8',
@@ -1347,6 +1419,12 @@ export function createWorkerServer(options = {}) {
           'x-content-type-options': 'nosniff'
         });
         try {
+          if (conversationId) {
+            emitCanonical(res, 'conversation.continued', {
+              taskId: job.id,
+              data: { conversationId, resumed: Boolean(job.providerSession), turns: (await conversations.get(conversationId))?.turns ?? 1 }
+            });
+          }
           if (config.demoMode) await runDemo(res, job, prompt);
           else if (config.adapterId === 'claude-code') await runClaude(res, job, prompt, instructions);
           else if (config.adapterId === 'opencode') await runOpenCode(res, job, prompt, instructions);

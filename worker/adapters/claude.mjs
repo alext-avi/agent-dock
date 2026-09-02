@@ -7,7 +7,7 @@ export const claudeAdapterManifest = Object.freeze({
   displayName: 'Claude Code',
   capabilities: {
     authentication: { methods: ['browser_oauth'], refresh: false },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     mcp: claudeMcpCapabilities,
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
     workspace: { list: true }
@@ -73,4 +73,14 @@ export function normalizeClaudeEvent(event = {}) {
   }
 
   return { type: 'provider.event', data: { name: event.type || 'unknown' } };
+}
+
+
+// Claude Code is the one harness that accepts an id we choose, so there is
+// nothing to observe: the worker supplies --session-id on the first turn and
+// --resume afterwards. Kept as a function so every adapter answers the same
+// question, and so a future Claude release that renames the field has one place
+// to change.
+export function observeClaudeSessionId() {
+  return null;
 }

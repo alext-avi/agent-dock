@@ -482,10 +482,37 @@ export function createControlPlane(options = {}) {
     res.end(text);
   }
 
+  // A conversation is only forwarded to a runtime that has said it can continue
+  // one. An older worker ignores the field, runs a context-free task, and reports
+  // success — which a caller reads as an agent that quietly stopped listening.
+  // Same reason the delivered-credential and cancel-by-task-id fields are gated.
+  async function requireConversationSupport(agent) {
+    let supported = false;
+    try {
+      const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
+      supported = status?.capabilities?.tasks?.conversations === true;
+    } catch (error) {
+      throw Object.assign(
+        new Error(`Could not confirm this runtime can continue a conversation: ${error.message}`),
+        { status: 502 }
+      );
+    }
+    if (!supported) {
+      throw Object.assign(
+        new Error('This runtime cannot continue a conversation, and would answer without the earlier turns. '
+          + 'Refresh the runtime onto the current image, then try again.'),
+        { status: 409 }
+      );
+    }
+  }
+
   async function proxyTask(req, res, agent) {
     const request = await readJson(req);
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
     if (!prompt) return json(res, 400, { error: 'prompt is required' });
+    if (request.conversationId !== undefined && request.conversationId !== null) {
+      await requireConversationSupport(agent);
+    }
     const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt, modelPolicy: agent.modelPolicy });
     const { response: upstream } = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
     if (!upstream.ok || !upstream.body) {
@@ -950,6 +977,15 @@ export function createControlPlane(options = {}) {
   }
 
   async function handleAgentOperation(req, res, url) {
+    const conversation = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/conversations(?:\/([^/]+))?$/);
+    if (conversation) {
+      const agent = requireAgent(decodeURIComponent(conversation[1]));
+      const id = conversation[2] ? decodeURIComponent(conversation[2]) : null;
+      if (req.method === 'GET' && !id) return proxyJson(req, res, agent, '/v1/conversations');
+      if (req.method === 'GET') return proxyJson(req, res, agent, `/v1/conversations/${encodeURIComponent(id)}`);
+      if (req.method === 'DELETE' && id) return proxyJson(req, res, agent, `/v1/conversations/${encodeURIComponent(id)}`);
+      return false;
+    }
     const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));

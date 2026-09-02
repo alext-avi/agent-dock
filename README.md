@@ -119,6 +119,8 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `POST` | `/api/v1/schedules/:id/run-now` | Dispatch a manual occurrence without changing the recurring cadence |
 | `GET` | `/api/v1/schedules/:id/runs` | Read durable outcome, duration, task, and usage history |
 | `POST` | `/api/v1/agents/:id/runtime/refresh` | Replace a managed runtime's container with one built from the current image, retaining its volumes |
+| `GET` | `/api/v1/agents/:id/conversations` | List the exchanges this agent can continue |
+| `GET`, `DELETE` | `/api/v1/agents/:id/conversations/:cid` | Read one, or forget the worker's mapping for it |
 | `GET`, `POST` | `/api/v1/credentials` | List connector credentials and the storage mode in force, or add one |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/credentials/:id` | Read, edit, or remove one credential. A value is never returned |
 

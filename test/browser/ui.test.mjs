@@ -371,7 +371,7 @@ test('the Data tab maps a chosen folder with explicit access in one flow', async
 
   await page.click('#new-attachment');
   await page.selectOption('#attachment-root', 'projects');
-  assert.match(await page.locator('#attachment-root-policy').textContent(), /Choose read-only or exclusive read\/write/);
+  assert.match(await page.locator('#attachment-root-policy').textContent(), /choose read-only or exclusive read\/write/i);
   assert.equal(await page.locator('#attachment-access').inputValue(), 'read-only');
   await page.click('#browse-attachment');
   const projectFolder = page.locator('.folder-browser-row').filter({ hasText: 'agent-container' });

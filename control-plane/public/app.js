@@ -1691,11 +1691,12 @@ function chooseHostFolder() {
 
 function syncAttachmentRootPolicy() {
   const root = attachmentRoots.find((candidate) => candidate.id === ui.attachmentRoot.value);
+  const selection = root ? `${root.label} / ${ui.attachmentPath.value || '.'}` : '';
   ui.attachmentRootPolicy.textContent = !root
     ? 'No approved host roots are configured for this control plane.'
     : root.allowWrite
-      ? `Selected ${root.label} / ${ui.attachmentPath.value || '.'}. Choose read-only or exclusive read/write access below.`
-      : `Selected ${root.label} / ${ui.attachmentPath.value || '.'}. This root permits read-only access only.`;
+      ? `Selected folder: ${selection} — choose read-only or exclusive read/write access below.`
+      : `Selected folder: ${selection} — this root permits read-only access only.`;
   ui.browseAttachment.disabled = !root;
   if (!ui.attachmentId.value) ui.saveAttachment.disabled = !root;
 }

@@ -20,7 +20,12 @@ let usageThrottled = false;
 const ui = {
   dashboardView: $('#dashboard-view'),
   jobsView: $('#jobs-view'),
-  credentialsView: $('#credentials-view'),
+  mcpView: $('#mcp-view'),
+  registryList: $('#registry-list'),
+  registryCount: $('#registry-count'),
+  registryMessage: $('#registry-message'),
+  newRegistryMcp: $('#new-registry-mcp'),
+  credentialMessage: $('#credential-message'),
   credentialList: $('#credential-list'),
   credentialStorage: $('#credential-storage'),
   credentialStorageNote: $('#credential-storage-note'),
@@ -1385,7 +1390,7 @@ function openMcpDialog(server = null) {
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
   ui.deleteMcpDefinition.classList.toggle('hidden', !server);
-  ui.saveMcp.textContent = server ? 'Save and apply' : 'Save and attach';
+  ui.saveMcp.textContent = currentAgent ? (server ? 'Save and apply' : 'Save and attach') : 'Save connector';
   syncMcpTransportFields();
   ui.mcpDialog.showModal();
 }
@@ -1439,6 +1444,14 @@ async function saveMcpDefinition(event) {
       body: JSON.stringify(payload)
     });
     const server = result.server;
+    // The same dialog serves two places. On an agent it also attaches and
+    // applies, because that is what the operator came to do; on the MCP page
+    // there is no agent to attach to, so it only defines the connector.
+    if (!currentAgent) {
+      ui.mcpDialog.close();
+      await loadRegistry();
+      return;
+    }
     if (!id) {
       await api(agentApi('mcp/bindings'), {
         method: 'POST',
@@ -1499,7 +1512,7 @@ async function deleteMcpDefinition() {
   if (!server || !window.confirm(`Delete the reusable MCP definition ${server.name}? It must not be attached to another agent.`)) return;
   try {
     const attachedHere = mcpBindings.some((binding) => binding.serverId === serverId);
-    if (attachedHere) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
+    if (attachedHere && currentAgent) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
     await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
     ui.mcpDialog.close();
     ui.mcpMessage.textContent = `${server.name} deleted.`;
@@ -2192,6 +2205,7 @@ ui.testAgentButton.addEventListener('click', () => {
 window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 
 let storedCredentials = [];
+let registryServers = [];
 
 function credentialRow(credential) {
   const row = document.createElement('article');
@@ -2244,21 +2258,115 @@ function renderCredentialStorage(storage = {}) {
   ui.credentialStorageNote.classList.remove('hidden');
 }
 
-async function loadCredentials() {
-  ui.credentialsView.classList.remove('hidden');
+// Connectors and the keys they authenticate with are one page, because a stored
+// key exists only to be used by a connector.
+async function loadMcpPage() {
+  ui.mcpView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
   ui.agentView.classList.add('hidden');
   ui.jobsView.classList.add('hidden');
-  document.title = 'Credentials — Agent Dock';
+  document.title = 'MCP — Agent Dock';
+  await Promise.all([loadRegistry(), loadCredentials()]);
+}
+
+async function loadRegistry() {
+  try {
+    const { servers } = await api(`${API_ROOT}/mcp/servers`);
+    registryServers = servers ?? [];
+    renderRegistry();
+    ui.registryCount.textContent = `${registryServers.length} defined`;
+    setConnection('online', 'Control plane online');
+  } catch (error) {
+    ui.registryMessage.textContent = error.message;
+    ui.registryList.innerHTML = '<p class="usage-error">Could not load connectors.</p>';
+    setConnection('offline', error.message);
+  }
+}
+
+function renderRegistry() {
+  ui.registryList.replaceChildren();
+  if (!registryServers.length) {
+    ui.registryList.innerHTML = '<p class="empty">No connectors yet. Add one, then attach it from an agent.</p>';
+    return;
+  }
+  for (const server of registryServers) {
+    const row = document.createElement('article');
+    row.className = 'mcp-row';
+    row.dataset.serverId = server.id;
+
+    const heading = document.createElement('div');
+    heading.className = 'mcp-row-heading';
+    const identity = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = server.name;
+    const kind = document.createElement('small');
+    kind.textContent = server.transport === 'http' ? 'remote HTTP' : 'local stdio process';
+    identity.append(name, kind);
+    heading.append(identity);
+
+    const endpoint = document.createElement('code');
+    endpoint.className = 'mcp-endpoint';
+    endpoint.textContent = mcpEndpoint(server);
+
+    const meta = document.createElement('p');
+    meta.className = 'mcp-meta';
+    meta.textContent = registryMeta(server);
+
+    const actions = document.createElement('div');
+    actions.className = 'mcp-row-actions';
+    const edit = document.createElement('button');
+    edit.className = 'text-button';
+    edit.type = 'button';
+    edit.textContent = 'Edit';
+    edit.addEventListener('click', () => openMcpDialog(server));
+    const remove = document.createElement('button');
+    remove.className = 'text-button danger';
+    remove.type = 'button';
+    remove.textContent = 'Delete';
+    remove.addEventListener('click', () => deleteRegistryServer(server));
+    actions.append(edit, remove);
+
+    row.append(heading, endpoint, meta, actions);
+    ui.registryList.append(row);
+  }
+}
+
+function registryMeta(server) {
+  const refs = mcpSecretReferences(server);
+  if (refs.length) return `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
+  if (server.credentialId) {
+    const credential = storedCredentials.find((item) => item.id === server.credentialId);
+    return credential
+      ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
+      : `Credential ${server.credentialId} · no longer stored`;
+  }
+  return `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+}
+
+async function deleteRegistryServer(server) {
+  if (!window.confirm(`Delete ${server.name}? It must be detached from every agent first.`)) return;
+  try {
+    await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(server.id)}`, { method: 'DELETE' });
+    ui.registryMessage.textContent = '';
+    await loadRegistry();
+  } catch (error) {
+    // Beside the list being acted on, not in the topbar status.
+    ui.registryMessage.textContent = error.message;
+  }
+}
+
+async function loadCredentials() {
   try {
     const result = await api(`${API_ROOT}/credentials`);
     storedCredentials = result.credentials ?? [];
     renderCredentialStorage(result.storage ?? {});
     renderCredentials();
     ui.credentialsRefreshed.textContent = `${storedCredentials.length} stored`;
-    setConnection('online', 'Credential store online');
+    // A connector row names the key it uses, so it has to re-render once the
+    // keys are known.
+    if (registryServers.length) renderRegistry();
   } catch (error) {
-    setConnection('offline', error.message);
+    ui.credentialMessage.textContent = error.message;
     ui.credentialList.innerHTML = '<p class="usage-error">Could not load credentials.</p>';
   }
 }
@@ -2297,6 +2405,7 @@ async function saveCredential(event) {
     ui.credentialDialog.close();
     ui.credentialValue.value = '';
     await loadCredentials();
+    if (registryServers.length) renderRegistry();
   } catch (error) {
     ui.credentialMessage.textContent = error.message;
     ui.credentialMessage.classList.remove('hidden');
@@ -2307,9 +2416,12 @@ async function deleteCredential(credential) {
   if (!window.confirm(`Delete ${credential.name}? Any connector still using it must be changed first.`)) return;
   try {
     await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}?confirmation=${encodeURIComponent(credential.name)}`, { method: 'DELETE' });
+    ui.credentialMessage.textContent = '';
     await loadCredentials();
   } catch (error) {
-    setConnection('offline', error.message);
+    // Next to the credential being deleted. This used to overwrite the topbar
+    // connection status, which reads as the control plane having gone offline.
+    ui.credentialMessage.textContent = error.message;
   }
 }
 
@@ -2336,6 +2448,7 @@ async function syncCredentialOptions(selectedId = '') {
   }
 }
 
+ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());
 ui.newCredential.addEventListener('click', () => openCredentialDialog());
 ui.credentialForm.addEventListener('submit', saveCredential);
 ui.cancelCredential.addEventListener('click', () => ui.credentialDialog.close());
@@ -2343,9 +2456,13 @@ ui.closeCredentialDialog.addEventListener('click', () => ui.credentialDialog.clo
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 const jobsRoute = /^\/(?:jobs|schedules)\/?$/.test(window.location.pathname);
-const credentialsRoute = /^\/credentials\/?$/.test(window.location.pathname);
+// Served at /connectors, not /mcp: the control plane's own MCP protocol endpoint
+// owns /mcp and answers a browser GET with 503. /credentials stays an alias so
+// existing links and bookmarks resolve, since credentials are now a section here
+// rather than a page of their own.
+const mcpRoute = /^\/(?:connectors|credentials)\/?$/.test(window.location.pathname);
 void loadPlatformSession();
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
 else if (jobsRoute) loadJobs();
-else if (credentialsRoute) loadCredentials();
+else if (mcpRoute) loadMcpPage();
 else loadDashboard();

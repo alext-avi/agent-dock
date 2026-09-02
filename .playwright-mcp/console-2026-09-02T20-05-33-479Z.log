@@ -1,0 +1,2 @@
+[      87ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8989/favicon.ico:0
+[   30541ms] [ERROR] Failed to load resource: the server responded with a status of 409 (Conflict) @ http://127.0.0.1:8989/api/v1/credentials/clickthrough-key?confirmation=clickthrough-key:0

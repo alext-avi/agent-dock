@@ -1,0 +1,51 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - link "Agent Dock dashboard" [ref=e3] [cursor=pointer]:
+      - /url: /
+      - generic [ref=e4]: A/
+      - generic [ref=e5]:
+        - strong [ref=e6]: Agent Dock
+        - generic [ref=e7]: container agent POC
+    - generic [ref=e8]:
+      - link "Fleet" [ref=e9] [cursor=pointer]:
+        - /url: /
+      - link "Jobs" [ref=e10] [cursor=pointer]:
+        - /url: /jobs
+      - link "Credentials" [ref=e11] [cursor=pointer]:
+        - /url: /credentials
+      - generic [ref=e12]: Credential store online
+      - generic "Signed-in operator" [ref=e15]:
+        - button "Local operator admin" [ref=e16] [cursor=pointer]:
+          - generic [ref=e17]:
+            - strong [ref=e18]: Local operator
+            - generic [ref=e19]: admin
+  - main [ref=e20]:
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e23]:
+          - paragraph [ref=e24]: CONTROL PLANE · CONNECTOR CREDENTIALS
+          - heading [level=1] [ref=e25]:
+            - text: Keys you can
+            - emphasis [ref=e26]: take back.
+          - paragraph [ref=e27]: An API key is stored once, sent only to the hosts you name, and delivered only to the agents whose connectors use it. A value is never shown again after saving.
+        - generic [ref=e28]:
+          - generic [ref=e29]: "storage: environment"
+          - button "New credential ＋" [ref=e30] [cursor=pointer]
+      - paragraph [ref=e32]: Values are encrypted at rest, and with the environment key provider that protects a copied volume or backup, not this host. Anyone able to read this host can read them.
+      - generic [ref=e33]:
+        - generic [ref=e34]:
+          - paragraph [ref=e35]: CREDENTIALS
+          - heading "Stored keys" [level=2] [ref=e36]
+        - generic [ref=e37]: 1 stored
+      - article [ref=e39]:
+        - generic [ref=e40]:
+          - strong [ref=e41]: clickthrough-key
+          - generic [ref=e42]: api-key · header X-Api-Key
+        - generic [ref=e43]: …8888
+        - generic "mcp.deepwiki.com" [ref=e44]
+        - generic [ref=e45]:
+          - button "Edit" [ref=e46] [cursor=pointer]
+          - button "Delete" [ref=e47] [cursor=pointer]
+  - contentinfo [ref=e48]:
+    - generic [ref=e49]: POC / local first
+    - generic [ref=e50]: No account rollover · No provider credential proxy

@@ -455,3 +455,9 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .access-identity > div:last-child { border-bottom: 0; }
   .access-config dl div { grid-template-columns: 1fr; gap: 3px; }
 }
+
+.subnav { display: flex; gap: 18px; margin: 0 0 6px; border-bottom: 1px solid var(--line); }
+.subnav-link { padding: 0 0 9px; color: var(--muted); text-decoration: none; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 2px solid transparent; }
+.subnav-link:hover { color: var(--text); border-bottom-color: var(--line); }
+.fleet-heading-actions { display: flex; align-items: center; gap: 14px; }
+.text-button.danger { color: #d98a8a; }

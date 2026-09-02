@@ -627,3 +627,75 @@ test('every page opens its dialogs without a browser error', async (t) => {
 
   assert.deepEqual(errors, [], `the browser reported errors: ${errors.join(' | ')}`);
 });
+
+// These share one control plane with every other test in this file, so each
+// asserts on names it created rather than on the first row or an empty list.
+test('credentials live inside the MCP page, not beside it in the nav', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#mcp-view:not(.hidden)');
+
+  // Credentials only ever serve connectors, so they are a section of this page
+  // rather than a peer of Fleet and Jobs.
+  const nav = await page.locator('.nav-link').allTextContents();
+  assert.deepEqual(nav.map((item) => item.trim()), ['Fleet', 'Jobs', 'MCP']);
+  assert.ok(await page.locator('#connectors').isVisible());
+  assert.ok(await page.locator('#credentials').isVisible());
+
+  // The old address still resolves, so existing links and bookmarks survive.
+  await page.goto(`${app.url}/credentials`);
+  await page.waitForSelector('#mcp-view:not(.hidden)');
+  assert.ok(await page.locator('#credentials').isVisible());
+});
+
+test('a connector defined from the MCP page is stored without being attached to anything', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  // With no agent in context the dialog defines only; it has nothing to attach to.
+  assert.equal((await page.locator('#save-mcp').textContent()).trim(), 'Save connector');
+  await page.fill('#mcp-name', 'registry-only');
+  await page.fill('#mcp-url', 'https://registry-only.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'registry-only' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /remote HTTP/);
+});
+
+test('a refused delete is reported beside the list, not as the control plane going offline', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#credential-list');
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'in-use-key');
+  await page.fill('#credential-header', 'X-Api-Key');
+  await page.fill('#credential-hosts', 'inuse.example.com');
+  await page.fill('#credential-value', 'sk-inuse-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  const credentialRow = page.locator('.credential-row', { hasText: 'in-use-key' });
+  await credentialRow.waitFor();
+
+  // Attach it to a connector so the deletion has to be refused.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'uses-the-key');
+  await page.fill('#mcp-url', 'https://inuse.example.com/mcp');
+  const option = await page.locator('#mcp-credential option', { hasText: 'in-use-key' }).textContent();
+  await page.selectOption('#mcp-credential', { label: option.trim() });
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#registry-list .mcp-row', { hasText: 'uses-the-key' }).waitFor();
+
+  page.on('dialog', (dialog) => dialog.accept());
+  await credentialRow.locator('.text-button', { hasText: 'Delete' }).click();
+
+  await page.waitForFunction(() => document.querySelector('#credential-message')?.textContent?.includes('still used by'));
+  // The topbar reports the control plane's health and must not be repurposed for
+  // an ordinary refusal — that reads as the whole thing having gone down.
+  assert.doesNotMatch(await page.locator('#connection-label').textContent(), /still used by/);
+  assert.equal(await credentialRow.count(), 1, 'the credential was deleted despite being in use');
+});

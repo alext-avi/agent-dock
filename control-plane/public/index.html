@@ -16,7 +16,7 @@
       <div class="topbar-right">
         <a class="nav-link" href="/">Fleet</a>
         <a class="nav-link" href="/jobs">Jobs</a>
-        <a class="nav-link" href="/credentials">Credentials</a>
+        <a class="nav-link" href="/connectors">MCP</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
         <div id="operator-account" class="operator-account" aria-label="Signed-in operator">
           <button id="access-policy-button" class="operator-access" type="button" aria-haspopup="dialog" title="View access policy">
@@ -55,29 +55,44 @@
         </section>
       </div>
 
-      <div id="credentials-view" class="view hidden">
+      <div id="mcp-view" class="view hidden">
         <section class="jobs-header">
           <div>
-            <p class="eyebrow">CONTROL PLANE · CONNECTOR CREDENTIALS</p>
-            <h1>Keys you can <em>take back.</em></h1>
-            <p class="hero-copy">An API key is stored once, sent only to the hosts you name, and delivered only to the agents whose connectors use it. A value is never shown again after saving.</p>
+            <p class="eyebrow">CONTROL PLANE · MCP</p>
+            <h1>Prove once. <em>Reuse deliberately.</em></h1>
+            <p class="hero-copy">Connectors are defined once and attached to any compatible agent. The keys they authenticate with live here too, because that is the only thing they are for.</p>
           </div>
           <div class="jobs-header-actions">
             <span id="credential-storage" class="pill neutral">checking storage</span>
-            <button id="new-credential" class="button primary" type="button">New credential <span>＋</span></button>
+            <button id="new-registry-mcp" class="button primary" type="button">New connector <span>＋</span></button>
           </div>
         </section>
 
+        <nav class="subnav" aria-label="MCP sections">
+          <a class="subnav-link" href="#connectors">Connectors</a>
+          <a class="subnav-link" href="#credentials">Credentials</a>
+        </nav>
+
+        <section class="fleet-heading" id="connectors">
+          <div><p class="kicker">REUSABLE CONNECTIONS</p><h2>Connectors</h2></div>
+          <span id="registry-count" class="hint">Loading connectors…</span>
+        </section>
+        <p class="capability-copy">A definition carries the connection shape and which stored key it uses — never a key's value. Attaching and applying happen on an individual agent.</p>
+        <section id="registry-list" class="mcp-list" aria-live="polite"><p class="empty">Loading connectors…</p></section>
+        <p id="registry-message" class="run-message" role="status"></p>
+
+        <section class="fleet-heading" id="credentials">
+          <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
+          <div class="fleet-heading-actions">
+            <span id="credentials-refreshed" class="hint">Loading credentials…</span>
+            <button id="new-credential" class="button primary" type="button">New credential <span>＋</span></button>
+          </div>
+        </section>
         <section id="credential-storage-note" class="panel credential-note hidden">
           <p id="credential-storage-detail"></p>
         </section>
-
-        <section class="fleet-heading">
-          <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
-          <span id="credentials-refreshed" class="hint">Loading credentials…</span>
-        </section>
-
         <section id="credential-list" class="mcp-list" aria-live="polite"><p class="empty">Loading credentials…</p></section>
+        <p id="credential-message" class="run-message" role="status"></p>
       </div>
 
       <div id="jobs-view" class="view hidden">

@@ -1028,8 +1028,25 @@ export function createWorkerServer(options = {}) {
     return publicAuthentication();
   }
 
+  // A provider names the session in its own error output when a resume fails, and
+  // that output is streamed to the caller. The session identifier is below the
+  // wrapper by contract, so it is scrubbed here — the one place every event and
+  // log line passes through — rather than at nine separate emit sites.
+  function redact(value) {
+    const secrets = state.activeJob?.redactions;
+    if (!secrets?.length || typeof value !== 'string') return value;
+    let scrubbed = value;
+    for (const secret of secrets) {
+      if (secret) scrubbed = scrubbed.split(secret).join('[session]');
+    }
+    return scrubbed;
+  }
+
   function emitCanonical(res, type, { taskId = null, data = {} } = {}) {
-    res.write(`${JSON.stringify(wrapperEvent(type, { taskId, data }))}\n`);
+    const safe = data && typeof data === 'object' && !Array.isArray(data)
+      ? Object.fromEntries(Object.entries(data).map(([key, value]) => [key, redact(value)]))
+      : data;
+    res.write(`${JSON.stringify(wrapperEvent(type, { taskId, data: safe }))}\n`);
   }
 
   function emitProviderEvent(res, event, job) {
@@ -1038,7 +1055,10 @@ export function createWorkerServer(options = {}) {
     // fails later still leaves a resumable conversation behind.
     if (job.conversationId) {
       const session = observeProviderSessionId(event);
-      if (session) conversations.attachSession(job.conversationId, session).catch(() => {});
+      if (session) {
+        if (!job.redactions?.includes(session)) job.redactions?.push(session);
+        conversations.attachSession(job.conversationId, session).catch(() => {});
+      }
     }
     const normalized = normalizeProviderEvent(event);
     if (!normalized) return;
@@ -1070,7 +1090,13 @@ export function createWorkerServer(options = {}) {
       ? ['exec', 'resume', resumeSession, '--json', '--skip-git-repo-check']
       : ['exec', '--json', '--skip-git-repo-check', '-C', config.workspace];
     if (config.allowUnsandboxed) args.push('--dangerously-bypass-approvals-and-sandbox');
-    else if (!resumeSession) args.push('--sandbox', 'workspace-write');
+    // `codex exec resume` rejects --sandbox, so the policy goes through the
+    // config override that subcommand does accept. Dropping it instead would let
+    // a resumed thread run under whatever policy was recorded when it started —
+    // so tightening ALLOW_UNSANDBOXED and refreshing a runtime would not govern
+    // an existing conversation, while the worker still reported it sandboxed.
+    else if (resumeSession) args.push('-c', 'sandbox_mode="workspace-write"');
+    else args.push('--sandbox', 'workspace-write');
     args.push('-');
 
     const child = spawn('codex', args, {
@@ -1378,39 +1404,51 @@ export function createWorkerServer(options = {}) {
 
       if (req.method === 'POST' && route === '/v1/tasks') {
         if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'This agent is already running a task' }));
-        const body = await readJson(req);
+        // Claim the slot before the first await. There are several of them before
+        // the real job is installed, and two concurrent posts used to pass the
+        // check above, both open the conversation, and both mint a session — with
+        // the loser's exchange written to a session nothing would reference again.
+        state.activeJob = { id: null, status: 'claiming', claim: true };
+        const release = () => { if (state.activeJob?.claim) state.activeJob = null; };
+        let body;
+        try { body = await readJson(req); }
+        catch (error) { release(); throw error; }
         const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
         const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : '';
-        if (!prompt) return json(res, 400, wrapperResponse({ error: 'prompt is required' }));
+        if (!prompt) return release() ?? json(res, 400, wrapperResponse({ error: 'prompt is required' }));
         let conversationId;
         try { conversationId = normalizeConversationId(body.conversationId); }
-        catch (error) { return json(res, error.status ?? 400, wrapperResponse({ error: error.message })); }
+        catch (error) { return release() ?? json(res, error.status ?? 400, wrapperResponse({ error: error.message })); }
         // Refusing is the point. A worker that accepted a conversation it cannot
         // continue would run a context-free task and report success, which reads
         // to the caller as an agent that quietly stopped listening.
         if (conversationId && !adapterManifest.capabilities.tasks.conversations) {
-          return json(res, 409, wrapperResponse({ error: 'This adapter cannot continue a conversation' }));
+          return release() ?? json(res, 409, wrapperResponse({ error: 'This adapter cannot continue a conversation' }));
         }
-        if (prompt.length > 100_000 || instructions.length > 50_000) return json(res, 413, wrapperResponse({ error: 'Prompt or instructions are too large' }));
+        if (prompt.length > 100_000 || instructions.length > 50_000) return release() ?? json(res, 413, wrapperResponse({ error: 'Prompt or instructions are too large' }));
         const resolvedModel = await resolveTaskModel(body.modelPolicy);
         const login = await authStatus();
         const localCredentiallessModel = resolvedModel.model?.startsWith('ollama/');
-        if (!login.authenticated && !localCredentiallessModel) return json(res, 409, wrapperResponse({
+        if (!login.authenticated && !localCredentiallessModel) return release() ?? json(res, 409, wrapperResponse({
           error: 'Authenticate this agent before running a task',
           authentication: publicAuthentication({ login })
         }));
 
         const job = { id: randomUUID(), status: 'running', startedAt: new Date().toISOString(), child: null, cancelled: false, tokenUsage: null, exitCode: null, model: resolvedModel.model };
         job.conversationId = conversationId;
+        job.redactions = [];
         if (conversationId) {
           const record = await conversations.open(conversationId, { taskId: job.id });
           job.providerSession = record.providerSession;
-          // A harness that takes an id from us needs one before it starts, and it
-          // is recorded now so a crashed first turn still leaves it resumable.
+          // Claude Code takes an id from us, so one is minted for the CLI flag.
+          // It is deliberately NOT recorded yet: the harness announces the session
+          // it actually opened, and recording one it never opened would mark the
+          // conversation resumable and then fail every later turn permanently,
+          // because the first recorded session wins.
           if (!job.providerSession && config.adapterId === 'claude-code') {
             job.mintedSession = conversations.mintSession();
-            await conversations.attachSession(conversationId, job.mintedSession);
           }
+          job.redactions = [job.providerSession, job.mintedSession].filter(Boolean);
         }
         state.activeJob = job;
         res.writeHead(200, {

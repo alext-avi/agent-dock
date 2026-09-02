@@ -76,11 +76,16 @@ export function normalizeClaudeEvent(event = {}) {
 }
 
 
-// Claude Code is the one harness that accepts an id we choose, so there is
-// nothing to observe: the worker supplies --session-id on the first turn and
-// --resume afterwards. Kept as a function so every adapter answers the same
-// question, and so a future Claude release that renames the field has one place
-// to change.
-export function observeClaudeSessionId() {
-  return null;
+// Claude Code is the one harness that accepts an id we choose, but it still
+// announces the session it actually opened:
+//   {"type":"system","subtype":"init","session_id":"b95e3a83-...","cwd":...}
+// Observed from a real `claude -p --output-format stream-json` run. Recording it
+// on announcement rather than before spawning matters: the id is only worth
+// keeping once the harness has accepted it, and a conversation that recorded a
+// session Claude never opened would report itself resumable and then fail every
+// later turn with no way back.
+export function observeClaudeSessionId(event = {}) {
+  if (event.type !== 'system') return null;
+  const id = event.session_id;
+  return typeof id === 'string' && id ? id : null;
 }

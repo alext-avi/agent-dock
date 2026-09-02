@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,8 +54,13 @@ test('each adapter recognises its own provider session identifier', () => {
   );
   assert.equal(observeOpenCodeSessionId({ type: 'text', part: {} }), null);
 
-  // Claude Code takes an id from us, so it announces nothing.
-  assert.equal(observeClaudeSessionId({ type: 'system', session_id: 'ignored' }), null);
+  // Claude Code takes an id from us but still announces the session it opened,
+  // which is what the worker records — recorded on announcement, not before.
+  assert.equal(
+    observeClaudeSessionId({ type: 'system', subtype: 'init', session_id: 'b95e3a83-757d-4d5b-afcf-c2945c861014' }),
+    'b95e3a83-757d-4d5b-afcf-c2945c861014'
+  );
+  assert.equal(observeClaudeSessionId({ type: 'assistant', session_id: 'x' }), null);
 });
 
 // The worker's own refusal of a conversation it cannot continue is unreachable
@@ -90,14 +95,16 @@ test('the first provider session wins and survives a worker restart', async (t) 
   const statePath = join(temporary, 'conversations.json');
 
   const store = createConversationStore({ statePath });
-  await store.open('chat-1', { taskId: 'task-a' });
+  const taskA = '11111111-1111-4111-8111-111111111111';
+  const taskB = '22222222-2222-4222-8222-222222222222';
+  await store.open('chat-1', { taskId: taskA });
   await store.attachSession('chat-1', 'ses_first');
   // A harness stamps its session on every event; a later one must not repoint an
   // established conversation at a different session mid-run.
   await store.attachSession('chat-1', 'ses_second');
   assert.equal((await store.resolve('chat-1')).providerSession, 'ses_first');
 
-  const second = await store.open('chat-1', { taskId: 'task-b' });
+  const second = await store.open('chat-1', { taskId: taskB });
   assert.equal(second.turns, 2);
 
   // Provider sessions are durable on the agent's volume, so ours must be too —
@@ -106,13 +113,40 @@ test('the first provider session wins and survives a worker restart', async (t) 
   const survived = await reopened.resolve('chat-1');
   assert.equal(survived.providerSession, 'ses_first');
   assert.equal(survived.turns, 2);
-  assert.equal(survived.lastTaskId, 'task-b');
+  assert.equal(survived.lastTaskId, taskB);
 
   // The provider's own identifier is worker-internal and must never be public.
   const listed = await reopened.list();
   assert.deepEqual(Object.keys(listed[0]).sort(), ['createdAt', 'id', 'lastTaskId', 'resumable', 'turns', 'updatedAt']);
   assert.doesNotMatch(JSON.stringify(listed), /ses_first/);
   assert.equal(listed[0].resumable, true);
+});
+
+test('a record written by the agent itself cannot be echoed back through the API', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-conversation-injected-'));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const statePath = join(temporary, 'conversations.json');
+
+  // This file lives on a volume the agent can write, and the agent may be
+  // prompt-injected. publicConversation chooses which fields come back; the load
+  // path decides what those fields may contain.
+  await writeFile(statePath, JSON.stringify({
+    schemaVersion: 1,
+    conversations: [
+      { id: 'injected', lastTaskId: 'sk-live-STOLEN-CREDENTIAL', turns: 'lots', providerSession: 'ses_x' },
+      { id: '../../escape', lastTaskId: null, turns: 1 },
+      { id: 'no-timestamps', turns: 2 }
+    ]
+  }));
+
+  const store = createConversationStore({ statePath });
+  const listed = await store.list();
+  assert.doesNotMatch(JSON.stringify(listed), /STOLEN/, 'a written-in value was echoed back');
+  assert.equal(listed.find((item) => item.id === 'injected').lastTaskId, null);
+  assert.equal(listed.find((item) => item.id === 'injected').turns, 0);
+  assert.equal(listed.some((item) => item.id === '../../escape'), false, 'an unsafe id survived the load');
+  // A record missing its timestamps must not crash the listing.
+  assert.ok(listed.find((item) => item.id === 'no-timestamps').updatedAt);
 });
 
 test('a worker reports and forgets conversations without disclosing provider sessions', async (t) => {
@@ -180,13 +214,16 @@ test('a claude worker records the session it minted before the harness ever runs
 
   await ndjson(workerUrl, { prompt: 'hello', conversationId: 'chat-mint' }, token);
 
-  // Claude takes an id from us, so it is recorded up front: a first turn that
-  // crashes still leaves something resumable rather than a dead conversation.
+  // A session is only recorded once the harness announces it. The demo worker
+  // announces nothing, so the conversation exists and honestly reports that it
+  // has no continuity to offer — rather than claiming a session Claude never
+  // opened, which would fail every later turn permanently, because the first
+  // recorded session wins and there is no way to correct it.
   const stored = JSON.parse(await readFile(statePath, 'utf8')).conversations[0];
-  assert.match(stored.providerSession, /^[0-9a-f-]{36}$/);
+  assert.equal(stored.id, 'chat-mint');
+  assert.equal(stored.providerSession, null);
   const listed = await (await fetch(`${workerUrl}/v1/conversations`, { headers: { authorization: `Bearer ${token}` } })).json();
-  assert.equal(listed.conversations[0].resumable, true);
-  assert.doesNotMatch(JSON.stringify(listed), new RegExp(stored.providerSession));
+  assert.equal(listed.conversations[0].resumable, false);
 });
 
 test('the control plane refuses to send a conversation to a runtime that cannot continue one', async (t) => {

@@ -50,13 +50,42 @@ export function publicConversation(record) {
   };
 }
 
+// This file lives on a volume the agent itself can write, and the agent may be
+// prompt-injected. publicConversation chooses which fields are returned; this
+// decides what those fields are allowed to contain, so a written-in value cannot
+// be echoed back through the API or crash the listing on a missing timestamp.
+function isoOr(value, fallback) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : fallback;
+}
+
+function sanitize(item) {
+  const now = new Date(0).toISOString();
+  const createdAt = isoOr(item.createdAt, now);
+  return {
+    id: item.id,
+    providerSession: typeof item.providerSession === 'string' && item.providerSession.length <= 200
+      ? item.providerSession
+      : null,
+    turns: Number.isInteger(item.turns) && item.turns >= 0 ? item.turns : 0,
+    createdAt,
+    updatedAt: isoOr(item.updatedAt, createdAt),
+    lastTaskId: typeof item.lastTaskId === 'string' && /^[0-9a-f-]{36}$/.test(item.lastTaskId)
+      ? item.lastTaskId
+      : null
+  };
+}
+
 export function createConversationStore({ statePath = null, clock = () => new Date() } = {}) {
   let records = new Map();
 
   async function persist() {
     if (!statePath) return;
     await mkdir(path.dirname(statePath), { recursive: true });
-    const temporary = `${statePath}.${process.pid}.${Date.now()}.tmp`;
+    // A millisecond clock is not unique enough: two persists in the same
+    // millisecond wrote the same temp path, truncating each other, and rename
+    // then installed the partial document as the state file — losing every
+    // mapping on the agent, not just the one being written.
+    const temporary = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
     const payload = { schemaVersion: 1, conversations: [...records.values()] };
     await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
     await rename(temporary, statePath);
@@ -68,8 +97,8 @@ export function createConversationStore({ statePath = null, clock = () => new Da
       const stored = JSON.parse(await readFile(statePath, 'utf8'));
       if (!Array.isArray(stored.conversations)) return;
       records = new Map(stored.conversations
-        .filter((item) => item && typeof item.id === 'string')
-        .map((item) => [item.id, item]));
+        .filter((item) => item && typeof item.id === 'string' && ID_PATTERN.test(item.id))
+        .map((item) => [item.id, sanitize(item)]));
     } catch (error) {
       // A missing file is the normal first-run case. A corrupt one is not worth
       // failing a whole worker over: the cost of starting from empty is losing

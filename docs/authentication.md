@@ -101,6 +101,8 @@ Authorization: Bearer <audience-bound-jwt>
 
 Agent Dock publishes REST protected-resource metadata at `/.well-known/oauth-protected-resource` and MCP metadata at `/.well-known/oauth-protected-resource/mcp`. Missing credentials receive `401` with a `WWW-Authenticate` challenge pointing to the corresponding document. A REST token cannot be replayed at MCP because the two resources use different audiences.
 
+The protected-resource documents intentionally omit `scopes_supported` for the WorkOS-backed human flow because this environment's authorization server advertises only the standard OIDC identity scopes. Human tool authorization comes from Agent Dock's explicit subject assignments. Separately provisioned agent tokens may still carry `fleet:read` and `tasks:execute`, which Agent Dock enforces directly.
+
 ## Control-plane MCP
 
 The Streamable HTTP endpoint is `${AUTH_PUBLIC_ORIGIN}/mcp`. It uses the official MCP TypeScript SDK, serves the current `2026-07-28` protocol, and retains its stateless compatibility path for 2025-era clients. Shared and remote deployments require `AUTH_MODE=oidc` and a bearer JWT whose audience is exactly `AUTH_MCP_AUDIENCE`.

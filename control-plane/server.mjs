@@ -998,7 +998,7 @@ export function createControlPlane(options = {}) {
       return json(res, 200, auth.protectedResourceMetadata());
     }
     if (req.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource/mcp') {
-      return json(res, 200, auth.protectedResourceMetadata(auth.mcpAudience, ['fleet:read', 'tasks:execute']));
+      return json(res, 200, auth.protectedResourceMetadata(auth.mcpAudience));
     }
     if (req.method === 'GET' && url.pathname === '/login') {
       const principal = await auth.authenticate(req);

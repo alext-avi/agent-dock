@@ -698,22 +698,11 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     revokeSession,
     clearSessionCookie: () => sessionCookie('', { clear: true }),
     close: () => sessionDb?.close(),
-    protectedResourceMetadata: (resourceIdentifier = apiAudience, scopes = [
-      'fleet:read',
-      'tasks:execute',
-      'schedules:manage',
-      'usage:refresh',
-      'agents:manage',
-      'mcp:manage',
-      'provider-auth:manage',
-      'runtime:manage',
-      'workspace:read',
-      'control:admin'
-    ]) => ({
+    protectedResourceMetadata: (resourceIdentifier = apiAudience, scopes = []) => ({
       resource: resourceIdentifier,
       authorization_servers: issuer ? [issuer] : [],
       bearer_methods_supported: ['header'],
-      scopes_supported: scopes
+      ...(scopes.length ? { scopes_supported: scopes } : {})
     })
   };
 }

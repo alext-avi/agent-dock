@@ -618,7 +618,7 @@ test('audience-bound bearer tokens obey the same role and permission policy', as
 
   const mcpMetadata = await (await fetch(`${url}/.well-known/oauth-protected-resource/mcp`)).json();
   assert.equal(mcpMetadata.resource, 'https://dock.example.test/mcp');
-  assert.deepEqual(mcpMetadata.scopes_supported, ['fleet:read', 'tasks:execute']);
+  assert.equal('scopes_supported' in mcpMetadata, false, 'resource metadata must not advertise scopes unsupported by the OIDC issuer');
 
   response = await fetch(`${url}/mcp`, {
     method: 'POST',

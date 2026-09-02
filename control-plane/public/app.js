@@ -191,6 +191,8 @@ const ui = {
   attachmentId: $('#attachment-id'),
   attachmentDialogTitle: $('#attachment-dialog-title'),
   attachmentLocationFields: $('#attachment-location-fields'),
+  attachmentRootField: $('#attachment-root-field'),
+  attachmentFolderField: $('#attachment-folder-field'),
   attachmentRoot: $('#attachment-root'),
   attachmentPath: $('#attachment-path'),
   browseAttachment: $('#browse-attachment'),
@@ -1731,6 +1733,9 @@ function openAttachmentDialog(attachment = null) {
     ui.attachmentRoot.append(option);
   }
   ui.attachmentRoot.value = attachment?.source?.root?.id ?? attachmentRoots[0]?.id ?? '';
+  const chooseRoot = !attachment && attachmentRoots.length > 1;
+  ui.attachmentRootField.classList.toggle('hidden', !chooseRoot);
+  ui.attachmentFolderField.classList.toggle('full', !chooseRoot);
   folderBrowserPath = attachment?.source?.root?.relativePath ?? '.';
   ui.attachmentPath.value = folderBrowserPath;
   closeHostFolderBrowser();

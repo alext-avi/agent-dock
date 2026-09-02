@@ -399,8 +399,8 @@
         <p class="dialog-copy">Choose a host folder and how this agent may use it. The agent must be idle because saving safely replaces its container.</p>
         <section id="attachment-location-fields">
           <div class="form-grid">
-            <label class="field">Approved root<select id="attachment-root"></select></label>
-            <label class="field">Folder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="attachment-path" maxlength="1000" value="." readonly><button id="browse-attachment" class="button secondary" type="button">Browse…</button></div></label>
+            <label id="attachment-root-field" class="field">Approved root<select id="attachment-root"></select></label>
+            <label id="attachment-folder-field" class="field">Folder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="attachment-path" maxlength="1000" value="." readonly><button id="browse-attachment" class="button secondary" type="button">Browse…</button></div></label>
           </div>
           <p id="attachment-root-policy" class="schedule-note"></p>
           <section id="host-folder-browser" class="host-folder-browser hidden" aria-label="Approved host folders">

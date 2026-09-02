@@ -699,3 +699,60 @@ test('a refused delete is reported beside the list, not as the control plane goi
   assert.doesNotMatch(await page.locator('#connection-label').textContent(), /still used by/);
   assert.equal(await credentialRow.count(), 1, 'the credential was deleted despite being in use');
 });
+
+test('the workshop fills the connector form in place and keeps its conversation across corrections', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  // Asking is offered when defining something new, inside the dialog it fills.
+  assert.ok(await page.locator('#workshop').isVisible());
+
+  // Pick the harness explicitly rather than relying on which one sorts first.
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a documentation connector');
+  await page.click('#run-workshop');
+
+  // The demo worker echoes the prompt back, so what returns is the example
+  // proposal the prompt carries — which still exercises the whole path: stream,
+  // extract, and fill the form the operator is looking at.
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'lowercase_connector_name');
+  assert.equal(await page.inputValue('#mcp-url'), 'https://example.com/mcp');
+  assert.match(await page.locator('#workshop-status').textContent(), /review before saving/i);
+
+  // A correction continues the same exchange rather than starting over, so the
+  // harness still has everything it worked out the first time.
+  await page.fill('#workshop-objective', 'no, it is the other endpoint');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelectorAll('#workshop-log p').length >= 4);
+
+  const agentId = app.agents['claude-code'].id;
+  const conversations = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/agents/${id}/conversations`);
+    return response.json();
+  }, agentId);
+  const workshopConversations = (conversations.conversations ?? []).filter((item) => item.id.startsWith('workshop-'));
+  assert.equal(workshopConversations.length, 1, 'a correction started a new conversation instead of continuing one');
+  assert.equal(workshopConversations[0].turns, 2);
+});
+
+test('editing an existing connector does not offer to ask a harness', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'already-known');
+  await page.fill('#mcp-url', 'https://already-known.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'already-known' });
+  await row.waitFor();
+
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  // Editing a known shape is a deliberate act, not a question for a harness.
+  assert.equal(await page.locator('#workshop').isVisible(), false);
+});

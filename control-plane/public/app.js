@@ -1,5 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+import { buildMcpWorkshopPrompt, extractMcpWorkshopProposal } from './mcp-workshop.js';
+
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
@@ -26,6 +28,12 @@ const ui = {
   registryMessage: $('#registry-message'),
   newRegistryMcp: $('#new-registry-mcp'),
   credentialMessage: $('#credential-message'),
+  workshop: $('#workshop'),
+  workshopAgent: $('#workshop-agent'),
+  workshopObjective: $('#workshop-objective'),
+  workshopRun: $('#run-workshop'),
+  workshopStatus: $('#workshop-status'),
+  workshopLog: $('#workshop-log'),
   credentialList: $('#credential-list'),
   credentialStorage: $('#credential-storage'),
   credentialStorageNote: $('#credential-storage-note'),
@@ -1392,6 +1400,7 @@ function openMcpDialog(server = null) {
   ui.deleteMcpDefinition.classList.toggle('hidden', !server);
   ui.saveMcp.textContent = currentAgent ? (server ? 'Save and apply' : 'Save and attach') : 'Save connector';
   syncMcpTransportFields();
+  void prepareWorkshop(server);
   ui.mcpDialog.showModal();
 }
 
@@ -1429,6 +1438,142 @@ async function applyMcp() {
     ui.mcpMessage.textContent = error.message;
   } finally {
     await refreshMcp();
+  }
+}
+
+// The workshop lives inside the connector dialog. A successful run fills in the
+// form you were already looking at; a failed one leaves the exchange visible so
+// you can correct it and ask again. Every ask after the first continues the same
+// conversation, so "no, it uses a different endpoint" is a correction rather
+// than a fresh start.
+let workshopConversationId = null;
+let workshopRunning = false;
+
+function workshopNote(text, kind = '') {
+  if (!text) return;
+  const line = document.createElement('p');
+  if (kind) line.className = kind;
+  line.textContent = text;
+  ui.workshopLog.classList.remove('hidden');
+  ui.workshopLog.append(line);
+  ui.workshopLog.scrollTop = ui.workshopLog.scrollHeight;
+}
+
+async function prepareWorkshop(server) {
+  workshopConversationId = null;
+  workshopRunning = false;
+  ui.workshopLog.replaceChildren();
+  ui.workshopLog.classList.add('hidden');
+  ui.workshopStatus.textContent = '';
+  ui.workshopObjective.value = '';
+  // Only offered when defining something new. Editing an existing connector is
+  // a deliberate act on a known shape, not a question for a harness.
+  ui.workshop.classList.toggle('hidden', Boolean(server));
+  if (server) return;
+  try {
+    const { agents } = await api(`${API_ROOT}/agents`);
+    const usable = (agents ?? []).filter((agent) => agent.runtime);
+    ui.workshopAgent.replaceChildren();
+    if (!usable.length) {
+      ui.workshop.classList.add('hidden');
+      return;
+    }
+    for (const agent of usable) {
+      const option = document.createElement('option');
+      option.value = agent.id;
+      option.textContent = agent.name ?? agent.id;
+      ui.workshopAgent.append(option);
+    }
+    if (currentAgent) ui.workshopAgent.value = currentAgent.id;
+  } catch {
+    // The dialog still works as a plain form.
+    ui.workshop.classList.add('hidden');
+  }
+}
+
+function applyProposalToForm(proposal) {
+  ui.mcpName.value = proposal.name ?? '';
+  ui.mcpTransport.value = proposal.transport;
+  syncMcpTransportFields();
+  ui.mcpUrl.value = proposal.url ?? '';
+  ui.mcpCommand.value = proposal.command ?? '';
+  ui.mcpArgs.value = (proposal.args ?? []).join('\n');
+  ui.mcpTimeout.value = String(Math.round((proposal.timeoutMs ?? 30_000) / 1000));
+  const bearer = Object.entries(proposal.secretHeaders ?? {})
+    .find(([header, value]) => header.toLowerCase() === 'authorization' && value.prefix === 'Bearer ');
+  ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
+  const environment = Object.entries(proposal.secretEnvironment ?? {})[0];
+  ui.mcpSecretTarget.value = environment?.[0] ?? '';
+  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+}
+
+async function runWorkshop() {
+  if (workshopRunning) return;
+  const agentId = ui.workshopAgent.value;
+  const objective = ui.workshopObjective.value.trim();
+  if (!agentId || !objective) {
+    ui.workshopStatus.textContent = 'Choose a harness and describe the connector.';
+    return;
+  }
+  workshopRunning = true;
+  ui.workshopRun.disabled = true;
+  ui.workshopStatus.textContent = 'Asking…';
+  workshopNote(objective, 'harness');
+
+  // The first ask carries the full instructions; later ones are corrections
+  // inside the same conversation, so the harness still has everything it learned.
+  const first = !workshopConversationId;
+  if (first) workshopConversationId = `workshop-${crypto.randomUUID()}`;
+  const prompt = first ? buildMcpWorkshopPrompt(objective) : objective;
+
+  let output = '';
+  try {
+    const response = await fetch(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt, conversationId: workshopConversationId })
+    });
+    if (!response.ok || !response.body) {
+      const failure = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(failure.error ?? `HTTP ${response.status}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type === 'message.completed' && event.data?.text) {
+          output += `${event.data.text}\n`;
+          workshopNote(event.data.text);
+        }
+        if (event.type === 'activity.started' && event.data?.name) {
+          ui.workshopStatus.textContent = `Working — ${event.data.name}`;
+        }
+        if (event.type === 'error' && event.data?.message) workshopNote(event.data.message, 'failed');
+      }
+      if (done) break;
+    }
+
+    const { proposal, warnings } = extractMcpWorkshopProposal(output);
+    applyProposalToForm(proposal);
+    for (const warning of warnings) workshopNote(warning, 'failed');
+    ui.workshopStatus.textContent = 'Filled in below — review before saving.';
+  } catch (error) {
+    // Deliberately not fatal: the exchange stays open and the conversation is
+    // kept, so the next ask is a correction rather than a fresh start.
+    workshopNote(error.message, 'failed');
+    ui.workshopStatus.textContent = 'Tell it what was wrong and ask again.';
+  } finally {
+    workshopRunning = false;
+    ui.workshopRun.disabled = false;
+    ui.workshopObjective.value = '';
   }
 }
 
@@ -2448,6 +2593,7 @@ async function syncCredentialOptions(selectedId = '') {
   }
 }
 
+ui.workshopRun?.addEventListener('click', runWorkshop);
 ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());
 ui.newCredential.addEventListener('click', () => openCredentialDialog());
 ui.credentialForm.addEventListener('submit', saveCredential);

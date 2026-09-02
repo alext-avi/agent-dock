@@ -456,8 +456,17 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .access-config dl div { grid-template-columns: 1fr; gap: 3px; }
 }
 
-.subnav { display: flex; gap: 18px; margin: 0 0 6px; border-bottom: 1px solid var(--line); }
-.subnav-link { padding: 0 0 9px; color: var(--muted); text-decoration: none; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 2px solid transparent; }
-.subnav-link:hover { color: var(--text); border-bottom-color: var(--line); }
+.section-rule { margin: 38px 0 0; border: 0; border-top: 1px solid var(--line); }
 .fleet-heading-actions { display: flex; align-items: center; gap: 14px; }
 .text-button.danger { color: #d98a8a; }
+
+.workshop { display: grid; gap: 10px; padding: 14px 15px; border: 1px solid var(--line); background: #0d110f; }
+.workshop-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+.workshop-head small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.workshop-head select { max-width: 190px; }
+.workshop textarea { width: 100%; resize: vertical; }
+.workshop-actions { display: flex; align-items: center; gap: 12px; }
+.workshop-log { max-height: 190px; overflow-y: auto; display: grid; gap: 7px; padding: 11px 12px; border: 1px solid var(--line); background: #0a0d0b; }
+.workshop-log p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.workshop-log p.harness { color: var(--text); }
+.workshop-log p.failed { color: #d98a8a; }

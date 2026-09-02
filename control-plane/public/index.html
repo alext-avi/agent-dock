@@ -68,11 +68,6 @@
           </div>
         </section>
 
-        <nav class="subnav" aria-label="MCP sections">
-          <a class="subnav-link" href="#connectors">Connectors</a>
-          <a class="subnav-link" href="#credentials">Credentials</a>
-        </nav>
-
         <section class="fleet-heading" id="connectors">
           <div><p class="kicker">REUSABLE CONNECTIONS</p><h2>Connectors</h2></div>
           <span id="registry-count" class="hint">Loading connectors…</span>
@@ -81,6 +76,7 @@
         <section id="registry-list" class="mcp-list" aria-live="polite"><p class="empty">Loading connectors…</p></section>
         <p id="registry-message" class="run-message" role="status"></p>
 
+        <hr class="section-rule">
         <section class="fleet-heading" id="credentials">
           <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
           <div class="fleet-heading-actions">
@@ -422,6 +418,19 @@
         <input id="mcp-definition-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">WORKER CONNECTION</p><h2 id="mcp-dialog-title">New MCP server</h2></div><button id="close-mcp-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
+
+        <section id="workshop" class="workshop hidden">
+          <div class="workshop-head">
+            <div><p class="kicker">ASK A HARNESS</p><small>Describe the connector and let an agent work out its shape. You review everything before it is saved.</small></div>
+            <select id="workshop-agent" aria-label="Harness to ask"><option value="">No agents available</option></select>
+          </div>
+          <textarea id="workshop-objective" rows="3" maxlength="12000" placeholder="The GitHub MCP server, for reading issues and pull requests."></textarea>
+          <div class="workshop-actions">
+            <button id="run-workshop" class="button secondary" type="button">Ask</button>
+            <span id="workshop-status" class="run-message" role="status"></span>
+          </div>
+          <div id="workshop-log" class="workshop-log hidden" aria-live="polite"></div>
+        </section>
         <div class="form-grid">
           <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company_docs"></label>
           <label class="field">Transport<select id="mcp-transport"><option value="http">Remote HTTP</option><option value="stdio">Local stdio process</option></select></label>

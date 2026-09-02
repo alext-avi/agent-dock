@@ -229,12 +229,22 @@ export function createWorkerServer(options = {}) {
   // endpoint, so the window source is only advertised when the operator opts in,
   // and it is labelled experimental so the UI never presents it as supported.
   const claudeUsageEnabled = config.adapterId === 'claude-code' && config.claudeOAuthUsage;
-  const capabilities = claudeUsageEnabled
+  const instanceCapabilities = claudeUsageEnabled
     ? {
         ...adapterManifest.capabilities,
         usage: { ...adapterManifest.capabilities.usage, quotaWindows: true, quotaWindowSource: 'experimental-oauth' }
       }
     : adapterManifest.capabilities;
+  const capabilities = {
+    ...instanceCapabilities,
+    tasks: {
+      ...instanceCapabilities.tasks,
+      // Older agent-wrapper/v1 workers accepted an optional taskId but did not
+      // advertise that behavior. The control plane must see this positive flag
+      // before it sends a cancellation that could otherwise kill unrelated work.
+      targetedCancellation: true
+    }
+  };
 
   const state = {
     startedAt: new Date().toISOString(),

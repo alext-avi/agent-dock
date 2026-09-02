@@ -1,5 +1,12 @@
 .git
 .claude
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.sqlite
+*.sqlite-*
+control-data
 node_modules
 test
 docs

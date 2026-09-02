@@ -129,11 +129,11 @@ The registered safe tools are:
 |---|---|
 | `list_agents` | List safe summaries of visible delegation targets |
 | `get_agent_status` | Read an allowed agent's wrapper status |
-| `submit_agent_task` | Queue work and return a durable control-plane task handle |
+| `submit_agent_task` | Dispatch work and return a durable control-plane task handle; a busy worker can finish `skipped_busy` |
 | `get_agent_task` | Poll an owned or assigned task and read its normalized result/usage |
 | `cancel_agent_task` | Request cancellation of a task owned by the caller |
 
-Human viewers receive only the two read tools. Operators and administrators receive the task tools as well. An agent token must carry `agent_id`, the corresponding `fleet:read` and/or `tasks:execute` scope, and an explicit entry in `MCP_AGENT_POLICIES_JSON`. Both its visible tools and target agents are the intersection of the token scopes and that policy. No policy means no agent-callable tools.
+Human MCP bearers need positive authorization: an explicit administrator/operator subject or verified-email assignment, or the corresponding `fleet:read`/`tasks:execute` token scope. `AUTH_DEFAULT_ROLE` by itself grants no MCP tools, so an otherwise unclassified bearer cannot inherit the interactive UI's default viewer access. Explicit operators and administrators receive the tools their shared role policy permits. An agent token must carry `agent_id`, the corresponding `fleet:read` and/or `tasks:execute` scope, and an explicit entry in `MCP_AGENT_POLICIES_JSON`. Both its visible tools and target agents are the intersection of the token scopes and that policy. No policy means no agent-callable tools.
 
 For example, this lets `researcher` inspect and delegate to two agents, with bounded fan-out and depth:
 
@@ -141,7 +141,7 @@ For example, this lets `researcher` inspect and delegate to two agents, with bou
 MCP_AGENT_POLICIES_JSON={"researcher":{"tools":["list_agents","get_agent_status","submit_agent_task","get_agent_task","cancel_agent_task"],"targetAgentIds":["analyst","writer"],"maxDepth":3,"maxConcurrent":2}}
 ```
 
-Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. Delegation cycles, spoofed parent ownership, excessive depth, and per-caller concurrency overflow fail closed.
+Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. An agent's parent is derived from its current inbound delegation rather than accepted from tool input, so depth and cycle checks survive real agent-to-agent hops. Ambiguous lineage, excessive depth, cycles, and per-caller concurrency overflow fail closed.
 
 The control plane does not yet mint or exchange third-party agent tokens. The configured authorization server must issue an MCP-audience JWT with the required `agent_id` and scopes. That is an identity-provider provisioning concern, separate from the provider subscription credential isolated in each worker.
 

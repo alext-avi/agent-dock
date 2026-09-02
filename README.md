@@ -116,7 +116,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `POST` | `/api/v1/agents/:id/auth/complete` | Forward a provider-issued one-time browser authorization code to a waiting CLI |
 | `POST` | `/api/v1/agents/:id/auth/refresh` | Ask the adapter to refresh its managed session |
 | `POST` | `/api/v1/agents/:id/tasks` | Run `{ "prompt": "..." }` with saved durable instructions; returns canonical NDJSON |
-| `POST` | `/api/v1/agents/:id/tasks/cancel` | Cancel the active task |
+| `POST` | `/api/v1/agents/:id/tasks/cancel` | Safely cancel `{ "taskId": "..." }` only if it is still active and the worker advertises targeted cancellation |
 | `GET` | `/api/v1/agents/:id/workspace` | List worker artifacts (not their contents) |
 | `GET` | `/api/v1/agents/:id/usage` | Read normalized request history, totals, quota windows, and account activity |
 | `POST` | `/api/v1/agents/:id/usage/refresh` | Ask the adapter to refresh its available usage sources |
@@ -160,6 +160,8 @@ That floor defaults to thirty minutes and is per worker process. Each agent has 
 
 This prototype deliberately omits multi-tenancy, webhooks, automatic model fallback, usage-limit routing, TLS termination, remote secret management, egress controls, and container resource limits. Platform authentication now supports explicit trusted-local mode or OIDC with durable revocable sessions, centralized role policy, separately audience-bound API/MCP tokens, and a safe control-plane MCP delegation surface; organization membership synchronization, administrative session management, agent-token issuance/exchange, and multi-replica login transactions remain follow-ons. Scheduled jobs use a local SQLite database, but multi-replica leader election, retries beyond one attempt, webhook triggers, and an agent-facing MCP schedule surface remain follow-ons. The agent/runtime/MCP registry is still a single JSON file and the browser is vanilla JavaScript; migration of that registry behind the SQLite/Postgres-ready persistence boundary and a React/TypeScript frontend are separately tracked. Usage telemetry, agent configuration, schedules, delegated task results, and run history are durable; live event streams and test conversations are not.
 
+Delegation restart recovery currently assumes one control-plane process: startup fails abandoned in-flight rows rather than replaying them, but it has no replica lease or worker-orphan reconciliation yet ([#33](https://github.com/alext-avi/agent-dock/issues/33)). Durable delegation rows retain prompt and result text in local SQLite until an operator deletes the database; configurable retention, redaction, and content deletion are tracked in [#34](https://github.com/alext-avi/agent-dock/issues/34).
+
 The experimental Claude usage source is the one place a provider credential is read by Agent Dock code rather than only by the vendor CLI. That read happens inside the worker, against the worker's own private auth volume; the token is never returned, logged, persisted, or sent to the control plane or browser, and only normalized quota windows cross the wrapper. The response is reduced to the quota fields before anything is written to the telemetry volume, so the account and billing state it also carries is not retained at rest. It targets an endpoint Anthropic does not document and for which no third-party OAuth flow or scoped usage-only token exists, so it may break without notice and is disabled unless you set `CLAUDE_OAUTH_USAGE=1`. The account-profile endpoint, which returns names, email addresses, and organization identifiers, is deliberately not called.
 
 Connector secrets for MCP servers are provisioned under the `MCP_SECRET_` namespace and are the only variables an MCP definition can resolve, so a definition cannot name the runtime's own wrapper token, a provider home, or the Ollama endpoint. Three limits are worth stating plainly rather than leaving to inference. The namespace is forwarded to every managed runtime rather than only to agents that reference it, because provisioning precedes any MCP binding, so a connector secret is present in every agent container. The resolved value is readable by the agent there, so this makes a credential revocable in one place without being per-agent isolation or confidentiality against the harness. And there is no destination allowlist yet: a definition carrying a legitimately provisioned secret can still name any `https` host, so an operator authoring or approving a definition is the only thing deciding where that credential is sent.
@@ -172,7 +174,9 @@ Users and operators remain responsible for complying with applicable OpenAI term
 
 ## Development and test
 
-The application has no third-party JavaScript dependencies. Run the contract test with:
+The control-plane MCP transport uses the official Model Context Protocol SDK and Zod; versions and integrity
+metadata are locked in `package-lock.json`, and the production image installs runtime dependencies with
+`npm ci --omit=dev --ignore-scripts`. Run the contract test with:
 
 ```bash
 npm test

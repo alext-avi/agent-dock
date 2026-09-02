@@ -63,6 +63,14 @@ async function modernRpc(url, principal, method, params = {}, name = null) {
   return rpcBody(text);
 }
 
+function allows(principal, permission) {
+  if (principal.scopes?.includes('*') || principal.scopes?.includes(permission)) return true;
+  if (principal.roles?.includes('admin')) return true;
+  if (permission === 'fleet:read') return principal.roles?.some((role) => ['viewer', 'operator'].includes(role)) ?? false;
+  if (permission === 'tasks:execute') return principal.roles?.includes('operator') ?? false;
+  return false;
+}
+
 test('agent MCP policies reject unknown tools and invalid limits', () => {
   assert.throws(() => parseAgentMcpPolicies('{'), /valid JSON/);
   assert.throws(() => parseAgentMcpPolicies({ caller: { tools: ['configure_mcp'] } }), /unsupported tool/);
@@ -84,6 +92,8 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
       }
     },
     delegation,
+    allows,
+    allowsMcpPrincipal: () => true,
     listAgents: () => [
       { id: 'target', name: 'Target', description: '', adapter: 'codex-cli', runtime: { state: 'running', managed: true, dedicated: true } },
       { id: 'hidden', name: 'Hidden', description: '', adapter: 'claude-code', runtime: { state: 'running', managed: true, dedicated: true } }
@@ -112,6 +122,19 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
   assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
   const modernListed = await modernRpc(`${base}/mcp`, principal, 'tools/list');
   assert.deepEqual(modernListed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
+
+  const oversized = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18',
+      'x-test-principal': Buffer.from(JSON.stringify(principal)).toString('base64url')
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list', params: { padding: 'x'.repeat(140_000) } })
+  });
+  assert.equal(oversized.status, 413);
+  assert.match((await oversized.json()).error, /too large/);
 
   const visible = await rpc(`${base}/mcp`, principal, {
     jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_agents', arguments: {} }

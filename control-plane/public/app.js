@@ -179,6 +179,7 @@ const ui = {
 };
 
 let running = false;
+let activeWorkerTaskId = null;
 let authPolling = null;
 let refreshingAuth = false;
 let currentAgent = null;
@@ -1997,6 +1998,8 @@ function appendLine(kind, text) {
 }
 
 function appendEvent(event) {
+  if (event.type === 'task.started' && event.taskId) activeWorkerTaskId = event.taskId;
+  if (event.type === 'task.completed' && event.taskId === activeWorkerTaskId) activeWorkerTaskId = null;
   ui.rawOutput.textContent += `${JSON.stringify(event)}\n`;
   ui.rawOutput.scrollTop = ui.rawOutput.scrollHeight;
   if (event.type === 'usage.updated') renderUsage(event.data?.usage);
@@ -2048,6 +2051,7 @@ async function runTask() {
     ui.runMessage.textContent = error.message;
   } finally {
     running = false;
+    activeWorkerTaskId = null;
     ui.cancelButton.classList.add('hidden');
     await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders(), refreshMcp()]);
   }
@@ -2056,7 +2060,8 @@ async function runTask() {
 async function cancelRun() {
   ui.cancelButton.disabled = true;
   try {
-    await api(agentApi('tasks/cancel'), { method: 'POST', body: '{}' });
+    if (!activeWorkerTaskId) throw new Error('The worker has not reported a cancellable task yet');
+    await api(agentApi('tasks/cancel'), { method: 'POST', body: JSON.stringify({ taskId: activeWorkerTaskId }) });
     ui.runMessage.textContent = 'Cancelling…';
   } catch (error) {
     ui.runMessage.textContent = error.message;

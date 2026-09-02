@@ -227,7 +227,9 @@ export function createAuthService(options = {}) {
     }
     if (typeof apiAudience !== 'string' || !apiAudience) throw new Error('AUTH_API_AUDIENCE is required in oidc mode');
     if (typeof mcpAudience !== 'string' || !mcpAudience) throw new Error('AUTH_MCP_AUDIENCE is required in oidc mode');
+    secureEndpoint(apiAudience, 'AUTH_API_AUDIENCE');
     secureEndpoint(mcpAudience, 'AUTH_MCP_AUDIENCE');
+    if (apiAudience === mcpAudience) throw new Error('AUTH_API_AUDIENCE and AUTH_MCP_AUDIENCE must be different resources');
     if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
       throw new Error('AUTH_SESSION_SECRET must contain at least 32 bytes in oidc mode');
     }
@@ -268,19 +270,20 @@ export function createAuthService(options = {}) {
   let jwks = options.jwks ?? null;
   let jwksReadAt = jwks ? now() : 0;
 
-  function rolesFor(claims) {
+  function roleAssignmentFor(claims) {
     const subject = String(claims.sub ?? '');
     const email = claims.email_verified === true || claims.email_verified === 1
       ? String(claims.email ?? '').toLowerCase()
       : '';
-    if (adminSubjects.has(subject) || (email && adminEmails.has(email))) return ['admin'];
-    if (operatorSubjects.has(subject) || (email && operatorEmails.has(email))) return ['operator'];
-    return [defaultRole];
+    if (adminSubjects.has(subject) || (email && adminEmails.has(email))) return { roles: ['admin'], source: 'explicit' };
+    if (operatorSubjects.has(subject) || (email && operatorEmails.has(email))) return { roles: ['operator'], source: 'explicit' };
+    return { roles: [defaultRole], source: 'default' };
   }
 
   function makePrincipal(claims, authentication) {
     const subject = String(claims.sub ?? '');
     if (!subject) throw httpError('Identity token is missing sub', 401);
+    const assignment = claims.agent_id ? { roles: [], source: 'agent' } : roleAssignmentFor(claims);
     return {
       type: claims.agent_id ? 'agent' : 'user',
       id: claims.agent_id ? `agent:${claims.agent_id}` : `oidc:${base64url(`${issuer}|${subject}`)}`,
@@ -293,7 +296,8 @@ export function createAuthService(options = {}) {
       authentication,
       // Workload/agent identities are scope-only. They never inherit a human
       // role (including AUTH_DEFAULT_ROLE) from this control plane.
-      roles: claims.agent_id ? [] : rolesFor(claims),
+      roles: assignment.roles,
+      roleSource: assignment.source,
       scopes: scopesFromClaims(claims)
     };
   }
@@ -307,6 +311,7 @@ export function createAuthService(options = {}) {
     provider: 'Trusted local mode',
     authentication: 'trusted-local',
     roles: ['admin'],
+    roleSource: 'trusted-local',
     scopes: ['*']
   };
 
@@ -369,6 +374,9 @@ export function createAuthService(options = {}) {
     const seconds = Math.floor(now() / 1000);
     if (claims.iss !== issuer) throw httpError('JWT issuer is invalid', 401);
     if (!audienceMatches(claims.aud, audience)) throw httpError('JWT audience is invalid', 401);
+    if (authorizedParty === undefined && Array.isArray(claims.aud) && claims.aud.length !== 1) {
+      throw httpError('Resource JWT must identify exactly one audience', 401);
+    }
     if (authorizedParty !== undefined) {
       if (claims.azp !== undefined && claims.azp !== authorizedParty) throw httpError('JWT authorized party is invalid', 401);
       if (Array.isArray(claims.aud) && claims.aud.length > 1 && claims.azp !== authorizedParty) {
@@ -437,6 +445,7 @@ export function createAuthService(options = {}) {
       if (stored) sessionDb.prepare('DELETE FROM auth_sessions WHERE id = ?').run(value.sid);
       return null;
     }
+    const assignment = roleAssignmentFor({ sub: stored.subject, email: stored.email, email_verified: stored.email_verified });
     return {
       type: 'user',
       id: `oidc:${base64url(`${issuer}|${stored.subject}`)}`,
@@ -447,7 +456,8 @@ export function createAuthService(options = {}) {
       authentication: 'session',
       // Re-evaluate authorization policy for every request so removing a
       // subject from an allowlist takes effect without waiting for logout.
-      roles: rolesFor({ sub: stored.subject, email: stored.email, email_verified: stored.email_verified }),
+      roles: assignment.roles,
+      roleSource: assignment.source,
       scopes: []
     };
   }
@@ -521,7 +531,7 @@ export function createAuthService(options = {}) {
       principal: localPrincipal,
       authInfo: {
         token: match[1],
-        clientId: 'local-codex',
+        clientId: 'agent-dock-local-mcp',
         scopes: localPrincipal.scopes,
         resource: new URL(mcpAudience),
         extra: { principal: localPrincipal }
@@ -534,6 +544,14 @@ export function createAuthService(options = {}) {
     if (!principal) return false;
     if (principal.scopes?.includes('*') || principal.scopes?.includes(permission)) return true;
     return principal.roles?.some((role) => ROLE_PERMISSIONS[role]?.has('*') || ROLE_PERMISSIONS[role]?.has(permission)) ?? false;
+  }
+
+  function allowsMcpPrincipal(principal) {
+    if (!principal) return false;
+    if (principal.type === 'agent') return true;
+    if (principal.authentication === 'trusted-local' || principal.roleSource === 'trusted-local') return true;
+    if (principal.roleSource === 'explicit') return true;
+    return principal.scopes?.some((scope) => ['*', 'fleet:read', 'tasks:execute'].includes(scope)) ?? false;
   }
 
   function checkCsrf(req, principal) {
@@ -669,6 +687,7 @@ ${error ? `<p class="error">${html(error)}</p>` : ''}<a class="button" href="${h
     authenticateBearer,
     authenticateMcpBearer,
     allows,
+    allowsMcpPrincipal,
     checkCsrf,
     permissionForRequest,
     beginLogin,

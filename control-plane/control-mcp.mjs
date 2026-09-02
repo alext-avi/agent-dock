@@ -54,14 +54,6 @@ export function parseAgentMcpPolicies(value = '{}') {
   return policies;
 }
 
-function hasPermission(principal, permission) {
-  if (principal?.scopes?.includes('*') || principal?.scopes?.includes(permission)) return true;
-  if (principal?.roles?.includes('admin')) return true;
-  if (permission === 'fleet:read') return principal?.roles?.some((role) => ['viewer', 'operator'].includes(role)) ?? false;
-  if (permission === 'tasks:execute') return principal?.roles?.includes('operator') ?? false;
-  return false;
-}
-
 function callerFor(principal) {
   return {
     id: principal.id,
@@ -105,6 +97,34 @@ function guarded(callback) {
   };
 }
 
+async function readJsonBody(req, maxBytes) {
+  const rawLength = Array.isArray(req.headers['content-length'])
+    ? req.headers['content-length'][0]
+    : req.headers['content-length'];
+  const contentLength = rawLength === undefined ? null : Number(rawLength);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) throw httpError('MCP request body is too large', 413);
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += value.length;
+    if (total > maxBytes) throw httpError('MCP request body is too large', 413);
+    chunks.push(value);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw httpError('MCP request body must be valid JSON', 400); }
+}
+
+function httpResponse(res, status, error) {
+  const body = JSON.stringify({ error });
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store'
+  });
+  res.end(body);
+}
+
 function allowedTargets(principal, policy) {
   if (principal.type !== 'agent') return null;
   return policy?.targetAgentIds ?? new Set();
@@ -115,9 +135,10 @@ function targetAllowed(principal, policy, targetAgentId) {
   return targets === null || targets.has('*') || targets.has(targetAgentId);
 }
 
-function canExposeTool(principal, policy, tool) {
+function canExposeTool(principal, policy, tool, allows, allowsMcpPrincipal) {
   const permission = READ_TOOLS.has(tool) ? 'fleet:read' : 'tasks:execute';
-  if (!hasPermission(principal, permission)) return false;
+  if (!allowsMcpPrincipal(principal)) return false;
+  if (!allows(principal, permission)) return false;
   return principal.type !== 'agent' || policy?.tools.has(tool) === true;
 }
 
@@ -126,10 +147,18 @@ export function createControlMcp(options = {}) {
   const getAgentStatus = options.getAgentStatus ?? (async () => { throw httpError('Agent status is unavailable', 503); });
   const delegation = options.delegation;
   if (!delegation) throw new Error('Control-plane MCP requires a delegation service');
+  const allows = options.allows;
+  if (typeof allows !== 'function') throw new Error('Control-plane MCP requires the shared authorization policy');
+  const allowsMcpPrincipal = options.allowsMcpPrincipal;
+  if (typeof allowsMcpPrincipal !== 'function') throw new Error('Control-plane MCP requires the shared MCP principal policy');
   const policies = options.agentPolicies instanceof Map
     ? options.agentPolicies
     : parseAgentMcpPolicies(options.agentPolicies ?? process.env.MCP_AGENT_POLICIES_JSON ?? '{}');
   const publicOrigin = new URL(options.publicOrigin ?? 'http://127.0.0.1:3000');
+  const maxRequestBytes = Number(options.maxRequestBytes ?? 128 * 1024);
+  if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1024 || maxRequestBytes > 1024 * 1024) {
+    throw new Error('Control-plane MCP maxRequestBytes must be between 1024 and 1048576');
+  }
   const allowedHostnames = [...new Set([
     publicOrigin.hostname,
     ...(options.allowedHostnames ?? [])
@@ -143,7 +172,7 @@ export function createControlMcp(options = {}) {
     const caller = callerFor(principal);
     const server = new McpServer({ name: 'agent-dock-control-plane', version: '0.1.0' });
 
-    if (canExposeTool(principal, policy, 'list_agents')) {
+    if (canExposeTool(principal, policy, 'list_agents', allows, allowsMcpPrincipal)) {
       server.registerTool('list_agents', {
         title: 'List agents',
         description: 'List agents visible as delegation targets. Does not expose credentials, MCP configuration, runtime controls, or storage.',
@@ -155,7 +184,7 @@ export function createControlMcp(options = {}) {
       }));
     }
 
-    if (canExposeTool(principal, policy, 'get_agent_status')) {
+    if (canExposeTool(principal, policy, 'get_agent_status', allows, allowsMcpPrincipal)) {
       server.registerTool('get_agent_status', {
         title: 'Get agent status',
         description: 'Read the current operational status of an allowed agent.',
@@ -167,14 +196,13 @@ export function createControlMcp(options = {}) {
       }));
     }
 
-    if (canExposeTool(principal, policy, 'submit_agent_task')) {
+    if (canExposeTool(principal, policy, 'submit_agent_task', allows, allowsMcpPrincipal)) {
       server.registerTool('submit_agent_task', {
         title: 'Submit agent task',
-        description: 'Queue autonomous work on an allowed agent and return a durable task handle immediately.',
+        description: 'Dispatch autonomous work to an allowed agent and return a durable task handle immediately. A busy worker can finish with skipped_busy.',
         inputSchema: z.object({
           targetAgentId: z.string().min(1).max(200),
-          prompt: z.string().min(1).max(50_000),
-          parentTaskId: z.string().min(1).max(200).optional()
+          prompt: z.string().min(1).max(50_000)
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false }
       }, guarded(async (input) => {
@@ -183,7 +211,7 @@ export function createControlMcp(options = {}) {
       }));
     }
 
-    if (canExposeTool(principal, policy, 'get_agent_task')) {
+    if (canExposeTool(principal, policy, 'get_agent_task', allows, allowsMcpPrincipal)) {
       server.registerTool('get_agent_task', {
         title: 'Get delegated task',
         description: 'Read a delegated task result by its durable handle.',
@@ -192,7 +220,7 @@ export function createControlMcp(options = {}) {
       }, guarded(async ({ taskId }) => toolResult({ task: delegation.get(taskId, caller) })));
     }
 
-    if (canExposeTool(principal, policy, 'cancel_agent_task')) {
+    if (canExposeTool(principal, policy, 'cancel_agent_task', allows, allowsMcpPrincipal)) {
       server.registerTool('cancel_agent_task', {
         title: 'Cancel delegated task',
         description: 'Request cancellation of a delegated task owned by the caller.',
@@ -215,7 +243,12 @@ export function createControlMcp(options = {}) {
     validate: (req, res) => validateHost(req, res) && validateOrigin(req, res),
     handle: async (req, res, { validated = false } = {}) => {
       if (!validated && (!validateHost(req, res) || !validateOrigin(req, res))) return;
-      await nodeHandler(req, res);
+      let parsedBody;
+      if (req.method === 'POST') {
+        try { parsedBody = await readJsonBody(req, maxRequestBytes); }
+        catch (error) { return httpResponse(res, error.status ?? 400, error.message); }
+      }
+      await nodeHandler(req, res, parsedBody);
     },
     close: () => handler.close()
   };

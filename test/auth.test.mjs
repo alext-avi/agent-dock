@@ -176,7 +176,7 @@ test('trusted-local MCP requires a separate strong bearer token', async () => {
   );
   const authenticated = await auth.authenticateMcpBearer({ headers: { authorization: `Bearer ${token}` } });
   assert.equal(authenticated.principal.id, 'local:operator');
-  assert.equal(authenticated.authInfo.clientId, 'local-codex');
+  assert.equal(authenticated.authInfo.clientId, 'agent-dock-local-mcp');
 });
 
 test('trusted-local control-plane MCP is unavailable without its token and exposes tools with it', async (t) => {
@@ -261,6 +261,24 @@ test('trusted-local mode refuses non-loopback origins and externally published b
     trustedLocalBind: '0.0.0.0'
   });
   oidc.close();
+});
+
+test('OIDC keeps API and MCP resource identifiers distinct and transport-safe', () => {
+  const identity = { issuer: 'https://issuer.example.test/' };
+  assert.throws(
+    () => createAuthService({
+      ...oidcOptions(identity),
+      mcpAudience: 'https://dock.example.test/api'
+    }),
+    /must be different resources/
+  );
+  assert.throws(
+    () => createAuthService({
+      ...oidcOptions(identity),
+      apiAudience: 'http://dock.example.test/api'
+    }),
+    /AUTH_API_AUDIENCE must use HTTPS/
+  );
 });
 
 test('return targets cannot escape the control-plane origin', () => {
@@ -449,6 +467,7 @@ test('OIDC rejects forged, stale, premature, misissued, and key-confused bearer 
   const invalid = [
     ['wrong issuer', identity.issueAccessToken({ iss: 'https://evil.example.test/' })],
     ['wrong audience', identity.issueAccessToken({ aud: 'https://wrong.example.test/api' })],
+    ['multiple audiences', identity.issueAccessToken({ aud: ['https://dock.example.test/api', 'https://dock.example.test/mcp'], azp: 'agent-dock-test-client' })],
     ['expired', identity.issueAccessToken({ exp: now - 60 })],
     ['missing expiry', identity.issueAccessToken({ exp: null })],
     ['not active', identity.issueAccessToken({ nbf: now + 60 })],
@@ -624,9 +643,32 @@ test('audience-bound bearer tokens obey the same role and permission policy', as
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} })
   });
+  assert.equal(response.status, 403, 'a default role is not positive MCP authorization');
+  assert.match((await response.json()).error, /not explicitly authorized/);
+
+  const mcpOperator = identity.issueAccessToken({
+    aud: 'https://dock.example.test/mcp',
+    sub: 'operator-user'
+  });
+  response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${mcpOperator}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'tools/list', params: {} })
+  });
   assert.equal(response.status, 200);
-  const mcpText = await response.text();
-  const mcpData = mcpText.split('\n').find((line) => line.startsWith('data: '));
-  const mcpPayload = JSON.parse(mcpData ? mcpData.slice(6) : mcpText);
-  assert.deepEqual(mcpPayload.result.tools.map((tool) => tool.name).sort(), ['get_agent_status', 'list_agents']);
+  const operatorText = await response.text();
+  const operatorData = operatorText.split('\n').find((line) => line.startsWith('data: '));
+  const operatorPayload = JSON.parse(operatorData ? operatorData.slice(6) : operatorText);
+  assert.deepEqual(operatorPayload.result.tools.map((tool) => tool.name).sort(), [
+    'cancel_agent_task',
+    'get_agent_status',
+    'get_agent_task',
+    'list_agents',
+    'submit_agent_task'
+  ]);
 });

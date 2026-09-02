@@ -525,6 +525,21 @@ export function createControlPlane(options = {}) {
     res.end();
   }
 
+  async function cancelKnownWorkerTask(agent, taskId) {
+    if (typeof taskId !== 'string' || !taskId.trim()) {
+      throw Object.assign(new Error('taskId is required for safe targeted cancellation'), { status: 400 });
+    }
+    taskId = taskId.trim();
+    const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
+    if (status.capabilities?.tasks?.targetedCancellation !== true) {
+      throw Object.assign(new Error('Worker does not advertise safe targeted cancellation; refresh its runtime before retrying'), { status: 409 });
+    }
+    if (status.task?.active?.id !== taskId) {
+      throw Object.assign(new Error('The requested task is no longer the worker active task'), { status: 409 });
+    }
+    return workerRequest(agent, 'POST', '/v1/tasks/cancel', { taskId }, 15_000);
+  }
+
   async function dispatchAgentTask({ agentId, prompt, timeoutMs, onTaskId = null }) {
     const agent = requireAgent(agentId);
     const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
@@ -532,6 +547,7 @@ export function createControlPlane(options = {}) {
       return { status: 'skipped_busy', error: `Agent is busy with task ${status.task.active.id ?? 'unknown'}` };
     }
 
+    let taskId = null;
     try {
       const { response } = await workerFetch(agent, '/v1/tasks', {
         method: 'POST',
@@ -555,7 +571,6 @@ export function createControlPlane(options = {}) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let taskId = null;
       let usage = null;
       let completion = null;
       let outputText = '';
@@ -603,8 +618,8 @@ export function createControlPlane(options = {}) {
         error: succeeded ? null : (lastError ?? `Worker task ended with status ${completion.status ?? 'unknown'}`)
       };
     } catch (error) {
-      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
-        await workerRequest(agent, 'POST', '/v1/tasks/cancel', {}, 15_000).catch(() => {});
+      if ((error?.name === 'TimeoutError' || error?.name === 'AbortError') && taskId) {
+        await cancelKnownWorkerTask(agent, taskId).catch(() => {});
       }
       throw error;
     }
@@ -633,7 +648,7 @@ export function createControlPlane(options = {}) {
     cancel: options.delegationCancel ?? (async (task) => {
       if (!task.workerTaskId) throw Object.assign(new Error('Worker has not acknowledged this task yet; retry cancellation shortly'), { status: 409 });
       const agent = requireAgent(task.targetAgentId);
-      await workerRequest(agent, 'POST', '/v1/tasks/cancel', { taskId: task.workerTaskId }, 15_000);
+      await cancelKnownWorkerTask(agent, task.workerTaskId);
     })
   });
 
@@ -652,6 +667,8 @@ export function createControlPlane(options = {}) {
       .split(',').map((value) => value.trim()).filter(Boolean),
     agentPolicies: options.mcpAgentPolicies ?? process.env.MCP_AGENT_POLICIES_JSON ?? '{}',
     delegation,
+    allows: auth.allows,
+    allowsMcpPrincipal: auth.allowsMcpPrincipal,
     listAgents: () => [...agents.values()].filter((agent) => !deletingAgents.has(agent.id)).map(agentPublic),
     getAgentStatus: async (agentId) => workerRequest(requireAgent(agentId), 'GET', '/v1/status', undefined, 15_000),
     onerror: (error) => console.error('[control-plane:mcp]', error)
@@ -781,6 +798,9 @@ export function createControlPlane(options = {}) {
       const dependentSchedules = scheduler.list({ agentId: id });
       if (dependentSchedules.length) {
         throw Object.assign(new Error(`Delete or reassign ${dependentSchedules.length} scheduled job${dependentSchedules.length === 1 ? '' : 's'} before deleting this agent`), { status: 409 });
+      }
+      if (delegation.hasActiveForAgent(id)) {
+        throw Object.assign(new Error('Wait for delegated work assigned to this agent to finish before deleting it'), { status: 409 });
       }
       deletingAgents.add(id);
       try {
@@ -964,7 +984,10 @@ export function createControlPlane(options = {}) {
     if (req.method === 'GET' && operation === 'workspace') return proxyJson(req, res, agent, '/v1/workspace');
     if (req.method === 'GET' && operation === 'usage') return proxyJson(req, res, agent, '/v1/usage');
     if (req.method === 'POST' && operation === 'usage/refresh') return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);
-    if (req.method === 'POST' && operation === 'tasks/cancel') return proxyJson(req, res, agent, '/v1/tasks/cancel');
+    if (req.method === 'POST' && operation === 'tasks/cancel') {
+      const body = await readJson(req);
+      return json(res, 202, await cancelKnownWorkerTask(agent, body.taskId));
+    }
     if (req.method === 'POST' && operation === 'tasks') return proxyTask(req, res, agent);
     if (req.method === 'POST' && operation === 'runtime/refresh') return refreshAgentRuntime(req, res, agent);
     return false;
@@ -1045,6 +1068,9 @@ export function createControlPlane(options = {}) {
       if (error.status === 401) return mcpAuthenticationRequired(res, error.message);
       throw error;
     }
+    if (!auth.allowsMcpPrincipal(authenticated.principal)) {
+      return authorizationDenied(res, null, 'MCP bearer is not explicitly authorized');
+    }
     req.auth = authenticated.authInfo;
     await controlMcp.handle(req, res, { validated: true });
     return true;
@@ -1061,6 +1087,15 @@ export function createControlPlane(options = {}) {
       database: status.database,
       lastTickAt: status.lastTickAt,
       tickFailed: Boolean(status.lastTickError),
+      executionFailed: Boolean(status.lastExecutionError),
+      activeExecutions: status.activeExecutions
+    };
+  }
+
+  function publicDelegationHealth() {
+    const status = delegation.status();
+    return {
+      healthy: status.healthy,
       executionFailed: Boolean(status.lastExecutionError),
       activeExecutions: status.activeExecutions
     };
@@ -1110,12 +1145,12 @@ export function createControlPlane(options = {}) {
       const agent = defaultAgent();
       if (req.method === 'GET' && ['/api/v1/health', '/api/health'].includes(url.pathname)) {
         const runtime = agent?.runtimeId ? runtimes.get(agent.runtimeId) : null;
-        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured', scheduler: publicSchedulerHealth() });
+        if (!runtime?.workerUrl) return json(res, 200, { ok: true, worker: 'unconfigured', scheduler: publicSchedulerHealth(), delegation: publicDelegationHealth() });
         try {
           const upstream = await fetch(`${runtime.workerUrl}/v1/health`, { signal: AbortSignal.timeout(2000) });
-          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy', scheduler: publicSchedulerHealth() });
+          return json(res, 200, { ok: true, worker: upstream.ok ? 'online' : 'unhealthy', scheduler: publicSchedulerHealth(), delegation: publicDelegationHealth() });
         } catch {
-          return json(res, 200, { ok: true, worker: 'offline', scheduler: publicSchedulerHealth() });
+          return json(res, 200, { ok: true, worker: 'offline', scheduler: publicSchedulerHealth(), delegation: publicDelegationHealth() });
         }
       }
       if (!agent && url.pathname.startsWith('/api/')) return json(res, 404, { error: 'No agents configured' });
@@ -1127,7 +1162,10 @@ export function createControlPlane(options = {}) {
       if (req.method === 'GET' && ['/api/v1/workspace', '/api/workspace'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/workspace');
       if (req.method === 'GET' && ['/api/v1/usage', '/api/usage'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/usage');
       if (req.method === 'POST' && ['/api/v1/usage/refresh', '/api/usage/refresh'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);
-      if (req.method === 'POST' && ['/api/v1/tasks/cancel', '/api/run/cancel'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/tasks/cancel');
+      if (req.method === 'POST' && ['/api/v1/tasks/cancel', '/api/run/cancel'].includes(url.pathname)) {
+        const body = await readJson(req);
+        return json(res, 202, await cancelKnownWorkerTask(agent, body.taskId));
+      }
       if (req.method === 'POST' && ['/api/v1/tasks', '/api/run'].includes(url.pathname)) return proxyTask(req, res, agent);
       if (req.method === 'GET') return serveStatic(res, url.pathname);
       return json(res, 404, { error: 'Not found' });

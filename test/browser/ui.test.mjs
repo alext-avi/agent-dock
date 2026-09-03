@@ -950,3 +950,90 @@ test('switching harness starts a fresh exchange rather than a correction', async
     'an ask after switching harness was sent as a bare correction'
   );
 });
+
+test('an advisory line is not painted as a failure, and a real failure is', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness probing an endpoint reports a 401 as an error and then carries on
+  // to succeed. Painting that red made a working run look broken.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'noisy' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'error', taskId: 'noisy', data: { source: 'provider', message: 'probe returned 401 Unauthorized' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'noisy', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"noisy-but-fine","transport":"http","url":"https://noisy.example.test/mcp","headers":{"X-Api-Key":"sk-should-be-stripped"},"timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'noisy', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector whose probe returns 401');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'noisy-but-fine');
+
+  const classes = await page.locator('#workshop-log p').evaluateAll((nodes) => nodes.map((node) => node.className));
+  // The probe error and the stripped-header warning are advisory; the run worked.
+  assert.ok(classes.some((cls) => cls.includes('warn')), 'an advisory line was not marked as advisory');
+  assert.ok(!classes.some((cls) => cls.includes('failed')), 'a successful run painted a line as a failure');
+});
+
+test('a variable in the arguments is named, and says it is not substituted', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${COMPANY_TOKEN}');
+
+  // Arguments reach the server verbatim; only the environment mapping is
+  // resolved. Leaving that implicit is what made the relationship unclear.
+  const note = page.locator('#mcp-args-variables');
+  await note.waitFor({ state: 'visible' });
+  const text = await note.textContent();
+  assert.match(text, /COMPANY_TOKEN/);
+  assert.match(text, /does not substitute/i);
+
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs');
+  await note.waitFor({ state: 'hidden' });
+});
+
+test('a connector secret is chosen from names already in use, or added by name', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // Define one connector that references a secret, so there is something to
+  // choose the second time rather than a name to remember and retype.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'first-stdio');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-command', 'node');
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs');
+  await page.fill('#mcp-secret-target', 'API_TOKEN');
+  await page.selectOption('#mcp-secret-source-choice', '__new');
+  await page.fill('#mcp-secret-source', 'COMPANY_API_TOKEN');
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#registry-list .mcp-row', { hasText: 'first-stdio' }).waitFor();
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#mcp-transport', 'stdio');
+  const options = await page.locator('#mcp-secret-source-choice option').allTextContents();
+  assert.ok(options.includes('COMPANY_API_TOKEN'), `the known secret was not offered: ${options.join(', ')}`);
+  assert.ok(options.includes('Add a new name…'));
+
+  // The free-text field only appears when adding a name.
+  assert.equal(await page.locator('#mcp-secret-source').isVisible(), false);
+  await page.selectOption('#mcp-secret-source-choice', '__new');
+  await page.locator('#mcp-secret-source').waitFor({ state: 'visible' });
+});

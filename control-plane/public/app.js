@@ -145,6 +145,8 @@ const ui = {
   mcpArgs: $('#mcp-args'),
   mcpSecretTarget: $('#mcp-secret-target'),
   mcpSecretSource: $('#mcp-secret-source'),
+  mcpSecretSourceChoice: $('#mcp-secret-source-choice'),
+  mcpArgsVariables: $('#mcp-args-variables'),
   mcpTimeout: $('#mcp-timeout'),
   mcpFormMessage: $('#mcp-form-message'),
   saveMcp: $('#save-mcp'),
@@ -1372,6 +1374,65 @@ async function refreshMcp() {
   }
 }
 
+const ARGUMENT_VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
+
+// Arguments are passed to the server verbatim. Whether ${NAME} in one is ever
+// expanded is the harness's business, not ours — so name what was found and be
+// explicit that the value comes from the mapping below, not from the argument.
+function syncArgumentVariables() {
+  const found = [...new Set([...ui.mcpArgs.value.matchAll(ARGUMENT_VARIABLE)].map((match) => match[1]))];
+  ui.mcpArgsVariables.classList.toggle('hidden', !found.length);
+  if (!found.length) return;
+  ui.mcpArgsVariables.replaceChildren(document.createTextNode('Looks like a variable: '));
+  found.forEach((name, index) => {
+    const code = document.createElement('code');
+    code.textContent = name;
+    ui.mcpArgsVariables.append(code);
+    if (index < found.length - 1) ui.mcpArgsVariables.append(document.createTextNode(' '));
+  });
+  ui.mcpArgsVariables.append(document.createTextNode(
+    found.length === 1
+      ? '. Agent Dock does not substitute this into an argument — map it below so the server reads it from its environment.'
+      : '. Agent Dock does not substitute these into arguments — map them below so the server reads them from its environment.'
+  ));
+}
+
+// Secret names the operator has already used somewhere, so one can be chosen
+// instead of remembered. "Add a new name…" reveals the free-text field.
+function syncSecretSourceChoices(selected = '') {
+  const known = new Set();
+  for (const server of [...registryServers, ...mcpDefinitions]) {
+    for (const reference of Object.values(server.secretEnvironment ?? {})) {
+      const name = typeof reference === 'string' ? reference : reference?.sourceEnv;
+      if (name) known.add(name);
+    }
+  }
+  if (selected) known.add(selected);
+  ui.mcpSecretSourceChoice.replaceChildren();
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = 'None';
+  ui.mcpSecretSourceChoice.append(none);
+  for (const name of [...known].sort()) {
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    ui.mcpSecretSourceChoice.append(option);
+  }
+  const add = document.createElement('option');
+  add.value = '__new';
+  add.textContent = 'Add a new name…';
+  ui.mcpSecretSourceChoice.append(add);
+  ui.mcpSecretSourceChoice.value = selected && known.has(selected) ? selected : '';
+  ui.mcpSecretSource.classList.add('hidden');
+  ui.mcpSecretSource.value = '';
+}
+
+function chosenSecretSource() {
+  const choice = ui.mcpSecretSourceChoice.value;
+  return choice === '__new' ? ui.mcpSecretSource.value.trim() : choice;
+}
+
 function syncMcpTransportFields() {
   const http = ui.mcpTransport.value === 'http';
   ui.mcpHttpFields.classList.toggle('hidden', !http);
@@ -1395,7 +1456,8 @@ function openMcpDialog(server = null) {
   syncCredentialOptions(server?.credentialId ?? '');
   const environment = Object.entries(server?.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
-  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+  syncSecretSourceChoices(environment?.[1]?.sourceEnv ?? '');
+  syncArgumentVariables();
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
   ui.deleteMcpDefinition.classList.toggle('hidden', !server || !currentAgent);
@@ -1407,7 +1469,7 @@ function openMcpDialog(server = null) {
 
 function mcpFormPayload() {
   const transport = ui.mcpTransport.value;
-  const sourceEnv = ui.mcpSecretSource.value.trim();
+  const sourceEnv = chosenSecretSource();
   const targetEnv = ui.mcpSecretTarget.value.trim();
   if ((sourceEnv && !targetEnv) || (!sourceEnv && targetEnv)) throw new Error('Both stdio secret variable fields are required when either is set.');
   const bearer = ui.mcpBearerEnv.value.trim();
@@ -1545,7 +1607,10 @@ function applyProposalToForm(proposal) {
   ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
   const environment = Object.entries(proposal.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
-  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+  syncSecretSourceChoices(environment?.[1]?.sourceEnv ?? '');
+  // A proposal often puts a variable in the arguments; point at it rather than
+  // leaving the operator to work out how it relates to the mapping fields.
+  syncArgumentVariables();
 }
 
 async function runWorkshop() {
@@ -1593,7 +1658,7 @@ async function runWorkshop() {
       if (!mine()) return;
       if (/continue a conversation/i.test(failure.error ?? '')) {
         workshopContinuity = false;
-        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'failed', token);
+        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'warn', token);
         response = await workshopDispatch(agentId, buildMcpWorkshopPrompt(objective), null, abort);
       }
     }
@@ -1625,7 +1690,10 @@ async function runWorkshop() {
         if (event.type === 'activity.started' && event.data?.name) {
           ui.workshopStatus.textContent = `Working — ${event.data.name}`;
         }
-        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'failed', token);
+        // Advisory while the run continues: a harness probing an endpoint reports
+        // a 401 or a 404 as an error and then carries on. Only the outcome decides
+        // whether this run failed.
+        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'warn', token);
       }
       if (done) {
         if (!buffer.trim()) break;
@@ -1637,7 +1705,7 @@ async function runWorkshop() {
             workshopNote('harness', event.data.text, '', token);
           }
           if (event.type === 'error' && event.data?.message) {
-            workshopNote('harness', event.data.message, 'failed', token);
+            workshopNote('harness', event.data.message, 'warn', token);
           }
         } catch { /* a partial final line is not an event */ }
         break;
@@ -1652,7 +1720,7 @@ async function runWorkshop() {
     requireSuccessfulWorkshopRun(runState);
     const { proposal, warnings } = extractMcpWorkshopProposal(output);
     applyProposalToForm(proposal);
-    for (const warning of warnings) workshopNote('harness', warning, 'failed', token);
+    for (const warning of warnings) workshopNote('harness', warning, 'warn', token);
 
     workshopTurns += 1;
 
@@ -1711,7 +1779,7 @@ async function checkProposal(agentId, proposal, token, signal) {
     const warnings = result.mcp?.validation?.warnings?.length ?? 0;
     return `Filled in below. Valid for this harness${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
   } catch (error) {
-    workshopNote('harness', error.message, 'failed', token);
+    workshopNote('harness', error.message, 'warn', token);
     // Only a 400 is the adapter judging the shape. A duplicate name, an unknown
     // agent, or an unreachable worker are the control plane's own answers and
     // never reach the harness at all, so they must not be reported as its verdict.
@@ -2756,6 +2824,12 @@ async function syncCredentialOptions(selectedId = '') {
   }
 }
 
+ui.mcpArgs.addEventListener('input', syncArgumentVariables);
+ui.mcpSecretSourceChoice.addEventListener('change', () => {
+  const adding = ui.mcpSecretSourceChoice.value === '__new';
+  ui.mcpSecretSource.classList.toggle('hidden', !adding);
+  if (adding) ui.mcpSecretSource.focus();
+});
 ui.workshopRun?.addEventListener('click', runWorkshop);
 ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());
 ui.newCredential.addEventListener('click', () => openCredentialDialog());

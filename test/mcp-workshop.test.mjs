@@ -146,6 +146,27 @@ test('quick stdio edits preserve cwd, literals, and additional secret mappings',
   });
 });
 
+// A harness investigating a service reports a 401 or a 404 as an error and then
+// carries on. Refusing on any error at all rejected perfectly good runs, so the
+// wrapper's terminal status is the authority — it implies a zero exit — and the
+// error count is kept only so the caller can say the run was not clean.
+test('an error the harness recovered from does not refuse a successful run', () => {
+  const state = createWorkshopRunState();
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(state, { type: 'error', taskId: 'task-1', data: { message: 'probe returned 401' } });
+  observeWorkshopRunEvent(state, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
+  assert.equal(state.errors, 1);
+  assert.doesNotThrow(() => requireSuccessfulWorkshopRun(state));
+});
+
+test('a stream describing two different tasks is refused', () => {
+  const state = createWorkshopRunState();
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-2' });
+  observeWorkshopRunEvent(state, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
+  assert.throws(() => requireSuccessfulWorkshopRun(state), /more than one task/);
+});
+
 test('workshop accepts proposals only from a matching successful task', () => {
   const success = createWorkshopRunState();
   observeWorkshopRunEvent(success, { type: 'task.started', taskId: 'task-1' });
@@ -164,11 +185,8 @@ test('workshop accepts proposals only from a matching successful task', () => {
   observeWorkshopRunEvent(mismatched, { type: 'task.completed', taskId: 'task-2', data: { status: 'succeeded' } });
   assert.throws(() => requireSuccessfulWorkshopRun(mismatched), /matching terminal event/);
 
-  const errored = createWorkshopRunState();
-  observeWorkshopRunEvent(errored, { type: 'task.started', taskId: 'task-1' });
-  observeWorkshopRunEvent(errored, { type: 'error', taskId: 'task-1', data: { message: 'provider error' } });
-  observeWorkshopRunEvent(errored, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
-  assert.throws(() => requireSuccessfulWorkshopRun(errored), /not accepted/);
+  // An error the harness recovered from is covered above: it no longer refuses a
+  // run the wrapper reported as succeeded, because that rejected good work.
 });
 
 // The prompt now tells a harness that credentials are not its business, because

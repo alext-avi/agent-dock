@@ -443,9 +443,16 @@
         <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
           <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
+          <p id="mcp-args-variables" class="field-note hidden"></p>
           <div class="form-grid">
-            <label class="field">Secret target variable <span>optional</span><input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="API_TOKEN"></label>
-            <label class="field">Connector secret name <span>optional</span><input id="mcp-secret-source" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN"></label>
+            <label class="field">Secret target variable <span>the name the server reads</span><input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="API_TOKEN"></label>
+            <label class="field" for="mcp-secret-source-choice">Connector secret <span>where the value comes from</span>
+              <select id="mcp-secret-source-choice">
+                <option value="">None</option>
+                <option value="__new">Add a new name…</option>
+              </select>
+              <input id="mcp-secret-source" class="hidden" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN" aria-label="New connector secret name">
+            </label>
           </div>
         </section>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>

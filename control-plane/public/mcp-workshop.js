@@ -155,16 +155,18 @@ export function mergeMcpQuickEdit(base = {}, quick = {}) {
 }
 
 export function createWorkshopRunState() {
-  return { taskId: null, terminalTaskId: null, terminalStatus: null, sawError: false };
+  return { taskId: null, terminalTaskId: null, terminalStatus: null, errors: 0, mixedTasks: false };
 }
 
 export function observeWorkshopRunEvent(state, event) {
   if (!state || !event || typeof event !== 'object') return state;
   if (event.type === 'task.started') {
-    if (state.taskId && event.taskId !== state.taskId) state.sawError = true;
+    if (state.taskId && event.taskId !== state.taskId) state.mixedTasks = true;
     else state.taskId = event.taskId ?? null;
   }
-  if (event.type === 'error') state.sawError = true;
+  // Recorded so the caller can say the run was not clean, but not on its own a
+  // reason to refuse: the terminal status decides that.
+  if (event.type === 'error') state.errors += 1;
   if (event.type === 'task.completed') {
     state.terminalTaskId = event.taskId ?? null;
     state.terminalStatus = event.data?.status ?? null;
@@ -175,13 +177,10 @@ export function observeWorkshopRunEvent(state, event) {
 export function requireSuccessfulWorkshopRun(state) {
   if (!state?.taskId) throw new Error('The harness stream did not identify its task. No proposal was accepted.');
   if (state.terminalTaskId !== state.taskId) throw new Error('The harness stream ended without a matching terminal event. No proposal was accepted.');
-  if (state.sawError) {
-    throw new Error('The harness reported an error during the run; its proposal was not accepted.');
+  if (state.mixedTasks) {
+    throw new Error('The harness stream described more than one task. No proposal was accepted.');
   }
   if (state.terminalStatus !== 'succeeded') {
-    // Saying "the harness task succeeded; its proposal was not accepted" is a
-    // contradiction, and that is what this produced when an error drove the
-    // refusal rather than the terminal status.
     throw new Error(`The harness task ${state.terminalStatus ?? 'ended without reporting a result'}; its proposal was not accepted.`);
   }
 }

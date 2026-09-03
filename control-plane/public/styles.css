@@ -473,3 +473,8 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
 .workshop-log .speaker { display: inline-block; min-width: 52px; margin-right: 8px; color: var(--faint); font: 9px ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.06em; vertical-align: 1px; }
 .workshop-log p.failed .speaker { color: #d98a8a; }
 .workshop-log p.failed { color: #d98a8a; }
+
+.field-note { margin: -4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.field-note code { padding: 1px 5px; border: 1px solid #6a5626; background: #1b1608; color: #e6c877; font: 10px ui-monospace, monospace; }
+.workshop-log p.warn { color: #d8c48a; }
+.workshop-log p.warn .speaker { color: #d8c48a; }

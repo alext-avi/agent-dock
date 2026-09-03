@@ -478,3 +478,17 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
 .field-note code { padding: 1px 5px; border: 1px solid #6a5626; background: #1b1608; color: #e6c877; font: 10px ui-monospace, monospace; }
 .workshop-log p.warn { color: #d8c48a; }
 .workshop-log p.warn .speaker { color: #d8c48a; }
+
+.auth-block { margin: 4px 0 0; padding: 12px 14px 13px; border: 1px solid var(--line); background: #0d110f; }
+.auth-block legend { padding: 0 6px; color: var(--faint); font: 9px ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.08em; }
+.auth-block .field { margin: 0; }
+.mapping-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mapping-row > span { color: var(--muted); font-size: 12px; }
+.mapping-row input, .mapping-row select { width: auto; min-width: 148px; }
+.field-effect { margin: 9px 0 0; color: var(--faint); font-size: 11px; line-height: 1.6; }
+.field-effect code { padding: 1px 5px; border: 1px solid var(--line); background: #0a0d0b; color: var(--aqua); font: 10px ui-monospace, monospace; }
+.field-effect.unset { color: var(--muted); }
+#mcp-bearer-details { margin-top: 11px; }
+#mcp-bearer-details summary { color: var(--muted); font-size: 11px; cursor: pointer; }
+#mcp-bearer-details[open] summary { margin-bottom: 9px; }
+.field-note button { margin-left: 6px; }

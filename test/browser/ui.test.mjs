@@ -728,6 +728,15 @@ test('the workshop fills the connector form in place and keeps its conversation 
   // and only once the harness list has loaded, so it never appears empty.
   await page.locator('#workshop').waitFor({ state: 'visible' });
 
+  // Capture the conversation this run uses, so the assertion does not depend on
+  // what any other test in this shared control plane has already created.
+  const conversationIds = new Set();
+  await page.route('**/api/v1/agents/*/tasks', async (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    if (body.conversationId) conversationIds.add(body.conversationId);
+    await route.continue();
+  });
+
   // Pick the harness explicitly rather than relying on which one sorts first.
   await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
   await page.fill('#workshop-objective', 'a documentation connector');
@@ -746,14 +755,16 @@ test('the workshop fills the connector form in place and keeps its conversation 
   await page.click('#run-workshop');
   await page.waitForFunction(() => document.querySelectorAll('#workshop-log p').length >= 4);
 
+  assert.equal(conversationIds.size, 1, 'a correction started a new conversation instead of continuing one');
+  const [conversationId] = [...conversationIds];
   const agentId = app.agents['claude-code'].id;
   const conversations = await page.evaluate(async (id) => {
     const response = await fetch(`/api/v1/agents/${id}/conversations`);
     return response.json();
   }, agentId);
-  const workshopConversations = (conversations.conversations ?? []).filter((item) => item.id.startsWith('workshop-'));
-  assert.equal(workshopConversations.length, 1, 'a correction started a new conversation instead of continuing one');
-  assert.equal(workshopConversations[0].turns, 2);
+  const mine = (conversations.conversations ?? []).find((item) => item.id === conversationId);
+  assert.ok(mine, 'the worker did not record the conversation this run used');
+  assert.equal(mine.turns, 2);
 });
 
 test('editing an existing connector does not offer to ask a harness', async (t) => {
@@ -1000,7 +1011,13 @@ test('a variable in the arguments is named, and says it is not substituted', asy
   await note.waitFor({ state: 'visible' });
   const text = await note.textContent();
   assert.match(text, /COMPANY_TOKEN/);
-  assert.match(text, /does not substitute/i);
+  assert.match(text, /passed to the server as written/i);
+
+  // And it offers to close the loop, which is the part that was invisible: the
+  // argument variable and the mapped environment name are the same idea.
+  await note.locator('button', { hasText: 'use COMPANY_TOKEN' }).click();
+  assert.equal(await page.inputValue('#mcp-secret-target'), 'COMPANY_TOKEN');
+  assert.match(await note.textContent(), /the variable mapped below/i);
 
   await page.fill('#mcp-args', '/opt/mcp/server.mjs');
   await note.waitFor({ state: 'hidden' });

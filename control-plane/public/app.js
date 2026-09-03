@@ -147,6 +147,9 @@ const ui = {
   mcpSecretSource: $('#mcp-secret-source'),
   mcpSecretSourceChoice: $('#mcp-secret-source-choice'),
   mcpArgsVariables: $('#mcp-args-variables'),
+  mcpStdioEffect: $('#mcp-stdio-effect'),
+  mcpHttpEffect: $('#mcp-http-effect'),
+  mcpBearerDetails: $('#mcp-bearer-details'),
   mcpTimeout: $('#mcp-timeout'),
   mcpFormMessage: $('#mcp-form-message'),
   saveMcp: $('#save-mcp'),
@@ -1375,6 +1378,67 @@ async function refreshMcp() {
 }
 
 const ARGUMENT_VARIABLE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
+const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
+
+function effectLine(element, parts) {
+  element.replaceChildren();
+  element.classList.toggle('unset', !parts.length);
+  if (!parts.length) {
+    element.textContent = 'No key is sent with this connector.';
+    return;
+  }
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      element.append(document.createTextNode(part));
+      continue;
+    }
+    const code = document.createElement('code');
+    code.textContent = part.code;
+    element.append(code);
+  }
+}
+
+// What actually happens, spelled out: which name is provisioned on the agent and
+// which name the server ends up reading.
+function syncStdioEffect() {
+  const target = ui.mcpSecretTarget.value.trim();
+  const source = chosenSecretSource();
+  if (!target && !source) return effectLine(ui.mcpStdioEffect, []);
+  if (!target || !source) {
+    return effectLine(ui.mcpStdioEffect, [
+      'Incomplete: both halves are needed, or neither. ',
+      target ? 'Choose where the value comes from.' : 'Name the variable the server reads.'
+    ]);
+  }
+  effectLine(ui.mcpStdioEffect, [
+    'On the agent, ',
+    { code: `${CONNECTOR_SECRET_PREFIX}${source}` },
+    ' is read and handed to the server as ',
+    { code: target },
+    ' in its environment. The value never appears in this definition.'
+  ]);
+}
+
+function syncHttpEffect() {
+  const credentialId = ui.mcpCredential.value;
+  const bearer = ui.mcpBearerEnv.value.trim();
+  if (credentialId) {
+    const credential = storedCredentials.find((item) => item.id === credentialId);
+    return effectLine(ui.mcpHttpEffect, credential
+      ? ['Sent as ', { code: credential.header }, ' to ', { code: credential.hosts.join(', ') }, ' only, and to no other host.']
+      : ['This stored key is no longer available.']);
+  }
+  if (bearer) {
+    return effectLine(ui.mcpHttpEffect, [
+      'On the agent, ',
+      { code: `${CONNECTOR_SECRET_PREFIX}${bearer}` },
+      ' is read and sent as ',
+      { code: 'Authorization: Bearer …' },
+      '. A stored key is preferred: it is limited to the hosts you name.'
+    ]);
+  }
+  effectLine(ui.mcpHttpEffect, []);
+}
 
 // Arguments are passed to the server verbatim. Whether ${NAME} in one is ever
 // expanded is the harness's business, not ours — so name what was found and be
@@ -1392,9 +1456,32 @@ function syncArgumentVariables() {
   });
   ui.mcpArgsVariables.append(document.createTextNode(
     found.length === 1
-      ? '. Agent Dock does not substitute this into an argument — map it below so the server reads it from its environment.'
-      : '. Agent Dock does not substitute these into arguments — map them below so the server reads them from its environment.'
+      ? '. Arguments are passed to the server as written, so this is not filled in for you. '
+      : '. Arguments are passed to the server as written, so these are not filled in for you. '
   ));
+
+  // If one of them is not already the mapped variable, offer to make it so —
+  // the connection between the two is the thing that was impossible to see.
+  const target = ui.mcpSecretTarget.value.trim();
+  const unmapped = found.filter((name) => name !== target);
+  if (!unmapped.length) {
+    ui.mcpArgsVariables.append(document.createTextNode('It is the variable mapped below.'));
+    return;
+  }
+  ui.mcpArgsVariables.append(document.createTextNode('Have the server read it from its environment instead:'));
+  for (const name of unmapped.slice(0, 3)) {
+    const use = document.createElement('button');
+    use.type = 'button';
+    use.className = 'text-button';
+    use.textContent = `use ${name}`;
+    use.addEventListener('click', () => {
+      ui.mcpSecretTarget.value = name;
+      syncArgumentVariables();
+      syncStdioEffect();
+      ui.mcpSecretSourceChoice.focus();
+    });
+    ui.mcpArgsVariables.append(use);
+  }
 }
 
 // Secret names the operator has already used somewhere, so one can be chosen
@@ -1457,7 +1544,12 @@ function openMcpDialog(server = null) {
   const environment = Object.entries(server?.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
   syncSecretSourceChoices(environment?.[1]?.sourceEnv ?? '');
+  // The legacy variable field stays folded away unless this definition uses it,
+  // so it is not offered as a peer of the stored key it was replaced by.
+  ui.mcpBearerDetails.open = Boolean(ui.mcpBearerEnv.value);
   syncArgumentVariables();
+  syncStdioEffect();
+  syncHttpEffect();
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
   ui.deleteMcpDefinition.classList.toggle('hidden', !server || !currentAgent);
@@ -1608,9 +1700,12 @@ function applyProposalToForm(proposal) {
   const environment = Object.entries(proposal.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
   syncSecretSourceChoices(environment?.[1]?.sourceEnv ?? '');
+  ui.mcpBearerDetails.open = Boolean(ui.mcpBearerEnv.value);
   // A proposal often puts a variable in the arguments; point at it rather than
   // leaving the operator to work out how it relates to the mapping fields.
   syncArgumentVariables();
+  syncStdioEffect();
+  syncHttpEffect();
 }
 
 async function runWorkshop() {
@@ -2819,16 +2914,22 @@ async function syncCredentialOptions(selectedId = '') {
       ui.mcpCredential.append(option);
     }
     ui.mcpCredential.value = selectedId ?? '';
+    syncHttpEffect();
   } catch {
     // A connector can still be defined without one.
   }
 }
 
 ui.mcpArgs.addEventListener('input', syncArgumentVariables);
+ui.mcpSecretTarget.addEventListener('input', () => { syncStdioEffect(); syncArgumentVariables(); });
+ui.mcpSecretSource.addEventListener('input', syncStdioEffect);
+ui.mcpCredential.addEventListener('change', syncHttpEffect);
+ui.mcpBearerEnv.addEventListener('input', syncHttpEffect);
 ui.mcpSecretSourceChoice.addEventListener('change', () => {
   const adding = ui.mcpSecretSourceChoice.value === '__new';
   ui.mcpSecretSource.classList.toggle('hidden', !adding);
   if (adding) ui.mcpSecretSource.focus();
+  syncStdioEffect();
 });
 ui.workshopRun?.addEventListener('click', runWorkshop);
 ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());

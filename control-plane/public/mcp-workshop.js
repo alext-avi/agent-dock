@@ -175,7 +175,13 @@ export function observeWorkshopRunEvent(state, event) {
 export function requireSuccessfulWorkshopRun(state) {
   if (!state?.taskId) throw new Error('The harness stream did not identify its task. No proposal was accepted.');
   if (state.terminalTaskId !== state.taskId) throw new Error('The harness stream ended without a matching terminal event. No proposal was accepted.');
-  if (state.terminalStatus !== 'succeeded' || state.sawError) {
-    throw new Error(`The harness task ${state.terminalStatus ?? 'failed'}; its proposal was not accepted.`);
+  if (state.sawError) {
+    throw new Error('The harness reported an error during the run; its proposal was not accepted.');
+  }
+  if (state.terminalStatus !== 'succeeded') {
+    // Saying "the harness task succeeded; its proposal was not accepted" is a
+    // contradiction, and that is what this produced when an error drove the
+    // refusal rather than the terminal status.
+    throw new Error(`The harness task ${state.terminalStatus ?? 'ended without reporting a result'}; its proposal was not accepted.`);
   }
 }

@@ -1312,18 +1312,10 @@ function renderMcp(result, definitions) {
     // A stored credential is not a connector-secret reference, and saying "no
     // credential references" on a connector that plainly has one reads as a bug
     // in the thing the operator just configured.
-    const credential = server.credentialId
-      ? storedCredentials.find((item) => item.id === server.credentialId)
-      : null;
-    if (refs.length) {
-      meta.textContent = `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
-    } else if (server.credentialId) {
-      meta.textContent = credential
-        ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
-        : `Credential ${server.credentialId} · no longer stored`;
-    } else {
-      meta.textContent = `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
-    }
+    // One description of a connector's credential, shared with the MCP page.
+    // Two copies is how this line came to say "no longer stored" here while the
+    // other said "checking".
+    meta.textContent = registryMeta(server);
     const actions = document.createElement('div');
     actions.className = 'mcp-row-actions';
     const validate = document.createElement('button');
@@ -1366,7 +1358,10 @@ async function refreshMcp() {
       // renders rather than only when the dialog opens.
       api(`${API_ROOT}/credentials`).catch(() => null)
     ]);
-    if (credentials) storedCredentials = credentials.credentials;
+    if (credentials) {
+      storedCredentials = credentials.credentials;
+      credentialsLoaded = true;
+    }
     renderMcp(agentMcp, library.servers ?? []);
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
@@ -1582,6 +1577,9 @@ async function runWorkshop() {
       workshopConversationId = `workshop-${workshopId()}`;
       workshopConversationAgentId = agentId;
       workshopContinuity = true;
+      // Without this the new harness inherits the old one's turn count and the
+      // next ask is sent as a correction into a conversation it never saw.
+      workshopTurns = 0;
     }
     const continuing = sameAgent && workshopTurns > 0 && workshopContinuity;
     const prompt = continuing ? objective : buildMcpWorkshopPrompt(objective);
@@ -1590,10 +1588,10 @@ async function runWorkshop() {
     // An un-refreshed runtime cannot continue a conversation and says so with a
     // 409. Losing follow-up corrections is worth far more than losing the
     // feature, so ask again without one and tell the operator what they lost.
-    if (response.status === 409 && workshopContinuity) {
+    if ((response.status === 409 || response.status === 502) && workshopContinuity) {
       const failure = await response.clone().json().catch(() => ({}));
       if (!mine()) return;
-      if (/cannot continue a conversation/i.test(failure.error ?? '')) {
+      if (/continue a conversation/i.test(failure.error ?? '')) {
         workshopContinuity = false;
         workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'failed', token);
         response = await workshopDispatch(agentId, buildMcpWorkshopPrompt(objective), null, abort);
@@ -1675,6 +1673,7 @@ async function runWorkshop() {
       workshopRunning = false;
       ui.workshopRun.disabled = false;
       ui.workshopObjective.value = '';
+      workshopAbort = null;
     }
   }
 }
@@ -2470,6 +2469,7 @@ ui.mcpDialog.addEventListener('close', () => {
   workshopAbort?.abort();
   workshopAbort = null;
   workshopRunning = false;
+  ui.workshopRun.disabled = false;
 });
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
 ui.modelSelect.addEventListener('change', () => {
@@ -2738,6 +2738,7 @@ async function syncCredentialOptions(selectedId = '') {
   try {
     const { credentials } = await api(`${API_ROOT}/credentials`);
     storedCredentials = credentials;
+    credentialsLoaded = true;
     ui.mcpCredential.replaceChildren();
     const none = document.createElement('option');
     none.value = '';

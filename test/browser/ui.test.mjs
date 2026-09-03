@@ -815,7 +815,11 @@ test('a runtime that cannot carry a conversation still gets a proposal, and says
   const dispatched = [];
   await page.route('**/api/v1/agents/*/tasks', async (route) => {
     const body = JSON.parse(route.request().postData() ?? '{}');
-    dispatched.push(Boolean(body.conversationId));
+    // Record what was actually asked, not merely whether a conversation id was
+    // attached. The first version of this test asserted booleans only, so it
+    // passed even when the retry sent a bare objective with no instructions —
+    // which is the entire reason the retry is worth having.
+    dispatched.push({ conversation: Boolean(body.conversationId), instructed: /agent-dock-mcp-proposal/.test(body.prompt ?? '') });
     if (body.conversationId) {
       return route.fulfill({
         status: 409,
@@ -841,7 +845,10 @@ test('a runtime that cannot carry a conversation still gets a proposal, and says
   await page.click('#run-workshop');
 
   await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'legacy-runtime');
-  assert.deepEqual(dispatched, [true, false], 'the retry did not drop the conversation');
+  assert.deepEqual(dispatched, [
+    { conversation: true, instructed: true },
+    { conversation: false, instructed: true }
+  ], 'the retry must drop the conversation and keep the instructions');
   const log = await page.locator('#workshop-log').textContent();
   assert.match(log ?? '', /cannot carry a conversation/i);
 });
@@ -882,5 +889,64 @@ test('a slow harness list cannot reveal the workshop inside an edit dialog', asy
     await page.locator('#workshop').isVisible(),
     false,
     'the workshop was revealed while editing a saved connector'
+  );
+});
+
+test('switching harness starts a fresh exchange rather than a correction', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  const proposal = (name) => [
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: name }),
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: name, data: { role: 'assistant', text: `<agent-dock-mcp-proposal>{"name":"${name}","transport":"http","url":"https://${name}.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>` } }),
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: name, data: { status: 'succeeded' } })
+  ].join('\n') + '\n';
+
+  // The second harness fails its first ask, so no conversation is ever created
+  // on it. The ask after that must carry the full instructions: a turn count
+  // inherited from the first harness would send a bare correction into a
+  // conversation this runtime has never seen, and the operator would be told
+  // only that no proposal came back.
+  const asks = [];
+  let failNext = false;
+  await page.route('**/api/v1/agents/*/tasks', (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    const agent = decodeURIComponent(route.request().url().split('/agents/')[1].split('/')[0]);
+    asks.push({ agent, instructed: /agent-dock-mcp-proposal/.test(body.prompt ?? '') });
+    if (failNext) {
+      failNext = false;
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'the harness fell over' }) });
+    }
+    return route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: proposal('ok-' + asks.length) });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+
+  const first = app.agents['claude-code'].id;
+  const second = app.agents['codex-cli'].id;
+
+  await page.selectOption('#workshop-agent', first);
+  await page.fill('#workshop-objective', 'a connector on the first harness');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value?.startsWith('ok-'));
+
+  failNext = true;
+  await page.selectOption('#workshop-agent', second);
+  await page.fill('#workshop-objective', 'now try the second harness');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('Nothing was filled in'));
+
+  await page.fill('#workshop-objective', 'no, the other endpoint');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelectorAll('#workshop-log p').length >= 5);
+
+  assert.deepEqual(asks.map((ask) => ask.agent), [first, second, second]);
+  assert.deepEqual(
+    asks.map((ask) => ask.instructed),
+    [true, true, true],
+    'an ask after switching harness was sent as a bare correction'
   );
 });

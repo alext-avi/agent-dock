@@ -1398,9 +1398,19 @@ function bindingLabel(binding) {
   if (!binding) return null;
   if (binding.source === 'credential') {
     const credential = storedCredentials.find((item) => item.id === binding.credentialId);
-    return credential
-      ? ['Uses the stored key ', { code: credential.name }, '. Its value is sent to this connector and nowhere else.']
-      : ['That stored key is no longer available.'];
+    if (!credential) return ['That stored key is no longer available.'];
+    if (!credential.complete) {
+      return [
+        'The key ',
+        { code: credential.name },
+        ' exists but has no value yet. Add its value under Stored keys below, or this connector cannot start.'
+      ];
+    }
+    // Whether the key is limited to anywhere is now the operator's choice, so
+    // say which it is rather than implying a restriction that may not exist.
+    return credential.restricted
+      ? ['Uses the stored key ', { code: credential.name }, ', which is limited to ', { code: credential.hosts.join(', ') }, '.']
+      : ['Uses the stored key ', { code: credential.name }, '. It is not limited to any host, so it can be sent wherever this connector points.'];
   }
   return [
     'Read from ',
@@ -1450,6 +1460,8 @@ function renderPlaceholderRows() {
       options.push([`secret:${secret}`, `container secret · ${secret}`]);
     }
     options.push(['__new', 'a new container secret…']);
+    const matching = storedCredentials.find((item) => item.name.toLowerCase() === name.toLowerCase());
+    if (!matching) options.push(['__create', `create a key called ${name}…`]);
     for (const [value, label] of options) {
       const option = document.createElement('option');
       option.value = value;
@@ -1468,14 +1480,38 @@ function renderPlaceholderRows() {
     effect.textContent = 'Nothing fills this yet, so the connector cannot be saved.';
 
     const existing = placeholderBindings.get(name);
-    if (existing?.source === 'credential') choice.value = `credential:${existing.credentialId}`;
-    else if (existing?.source === 'connector-secret') {
-      if (knownSecrets.has(existing.name)) choice.value = `secret:${existing.name}`;
-      else { choice.value = '__new'; custom.value = existing.name; custom.classList.remove('hidden'); }
+    // A key whose name matches the placeholder is the obvious answer, so it is
+    // preselected. Still visible and still changeable — it is a prefill, not a
+    // decision made on the operator's behalf.
+    if (!existing && matching) {
+      placeholderBindings.set(name, { source: 'credential', credentialId: matching.id });
+    }
+    const binding = placeholderBindings.get(name);
+    if (binding?.source === 'credential') choice.value = `credential:${binding.credentialId}`;
+    else if (binding?.source === 'connector-secret') {
+      if (knownSecrets.has(binding.name)) choice.value = `secret:${binding.name}`;
+      else { choice.value = '__new'; custom.value = binding.name; custom.classList.remove('hidden'); }
     }
 
-    const settle = () => {
+    const settle = async () => {
       const value = choice.value;
+      if (value === '__create') {
+        try {
+          const created = await api(`${API_ROOT}/credentials`, {
+            method: 'POST',
+            body: JSON.stringify({ name })
+          });
+          storedCredentials = [...storedCredentials, created.credential];
+          placeholderBindings.set(name, { source: 'credential', credentialId: created.credential.id });
+          renderPlaceholderRows();
+          void loadCredentials();
+          return;
+        } catch (error) {
+          effect.classList.remove('unset');
+          effect.textContent = error.message;
+          return;
+        }
+      }
       let binding = null;
       if (value.startsWith('credential:')) binding = { source: 'credential', credentialId: value.slice('credential:'.length) };
       else if (value.startsWith('secret:')) binding = { source: 'connector-secret', name: value.slice('secret:'.length) };
@@ -2674,14 +2710,24 @@ function credentialRow(credential) {
       <button class="text-button danger-text credential-delete" type="button">Delete</button>
     </div>`;
   row.querySelector('strong').textContent = credential.name;
-  row.querySelector('small').textContent = `${credential.type} · header ${credential.header}`;
-  row.querySelector('.credential-hint').textContent = credential.hint ?? '…';
-  // The hosts are the point of the record, so they are on the row rather than
-  // hidden behind an edit dialog.
+  row.querySelector('small').textContent = credential.header
+    ? `${credential.type} · sent as ${credential.header}`
+    : credential.type;
+  // A key created by writing a placeholder has no value yet. Saying so on the
+  // row is the whole point of letting it exist in that state.
+  const hint = row.querySelector('.credential-hint');
+  if (credential.complete) {
+    hint.textContent = credential.hint ?? '…';
+  } else {
+    row.classList.add('incomplete');
+    hint.className = 'credential-needs-value';
+    hint.textContent = 'needs a value';
+  }
   const hosts = credential.hosts ?? [];
   const hostList = row.querySelector('.credential-hosts');
-  hostList.textContent = hosts.join(', ');
-  hostList.title = hosts.join('\n');
+  // An empty list is not a blank cell: it means this key is not limited.
+  hostList.textContent = hosts.length ? hosts.join(', ') : 'any host';
+  hostList.title = hosts.length ? hosts.join('\n') : 'This key is not limited to any host.';
   row.querySelector('.credential-edit').addEventListener('click', () => openCredentialDialog(credential));
   row.querySelector('.credential-delete').addEventListener('click', () => deleteCredential(credential));
   return row;
@@ -2853,10 +2899,13 @@ function openCredentialDialog(credential = null) {
   ui.credentialHosts.value = (credential?.hosts ?? []).join('\n');
   // Editing cannot show the value, so the field means "replace it" rather than
   // "here is what it is".
-  ui.credentialValue.required = !credential;
-  ui.credentialValueHint.textContent = credential
-    ? `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`
-    : 'pasted once, never shown again';
+  const incomplete = credential && !credential.complete;
+  ui.credentialValue.required = !credential || incomplete;
+  ui.credentialValueHint.textContent = !credential
+    ? 'pasted once, never shown again'
+    : incomplete
+      ? 'this key has no value yet — paste it to finish setting it up'
+      : `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`;
   ui.credentialDialog.showModal();
 }
 

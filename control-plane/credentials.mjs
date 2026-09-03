@@ -110,7 +110,10 @@ function hostList(value, field) {
 // one level of wildcard — deliberately not a substring match, which would let
 // api.example.com.attacker.test through.
 export function hostPermitted(hosts, url) {
-  if (!hosts?.length) return false;
+  // No list means no restriction. That is the opt-in behaviour, and it is why
+  // publicCredential reports `restricted` — a caller must be able to tell an
+  // unrestricted key from one limited to a host, and so must the operator.
+  if (!hosts?.length) return true;
   let hostname;
   try {
     hostname = new URL(url).hostname.toLowerCase();
@@ -141,8 +144,14 @@ export function publicCredential(record) {
     type: record.type,
     header: record.header,
     hosts: [...record.hosts],
-    // Enough to tell one key from another without disclosing any of it.
+    // Enough to tell one key from another without disclosing any of it. Null
+    // until the key has a value at all.
     hint: record.hint,
+    // A key created by writing a placeholder has no value yet and cannot be used.
+    complete: Boolean(record.sealed),
+    // Whether the host list actually limits anything. Reported rather than
+    // inferred from an empty array, so the interface can say which it is.
+    restricted: (record.hosts?.length ?? 0) > 0,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt
   };
@@ -161,6 +170,14 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     return record;
   }
 
+  // A key waiting to be completed is a normal state, not a corrupt one, so the
+  // refusal names what to do rather than reporting a fault.
+  function requireComplete(record) {
+    if (!record.sealed) {
+      throw failure(`The key ${record.name} has no value yet. Add its value before using it.`, 409);
+    }
+  }
+
   function normalize(input, { currentId = null } = {}) {
     const name = text(input.name, 'name', { required: true, max: 64 });
     if (!NAME_PATTERN.test(name)) throw failure('name must be alphanumeric with dashes or underscores');
@@ -172,13 +189,15 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       throw failure(`type must be one of ${CREDENTIAL_TYPES.join(', ')}`);
     }
 
-    const header = text(input.header, 'header', { required: true, max: 64 });
-    if (!HEADER_PATTERN.test(header)) throw failure('header must be a valid HTTP header name');
+    // Optional. It is only meaningful for the older path that sends a credential
+    // as a header; a placeholder puts the value exactly where it is written.
+    const header = text(input.header, 'header', { max: 64 }) ?? null;
+    if (header && !HEADER_PATTERN.test(header)) throw failure('header must be a valid HTTP header name');
 
+    // Opt-in. An empty list means this key is not limited to any host, which is
+    // a real loss of protection for a remote connector and is reported as such
+    // rather than left to be assumed — see hostPermitted.
     const hosts = hostList(input.hosts, 'hosts');
-    if (!hosts.length) {
-      throw failure('hosts is required: a credential must name where it may be sent');
-    }
     return { name, type, header, hosts };
   }
 
@@ -202,12 +221,18 @@ export function createCredentialStore({ records, persist, keyProvider = environm
 
     async create(input) {
       const fields = normalize(input);
-      const value = text(input.value, 'value', { required: true, max: 4096 });
+      // A key with no value yet is a real record waiting to be completed, which
+      // is what lets a placeholder in a connector create the entity to fill in.
+      // It is deliberately not treated as an error: nothing can use it until it
+      // has a value, and resolving one says exactly that.
+      const value = input.value === undefined || input.value === null || input.value === ''
+        ? null
+        : text(input.value, 'value', { required: true, max: 4096 });
       const record = {
         ...fields,
         id: makeId(fields.name, new Set(records.keys())),
-        sealed: seal(value, keyProvider.key()),
-        hint: hintFor(value),
+        sealed: value === null ? null : seal(value, keyProvider.key()),
+        hint: value === null ? null : hintFor(value),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
@@ -234,7 +259,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       // an editor could simply move the allowlist to wherever they wanted the
       // credential sent, which is not a boundary at all.
       const hostsChanged = fields.hosts.join(',') !== record.hosts.join(',');
-      if (hostsChanged && value === undefined) {
+      if (hostsChanged && value === undefined && record.sealed) {
         throw failure(
           'Changing permitted hosts requires supplying the credential value again, '
           + 'because it changes where the credential may be sent',
@@ -262,6 +287,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     // the destination has been checked. Never reachable from a browser route.
     resolveForHost(id, url) {
       const record = requireRecord(id);
+      requireComplete(record);
       if (!hostPermitted(record.hosts, url)) {
         throw failure(
           `Credential ${record.name} is not permitted for ${url}; it is limited to ${record.hosts.join(', ')}`,
@@ -277,6 +303,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     // happen, and this way the one caller that skips it is visible.
     resolveForLocalProcess(id) {
       const record = requireRecord(id);
+      requireComplete(record);
       return { header: record.header, value: open(record.sealed, keyProvider.key()) };
     },
 
@@ -284,6 +311,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     // so a value is never compared with ===.
     matches(id, candidate) {
       const record = requireRecord(id);
+      requireComplete(record);
       const actual = Buffer.from(open(record.sealed, keyProvider.key()));
       const supplied = Buffer.from(String(candidate));
       const equal = actual.length === supplied.length && timingSafeEqual(actual, supplied);

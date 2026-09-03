@@ -501,3 +501,8 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
 .placeholder-row select, .placeholder-row input { min-width: 170px; }
 .placeholder-row .field-effect { margin: 0; }
 .placeholder-where { color: var(--faint); font: 10px ui-monospace, monospace; }
+
+.credential-advanced summary { color: var(--muted); font-size: 11px; cursor: pointer; }
+.credential-advanced[open] summary { margin-bottom: 9px; }
+.credential-row.incomplete { border-left: 2px solid #6a5626; }
+.credential-needs-value { color: #d8c48a; font: 10px ui-monospace, monospace; }

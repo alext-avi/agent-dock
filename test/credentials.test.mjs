@@ -113,18 +113,65 @@ test('host matching is not a substring check', async () => {
   assert.equal(hostPermitted(['*.example.com'], 'https://a.example.com/x'), true);
   assert.equal(hostPermitted(['*.example.com'], 'https://example.com/x'), false);
   assert.equal(hostPermitted(['*.example.com'], 'https://a.example.com.attacker.test/x'), false);
-  assert.equal(hostPermitted([], 'https://mcp.example.com/x'), false);
+  // No list is no restriction: the allowlist is opt-in. This is the one place
+  // that decides it, so it is asserted here rather than left implicit.
+  assert.equal(hostPermitted([], 'https://mcp.example.com/x'), true);
+  assert.equal(hostPermitted(undefined, 'https://mcp.example.com/x'), true);
   assert.equal(hostPermitted(['mcp.example.com'], 'not-a-url'), false);
 });
 
-test('a credential must say where it may be sent', async () => {
+test('a key needs a name and little else, and says what it is limited to', async () => {
   const { credentials } = store();
-  await assert.rejects(() => credentials.create(apiKey({ hosts: [] })), /hosts is required/);
-  await assert.rejects(() => credentials.create(apiKey({ hosts: undefined })), /hosts is required/);
-  await assert.rejects(() => credentials.create(apiKey({ hosts: ['not a hostname'] })), /is not a hostname/);
-  await assert.rejects(() => credentials.create(apiKey({ header: 'Bad Header' })), /valid HTTP header/);
-  await assert.rejects(() => credentials.create(apiKey({ type: 'oauth' })), /type must be one of/);
-  await assert.rejects(() => credentials.create(apiKey({ value: undefined })), /value is required/);
+
+  // A name and a value is the whole requirement. A header only mattered when a
+  // credential was delivered as one; a placeholder puts the value where it is
+  // written, so it is optional. So is the host list.
+  const plain = await credentials.create({ name: 'plain-key', value: 'sk-plain-000011112222' });
+  assert.equal(plain.header, null);
+  assert.deepEqual(plain.hosts, []);
+  assert.equal(plain.complete, true);
+  // And it says plainly that nothing limits it, rather than leaving an empty
+  // array to be interpreted.
+  assert.equal(plain.restricted, false);
+
+  const limited = await credentials.create(apiKey({ name: 'limited-key' }));
+  assert.equal(limited.restricted, true);
+
+  // What is still refused is malformed, not merely absent.
+  await assert.rejects(() => credentials.create({ name: 'bad-hosts', value: 'x'.repeat(20), hosts: ['not a hostname'] }), /is not a hostname/);
+  await assert.rejects(() => credentials.create({ name: 'bad-header', value: 'x'.repeat(20), header: 'Bad Header' }), /valid HTTP header/);
+  await assert.rejects(() => credentials.create({ name: 'bad-type', value: 'x'.repeat(20), type: 'oauth' }), /type must be one of/);
+  await assert.rejects(() => credentials.create({ name: 'no name at all'.repeat(20), value: 'x' }), /too long|alphanumeric/);
+});
+
+test('a key can exist before it has a value, and nothing can use it until it does', async () => {
+  const { credentials } = store();
+
+  // This is what lets writing ${GITHUB_TOKEN} in a connector create the thing
+  // the operator then goes and fills in.
+  const stub = await credentials.create({ name: 'GITHUB_TOKEN' });
+  assert.equal(stub.complete, false);
+  assert.equal(stub.hint, null);
+
+  // Using it is refused in a way that says what to do, rather than as a fault.
+  assert.throws(() => credentials.resolveForHost(stub.id, 'https://example.test/mcp'), (error) => {
+    assert.equal(error.status, 409);
+    assert.match(error.message, /has no value yet/);
+    return true;
+  });
+  assert.throws(() => credentials.resolveForLocalProcess(stub.id), /has no value yet/);
+
+  // Completing it is an ordinary edit.
+  const completed = await credentials.update(stub.id, { value: 'sk-later-000011112222' });
+  assert.equal(completed.complete, true);
+  assert.equal(completed.hint, '…2222');
+  assert.equal(credentials.resolveForHost(stub.id, 'https://anywhere.test/mcp').value, 'sk-later-000011112222');
+
+  // Setting a host list on an incomplete key does not need the value back,
+  // because there is no value to prove ownership of yet.
+  const second = await credentials.create({ name: 'SECOND_TOKEN' });
+  const scoped = await credentials.update(second.id, { hosts: ['only.example.test'] });
+  assert.deepEqual(scoped.hosts, ['only.example.test']);
 });
 
 test('renaming leaves the value alone, and replacing it changes the hint', async () => {

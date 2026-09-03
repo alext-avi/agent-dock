@@ -542,7 +542,6 @@ test('a credential can be added from the UI and its value never comes back', asy
 
   await page.click('#new-credential');
   await page.fill('#credential-name', 'company-docs');
-  await page.fill('#credential-header', 'X-Api-Key');
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-browser-secret-9999');
   await page.click('#credential-form button[type="submit"]');
@@ -569,7 +568,6 @@ test('a placeholder is what asks for a key, and binds to a stored one', async (t
 
   await page.click('#new-credential');
   await page.fill('#credential-name', 'picker-key');
-  await page.fill('#credential-header', 'X-Api-Key');
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-picker-000011112222');
   await page.click('#credential-form button[type="submit"]');
@@ -699,7 +697,6 @@ test('a refused delete is reported beside the list, not as the control plane goi
 
   await page.click('#new-credential');
   await page.fill('#credential-name', 'in-use-key');
-  await page.fill('#credential-header', 'X-Api-Key');
   await page.fill('#credential-hosts', 'inuse.example.com');
   await page.fill('#credential-value', 'sk-inuse-000011112222');
   await page.click('#credential-form button[type="submit"]');
@@ -735,7 +732,6 @@ test('a refused delete is reported beside the list, not as the control plane goi
   // A failed save must report inside the dialog, not on the page behind it.
   await page.click('#new-credential');
   await page.fill('#credential-name', 'in-use-key');
-  await page.fill('#credential-header', 'X-Api-Key');
   await page.fill('#credential-hosts', 'inuse.example.com');
   await page.fill('#credential-value', 'sk-duplicate-000011112222');
   await page.click('#credential-form button[type="submit"]');
@@ -1115,4 +1111,76 @@ test('a proposal carrying a placeholder asks the operator what fills it', async 
   assert.match(status, /Choose what fills SERVICE_TOKEN/);
   assert.doesNotMatch(status, /rejected the shape/i);
   assert.doesNotMatch(status, /could not be completed/i);
+});
+
+test('a key named after the placeholder is preselected', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-credential');
+
+  // A name and a value is all a key needs now.
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'MATCHING_TOKEN');
+  await page.fill('#credential-value', 'sk-matching-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.locator('.credential-row', { hasText: 'MATCHING_TOKEN' }).waitFor();
+  // No host list means no restriction, and the row says so rather than showing
+  // an empty cell.
+  assert.match(await page.locator('.credential-row', { hasText: 'MATCHING_TOKEN' }).textContent(), /any host/);
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${MATCHING_TOKEN}');
+
+  // The obvious answer is offered rather than looked up. A prefill, not a
+  // decision: the select still shows it and can still be changed.
+  const row = page.locator('.placeholder-row', { hasText: 'MATCHING_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.locator('select').inputValue(), /^credential:/);
+  assert.match(await row.textContent(), /Uses the stored key/);
+  // And it says the key is unrestricted, rather than implying a limit it has not got.
+  assert.match(await row.textContent(), /not limited to any host/);
+});
+
+test('a placeholder with no key can create one to complete', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'needs-a-new-key');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${BRAND_NEW_TOKEN}');
+  const row = page.locator('.placeholder-row', { hasText: 'BRAND_NEW_TOKEN' });
+  await row.waitFor();
+
+  // Writing the placeholder is enough to bring the key into existence; the value
+  // is filled in afterwards, which is the point of letting it exist unfinished.
+  await row.locator('select').selectOption('__create');
+  await page.waitForFunction(() => {
+    const text = document.querySelector('.placeholder-row')?.textContent ?? '';
+    return text.includes('has no value yet');
+  });
+  assert.match(await row.textContent(), /Add its value under Stored keys/);
+
+  const created = page.locator('.credential-row', { hasText: 'BRAND_NEW_TOKEN' });
+  await created.waitFor();
+  assert.match(await created.textContent(), /needs a value/);
+
+  // The connector can still be saved: the binding is real, the value is simply
+  // outstanding, and the apply is what refuses until it is there.
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#registry-list .mcp-row', { hasText: 'needs-a-new-key' }).waitFor();
+
+  // Completing it is an ordinary edit, and the value is then required.
+  await created.locator('.credential-edit').click();
+  await page.waitForSelector('#credential-dialog[open]');
+  assert.match(await page.locator('#credential-value-hint').textContent(), /no value yet/);
+  assert.equal(await page.locator('#credential-value').evaluate((node) => node.required), true);
+  await page.fill('#credential-value', 'sk-completed-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('.credential-row')].find((node) => node.textContent.includes('BRAND_NEW_TOKEN'));
+    return row && !row.textContent.includes('needs a value');
+  });
 });

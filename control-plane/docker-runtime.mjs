@@ -115,13 +115,21 @@ for (const child of children.sort((left, right) => left.name.localeCompare(right
 process.stdout.write(JSON.stringify({ directories, truncated: directories.length >= 500 }));
 `;
 
-function dockerError(status, body, path) {
+export function dockerError(status, body, path) {
   let message = body;
   try {
     message = JSON.parse(body).message ?? body;
   } catch {}
-  const error = new Error(`Docker API ${status} for ${path}: ${message || 'request failed'}`);
+  // Docker routinely includes bind source paths and other host-only details in
+  // its error body. Keep those details available to trusted diagnostics without
+  // putting them in Error.message, which is returned by the REST API.
+  const error = new Error(`Docker API request failed with status ${status}`);
   error.status = status === 404 ? 409 : 502;
+  Object.defineProperties(error, {
+    dockerStatus: { value: status, enumerable: false },
+    dockerPath: { value: path, enumerable: false },
+    dockerMessage: { value: message || 'request failed', enumerable: false }
+  });
   return error;
 }
 
@@ -184,6 +192,7 @@ export class DockerRuntimeManager {
     this.attachmentValidatorImage = options.attachmentValidatorImage
       ?? process.env.ATTACHMENT_VALIDATOR_IMAGE
       ?? 'node:22-bookworm-slim';
+    this.attachmentValidatorImageReady = null;
   }
 
   // Held for the whole of a destructive operation. Checked and set synchronously
@@ -282,6 +291,30 @@ export class DockerRuntimeManager {
     await this.request('POST', '/volumes/create', { Name: name, Labels: labels });
   }
 
+  async ensureAttachmentValidatorImage() {
+    if (this.attachmentValidatorImageReady) return this.attachmentValidatorImageReady;
+    const ensure = async () => {
+      try {
+        await this.request('GET', `/images/${encodeURIComponent(this.attachmentValidatorImage)}/json`);
+        return;
+      } catch (error) {
+        if (error.dockerStatus !== 404) throw error;
+      }
+      await this.request(
+        'POST',
+        `/images/create?fromImage=${encodeURIComponent(this.attachmentValidatorImage)}`,
+        undefined,
+        [200]
+      );
+      await this.request('GET', `/images/${encodeURIComponent(this.attachmentValidatorImage)}/json`);
+    };
+    this.attachmentValidatorImageReady = ensure().catch((error) => {
+      this.attachmentValidatorImageReady = null;
+      throw error;
+    });
+    return this.attachmentValidatorImageReady;
+  }
+
   async createManagedDataVolume(dataSourceId) {
     const suffix = randomUUID().slice(0, 8);
     const base = safeName(`agent-dock-source-${dataSourceId}`).slice(0, 71);
@@ -310,6 +343,7 @@ export class DockerRuntimeManager {
     }
     const template = ADAPTERS[adapter];
     if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
+    await this.ensureAttachmentValidatorImage();
     const body = {
       Image: this.attachmentValidatorImage,
       Cmd: ['node', '-e', ATTACHMENT_VALIDATOR_SCRIPT],
@@ -363,6 +397,7 @@ export class DockerRuntimeManager {
     if (!root) throw Object.assign(new Error(`Attachment root ${rootId} is not configured`), { status: 400 });
     const template = ADAPTERS[adapter];
     if (!template) throw Object.assign(new Error(`No runtime template exists for ${adapter}`), { status: 400 });
+    await this.ensureAttachmentValidatorImage();
     relativePath = normalizeRelativePath(relativePath);
     const body = {
       Image: this.attachmentValidatorImage,
@@ -440,6 +475,17 @@ export class DockerRuntimeManager {
           ReadOnly: attachment.access === 'read-only',
           BindOptions: { Propagation: 'rprivate' }
         };
+        materialized.push({
+          ...attachment,
+          mount,
+          hostDirectory: {
+            rootId: source.rootId,
+            relativePath: source.relativePath,
+            access: attachment.access,
+            adapter
+          }
+        });
+        continue;
       } else {
         if (!source.volumeName) throw Object.assign(new Error('Managed data source has no volume'), { status: 409 });
         const volume = await this.request('GET', `/volumes/${encodeURIComponent(source.volumeName)}`);
@@ -456,6 +502,22 @@ export class DockerRuntimeManager {
       materialized.push({ ...attachment, mount });
     }
     return materialized;
+  }
+
+  async revalidateHostAttachments(attachments) {
+    const revalidated = [];
+    for (const attachment of attachments) {
+      if (!attachment.hostDirectory) {
+        revalidated.push(attachment);
+        continue;
+      }
+      const sourcePath = await this.validateHostDirectory(attachment.hostDirectory);
+      revalidated.push({
+        ...attachment,
+        mount: { ...attachment.mount, Source: sourcePath }
+      });
+    }
+    return revalidated;
   }
 
   // One definition of what a runtime's container is, shared by provisioning and
@@ -487,6 +549,7 @@ export class DockerRuntimeManager {
       image,
       body: {
         Image: image,
+        User: template.user,
         Env: Object.entries(environment).map(([key, value]) => `${key}=${value}`),
         Labels: labels,
         ExposedPorts: { '7777/tcp': {} },
@@ -598,7 +661,7 @@ export class DockerRuntimeManager {
     };
     // Build the spec before removing anything: an unresolvable network or image
     // should fail while the existing container is still running.
-    const desired = await this.containerSpec({
+    await this.containerSpec({
       adapter: runtime.adapter,
       workerId: runtime.workerId,
       workerToken: runtime.workerToken,
@@ -606,7 +669,7 @@ export class DockerRuntimeManager {
       labels,
       attachments
     });
-    const previous = await this.containerSpec({
+    await this.containerSpec({
       adapter: runtime.adapter,
       workerId: runtime.workerId,
       workerToken: runtime.workerToken,
@@ -656,10 +719,33 @@ export class DockerRuntimeManager {
       }
     }
     try {
-      return await createReplacement(desired, attachments);
+      // The preflight validation in materializeAttachments protects the running
+      // container. Validate again only after that container is gone so the agent
+      // itself cannot swap a checked directory for a symlink before Docker binds
+      // it into the replacement. A privileged host actor remains outside this
+      // POC's security boundary.
+      const finalAttachments = await this.revalidateHostAttachments(attachments);
+      const desired = await this.containerSpec({
+        adapter: runtime.adapter,
+        workerId: runtime.workerId,
+        workerToken: runtime.workerToken,
+        volumes,
+        labels,
+        attachments: finalAttachments
+      });
+      return await createReplacement(desired, finalAttachments);
     } catch (error) {
       try {
-        error.rollbackRuntime = await createReplacement(previous, previousAttachments);
+        const finalPreviousAttachments = await this.revalidateHostAttachments(previousAttachments);
+        const previous = await this.containerSpec({
+          adapter: runtime.adapter,
+          workerId: runtime.workerId,
+          workerToken: runtime.workerToken,
+          volumes,
+          labels,
+          attachments: finalPreviousAttachments
+        });
+        error.rollbackRuntime = await createReplacement(previous, finalPreviousAttachments);
       } catch (rollbackError) {
         error.message = `${error.message}; restoring the previous runtime also failed: ${rollbackError.message}`;
       }

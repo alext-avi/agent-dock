@@ -278,6 +278,7 @@ export function createControlPlane(options = {}) {
   const dataAttachments = new Map();
   let persistQueue = Promise.resolve();
   let storageMutationQueue = Promise.resolve();
+  const pendingAttachmentSets = new Map();
   const activeAgentOperations = new Map();
   const defaultAgent = () => {
     const preferred = agents.get(config.defaultAgentId);
@@ -313,6 +314,53 @@ export function createControlPlane(options = {}) {
     const result = storageMutationQueue.then(operation, operation);
     storageMutationQueue = result.catch(() => {});
     return result;
+  }
+
+  const pendingSourceIds = () => new Set(
+    [...pendingAttachmentSets.values()].flatMap((claim) => [...claim.reservedSourceIds])
+  );
+
+  const sourceHasPendingMutation = (sourceId) => pendingSourceIds().has(sourceId);
+
+  function reserveAttachmentSet(agentId, nextAttachments, provisionalSources, removeSourceIds) {
+    const otherClaims = [...pendingAttachmentSets.entries()]
+      .filter(([otherAgentId]) => otherAgentId !== agentId)
+      .map(([, claim]) => claim);
+    const requestedSourceIds = new Set(nextAttachments.map((attachment) => attachment.dataSourceId));
+    for (const claim of otherClaims) {
+      if ([...requestedSourceIds].some((sourceId) => claim.removeSourceIds.has(sourceId))) {
+        throw Object.assign(new Error('A referenced data source is being removed; retry after the current storage change finishes'), { status: 409 });
+      }
+      if ([...removeSourceIds].some((sourceId) => claim.reservedSourceIds.has(sourceId))) {
+        throw Object.assign(new Error('A data source is being attached; retry after the current storage change finishes'), { status: 409 });
+      }
+    }
+
+    const leaseSources = new Map(dataSources);
+    for (const claim of otherClaims) {
+      for (const [sourceId, source] of claim.provisionalSources) leaseSources.set(sourceId, source);
+    }
+    for (const [sourceId, source] of provisionalSources) leaseSources.set(sourceId, source);
+    const competing = [
+      ...[...dataAttachments.values()].filter((attachment) => attachment.agentId !== agentId),
+      ...otherClaims.flatMap((claim) => claim.attachments)
+    ];
+    const accepted = [];
+    for (const attachment of nextAttachments) {
+      assertWriteLease(attachment, [...competing, ...accepted], leaseSources, attachmentRoots);
+      accepted.push(attachment);
+    }
+
+    const claim = {
+      attachments: [...nextAttachments],
+      provisionalSources: new Map(provisionalSources),
+      removeSourceIds: new Set(removeSourceIds),
+      reservedSourceIds: new Set([...requestedSourceIds, ...removeSourceIds])
+    };
+    pendingAttachmentSets.set(agentId, claim);
+    return () => {
+      if (pendingAttachmentSets.get(agentId) === claim) pendingAttachmentSets.delete(agentId);
+    };
   }
 
   function claimAgentOperation(agentId, operation) {
@@ -574,7 +622,7 @@ export function createControlPlane(options = {}) {
     return runtime;
   }
 
-  async function materializeAttachments(agent, attachments) {
+  async function materializeAttachments(agent, attachments, sources = dataSources) {
     if (!runtimeManager?.materializeAttachments) {
       if (!attachments.length) return [];
       throw Object.assign(new Error('The runtime provisioner does not support data attachments'), { status: 503 });
@@ -582,18 +630,18 @@ export function createControlPlane(options = {}) {
     return runtimeManager.materializeAttachments({
       adapter: agent.adapter,
       attachments,
-      sources: dataSources
+      sources
     });
   }
 
-  async function applyAttachmentSet(agent, nextAttachments, { previousAttachments = null } = {}) {
+  async function applyAttachmentSet(agent, nextAttachments, { previousAttachments = null, sources = dataSources } = {}) {
     const runtime = await requireIdleRuntime(agent);
     const previousIds = new Set(runtime.appliedAttachmentIds ?? []);
     const previous = previousAttachments
       ?? attachmentsForAgent(agent.id).filter((attachment) => previousIds.has(attachment.id));
     const [materialized, previousMaterialized] = await Promise.all([
-      materializeAttachments(agent, nextAttachments),
-      materializeAttachments(agent, previous)
+      materializeAttachments(agent, nextAttachments, sources),
+      materializeAttachments(agent, previous, sources)
     ]);
     try {
       const replaced = await runtimeManager.recreate(runtime, {
@@ -611,26 +659,53 @@ export function createControlPlane(options = {}) {
     }
   }
 
-  async function commitAttachmentSet(agent, nextAttachments) {
+  async function commitAttachmentSet(agent, nextAttachments, { provisionalSources = [], removeSourceIds = [] } = {}) {
     const release = claimAgentOperation(agent.id, 'runtime storage reconfiguration');
+    const provisional = new Map(provisionalSources.map((source) => [source.id, source]));
+    const removals = new Set(removeSourceIds);
+    const sourceView = new Map(dataSources);
+    for (const [sourceId, source] of provisional) {
+      if (sourceView.has(sourceId)) {
+        release();
+        throw Object.assign(new Error(`Data source ${sourceId} already exists`), { status: 409 });
+      }
+      sourceView.set(sourceId, source);
+    }
+    let releaseReservation;
     try {
+      releaseReservation = reserveAttachmentSet(agent.id, nextAttachments, provisional, removals);
       const previous = attachmentsForAgent(agent.id);
-      await applyAttachmentSet(agent, nextAttachments, { previousAttachments: previous });
-      for (const attachment of previous) dataAttachments.delete(attachment.id);
-      for (const attachment of nextAttachments) dataAttachments.set(attachment.id, attachment);
+      await applyAttachmentSet(agent, nextAttachments, { previousAttachments: previous, sources: sourceView });
       try {
-        await persistAgents();
+        await withStorageMutation(async () => {
+          for (const [sourceId, source] of provisional) dataSources.set(sourceId, source);
+          const removedSources = new Map();
+          for (const sourceId of removals) {
+            if (dataSources.has(sourceId)) removedSources.set(sourceId, dataSources.get(sourceId));
+            dataSources.delete(sourceId);
+          }
+          for (const attachment of previous) dataAttachments.delete(attachment.id);
+          for (const attachment of nextAttachments) dataAttachments.set(attachment.id, attachment);
+          try {
+            await persistAgents();
+          } catch (error) {
+            for (const attachment of nextAttachments) dataAttachments.delete(attachment.id);
+            for (const attachment of previous) dataAttachments.set(attachment.id, attachment);
+            for (const sourceId of provisional.keys()) dataSources.delete(sourceId);
+            for (const [sourceId, source] of removedSources) dataSources.set(sourceId, source);
+            throw error;
+          }
+        });
       } catch (error) {
-        for (const attachment of nextAttachments) dataAttachments.delete(attachment.id);
-        for (const attachment of previous) dataAttachments.set(attachment.id, attachment);
         try {
-          await applyAttachmentSet(agent, previous, { previousAttachments: nextAttachments });
+          await applyAttachmentSet(agent, previous, { previousAttachments: nextAttachments, sources: sourceView });
         } catch (rollbackError) {
           error.message = `${error.message}; restoring the previous attachment set also failed: ${rollbackError.message}`;
         }
         throw error;
       }
     } finally {
+      releaseReservation?.();
       release();
     }
   }
@@ -1110,8 +1185,7 @@ export function createControlPlane(options = {}) {
 
   async function handleDataAttachments(req, res, url, { mutationLocked = false } = {}) {
     const storagePath = url.pathname === '/api/v1/data-sources'
-      || /^\/api\/v1\/data-sources\/[^/]+$/.test(url.pathname)
-      || /^\/api\/v1\/agents\/[^/]+\/attachments(?:\/[^/]+)?$/.test(url.pathname);
+      || /^\/api\/v1\/data-sources\/[^/]+$/.test(url.pathname);
     if (!mutationLocked && storagePath && ['POST', 'PATCH', 'DELETE'].includes(req.method)) {
       return withStorageMutation(() => handleDataAttachments(req, res, url, { mutationLocked: true }));
     }
@@ -1153,7 +1227,10 @@ export function createControlPlane(options = {}) {
       }
       if (req.method === 'POST') {
         const body = await readJson(req);
-        const source = normalizeDataSource(body, { existingIds: new Set(dataSources.keys()), roots: attachmentRoots });
+        const source = normalizeDataSource(body, {
+          existingIds: new Set([...dataSources.keys(), ...pendingSourceIds()]),
+          roots: attachmentRoots
+        });
         if (source.kind === 'managed-volume') {
           if (!runtimeManager?.createManagedDataVolume) {
             throw Object.assign(new Error('Managed data volumes are unavailable'), { status: 503 });
@@ -1180,6 +1257,9 @@ export function createControlPlane(options = {}) {
       if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
       if (req.method === 'GET') return json(res, 200, { dataSource: publicDataSource(source, attachmentRoots) });
       if (req.method === 'PATCH') {
+        if (sourceHasPendingMutation(source.id)) {
+          throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
+        }
         const body = await readJson(req);
         if (body.id !== undefined && body.id !== source.id) {
           throw Object.assign(new Error('Data source id cannot be changed'), { status: 409 });
@@ -1204,6 +1284,9 @@ export function createControlPlane(options = {}) {
         return json(res, 200, { dataSource: publicDataSource(updated, attachmentRoots) });
       }
       if (req.method === 'DELETE') {
+        if (sourceHasPendingMutation(source.id)) {
+          throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
+        }
         if ([...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id)) {
           throw Object.assign(new Error('Detach this data source from every agent before deleting it'), { status: 409 });
         }
@@ -1258,21 +1341,20 @@ export function createControlPlane(options = {}) {
           id: `mapping-${randomUUID()}`,
           kind: 'host-directory',
           name: body.source.name ?? body.mountName ?? 'Mapped folder'
-        }, { existingIds: new Set(dataSources.keys()), roots: attachmentRoots });
+        }, { existingIds: new Set([...dataSources.keys(), ...pendingSourceIds()]), roots: attachmentRoots });
         source.scope = 'attachment';
         attachmentScoped = true;
-        dataSources.set(source.id, source);
       } else {
         source = dataSources.get(body.dataSourceId);
         if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
       }
       try {
         const attachment = normalizeAttachment(body, { agentId: agent.id, source, existing: current });
-        assertWriteLease(attachment, [...dataAttachments.values()], dataSources, attachmentRoots);
-        await commitAttachmentSet(agent, [...current, attachment]);
+        await commitAttachmentSet(agent, [...current, attachment], {
+          provisionalSources: attachmentScoped ? [source] : []
+        });
         return json(res, 201, { attachment: publicAttachment(attachment, source, attachmentRoots) });
       } catch (error) {
-        if (attachmentScoped) dataSources.delete(source.id);
         throw error;
       }
     }
@@ -1289,19 +1371,17 @@ export function createControlPlane(options = {}) {
         existing: current,
         defaults: existing
       });
-      assertWriteLease(updated, [...dataAttachments.values()].filter((attachment) => attachment.id !== existing.id), dataSources, attachmentRoots);
       await commitAttachmentSet(agent, current.map((attachment) => attachment.id === existing.id ? updated : attachment));
       return json(res, 200, { attachment: publicAttachment(updated, source, attachmentRoots) });
     }
     if (req.method === 'DELETE') {
-      await commitAttachmentSet(agent, current.filter((attachment) => attachment.id !== existing.id));
       const source = dataSources.get(existing.dataSourceId);
-      if (source?.scope === 'attachment'
-        && ![...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id)) {
-        dataSources.delete(source.id);
-        try { await persistAgents(); }
-        catch { dataSources.set(source.id, source); }
-      }
+      const nextAttachments = current.filter((attachment) => attachment.id !== existing.id);
+      const removeSourceIds = source?.scope === 'attachment'
+        && ![...dataAttachments.values()].some((attachment) => attachment.id !== existing.id && attachment.dataSourceId === source.id)
+        ? [source.id]
+        : [];
+      await commitAttachmentSet(agent, nextAttachments, { removeSourceIds });
       res.writeHead(204, { 'cache-control': 'no-store' });
       return res.end();
     }

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
-import { DockerRuntimeManager } from '../control-plane/docker-runtime.mjs';
+import { DockerRuntimeManager, dockerError } from '../control-plane/docker-runtime.mjs';
 import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
 import { normalizeOpenCodeEvent } from '../worker/adapters/opencode.mjs';
 
@@ -103,7 +103,7 @@ class FakeRuntimeManager {
   // Mirrors the real manager: a new container id, the same name and volumes, and
   // the currently configured image. Volumes are never touched.
   async recreate(runtime, { agentId = null, attachments = [], previousAttachments = attachments } = {}) {
-    this.onRecreate?.();
+    this.onRecreate?.(runtime);
     if (this.recreateDelay) await this.recreateDelay;
     this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes, attachments, previousAttachments });
     return {
@@ -940,7 +940,7 @@ test('data-source registry applies scoped mounts, persists them, and enforces ex
   assert.equal(JSON.stringify(persisted).includes('/Users/operator/Projects'), false, 'deployment roots leaked into the registry');
 });
 
-test('an attachment persistence failure restores the previous live mount set', async (t) => {
+test('an inline attachment persistence failure restores the runtime without leaking its provisional source', async (t) => {
   const token = 'storage-rollback-secret';
   const worker = createStatusWorker({ workerId: 'rollback-worker', token, authenticated: true });
   const workerUrl = await listen(worker);
@@ -969,18 +969,12 @@ test('an attachment persistence failure restores the previous live mount set', a
     })
   });
   const agent = (await response.json()).agent;
-  response = await fetch(`${controlUrl}/api/v1/data-sources`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      id: 'rollback-source', name: 'Rollback source', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
-    })
-  });
-  assert.equal(response.status, 201);
-
   await rm(registryDirectory, { recursive: true, force: true });
   await writeFile(registryDirectory, 'blocks the registry directory');
   response = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      dataSourceId: 'rollback-source', mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+      source: { name: 'Rollback source', rootId: 'projects', relativePath: 'repo' },
+      mountName: 'repo', access: 'read-write', purpose: 'working-directory'
     })
   });
   assert.equal(response.status, 500);
@@ -991,6 +985,8 @@ test('an attachment persistence failure restores the previous live mount set', a
   const state = await (await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`)).json();
   assert.deepEqual(state.attachments, []);
   assert.equal(state.workingDirectory, '/workspace');
+  const provisionalSourceId = manager.recreated[0].attachments[0].dataSourceId;
+  assert.equal((await fetch(`${controlUrl}/api/v1/data-sources/${provisionalSourceId}`)).status, 404);
 });
 
 test('simultaneous attachment requests cannot both acquire one write lease', async (t) => {
@@ -1037,6 +1033,77 @@ test('simultaneous attachment requests cannot both acquire one write lease', asy
   })));
   assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
   assert.equal(manager.recreated.length, 1, 'both concurrent requests replaced a runtime');
+});
+
+test('disjoint agents replace their containers concurrently and serialize only registry commits', async (t) => {
+  const token = 'storage-parallel-secret';
+  const worker = createStatusWorker({ workerId: 'parallel-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'parallel-worker', workerUrl, token },
+    { workerId: 'parallel-worker', workerUrl, token }
+  ]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  let releaseRecreates;
+  const recreateDelay = new Promise((resolve) => { releaseRecreates = resolve; });
+  t.after(() => {
+    releaseRecreates?.();
+    return Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+  });
+
+  const agents = await Promise.all(['Parallel one', 'Parallel two'].map(async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, adapter: 'claude-code', runtime: { mode: 'provision' }
+      })
+    });
+    return (await response.json()).agent;
+  }));
+  const sources = [];
+  for (const [index, relativePath] of ['repo-one', 'repo-two'].entries()) {
+    const response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        id: `parallel-${index}`, name: `Parallel ${index}`, kind: 'host-directory', rootId: 'projects', relativePath
+      })
+    });
+    sources.push((await response.json()).dataSource);
+  }
+
+  manager.recreateDelay = recreateDelay;
+  let markBothStarted;
+  const bothStarted = new Promise((resolve) => { markBothStarted = resolve; });
+  const started = new Set();
+  manager.onRecreate = (runtime) => {
+    started.add(runtime.id);
+    if (started.size === 2) markBothStarted();
+  };
+  const requests = agents.map((agent, index) => fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: sources[index].id, mountName: `repo-${index}`, access: 'read-write', purpose: 'data'
+    })
+  }));
+
+  await Promise.race([
+    bothStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('unrelated runtime replacements were serialized')), 500))
+  ]);
+  const sourceMutation = await fetch(`${controlUrl}/api/v1/data-sources/${sources[0].id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Must wait' })
+  });
+  assert.equal(sourceMutation.status, 409, 'a source changed while its replacement container was in flight');
+  releaseRecreates();
+  assert.deepEqual((await Promise.all(requests)).map((response) => response.status), [201, 201]);
 });
 
 test('a task cannot start while its runtime mount set is being replaced', async (t) => {
@@ -1285,7 +1352,81 @@ test('the shared container spec carries every setting a worker needs', async () 
   assert.deepEqual(mounts.map((mount) => mount.Source).sort(), Object.values(volumes).sort());
   assert.ok(mounts.every((mount) => mount.Type === 'volume'), 'a bind mount reached a managed runtime');
   assert.equal(body.HostConfig.NetworkMode, 'test-net');
+  assert.equal(body.User, '10001:10001', 'the worker UID drifted from the attachment validator UID');
   assert.ok(!body.HostConfig.Privileged);
+});
+
+test('Docker errors keep host-only details out of public messages', () => {
+  const error = dockerError(500, JSON.stringify({ message: 'bind source path does not exist: /Users/operator/Projects/private' }), '/containers/create');
+  assert.equal(error.status, 502);
+  assert.match(error.message, /status 500/);
+  assert.doesNotMatch(error.message, /Users\/operator/);
+  assert.match(error.dockerMessage, /Users\/operator/);
+  assert.equal(JSON.stringify({ error: error.message }).includes('/Users/operator'), false);
+});
+
+test('the attachment validator image is pulled once when a fresh engine lacks it', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  let inspections = 0;
+  let pulls = 0;
+  manager.request = async (method, path) => {
+    if (method === 'GET' && path.startsWith('/images/')) {
+      inspections += 1;
+      if (inspections === 1) throw dockerError(404, '{"message":"No such image"}', path);
+      return { Id: 'sha256:validator' };
+    }
+    if (method === 'POST' && path.startsWith('/images/create?')) {
+      pulls += 1;
+      return null;
+    }
+    throw new Error(`unexpected Docker call ${method} ${path}`);
+  };
+
+  await Promise.all([
+    manager.ensureAttachmentValidatorImage(),
+    manager.ensureAttachmentValidatorImage()
+  ]);
+  await manager.ensureAttachmentValidatorImage();
+  assert.equal(pulls, 1);
+  assert.equal(inspections, 2);
+});
+
+test('runtime replacement revalidates host mounts only after the old agent is gone', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const events = [];
+  manager.containerSpec = async ({ attachments }) => ({ image: 'worker:test', body: { attachments } });
+  manager.resolveContainer = async () => ({ id: 'old-container' });
+  manager.validateHostDirectory = async () => {
+    events.push('validate');
+    return '/approved/projects/repo';
+  };
+  manager.request = async (method, path, body) => {
+    if (method === 'DELETE' && path.startsWith('/containers/old-container')) {
+      events.push('delete-old');
+      return null;
+    }
+    if (method === 'POST' && path.startsWith('/containers/create?')) {
+      events.push('create-new');
+      assert.equal(body.attachments[0].mount.Source, '/approved/projects/repo');
+      return { Id: 'new-container' };
+    }
+    if (method === 'POST' && path === '/containers/new-container/start') return null;
+    if (method === 'GET' && path === '/containers/new-container/json') return { Image: 'sha256:worker' };
+    throw new Error(`unexpected Docker call ${method} ${path}`);
+  };
+  const runtime = {
+    id: 'runtime-race', adapter: 'claude-code', workerId: 'worker-race', workerToken: 'token-race',
+    containerId: 'old-container', containerName: 'agent-dock-runtime-race',
+    volumes: { auth: 'auth', binary: 'binary', telemetry: 'telemetry', workspace: 'workspace' }
+  };
+  const attachment = {
+    id: 'attachment-race', purpose: 'data', target: '/data/repo',
+    mount: { Type: 'bind', Source: '/preflight/repo', Target: '/data/repo', ReadOnly: false },
+    hostDirectory: { rootId: 'projects', relativePath: 'repo', access: 'read-write', adapter: 'claude-code' }
+  };
+
+  await manager.recreate(runtime, { agentId: 'agent-race', attachments: [attachment], previousAttachments: [] });
+  assert.deepEqual(events, ['delete-old', 'validate', 'create-new']);
 });
 
 test('destructive runtime operations cannot overlap', async () => {

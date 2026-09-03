@@ -71,6 +71,7 @@ h3 { font-size: 17px; margin: 0; letter-spacing: -.015em; }
 .runtime-title h2 { font-size: 18px; }
 .runtime-title small { display: block; color: var(--muted); margin-top: 3px; font: 10px ui-monospace, monospace; }
 .runtime-icon { width: 34px; height: 34px; display: grid; place-items: center; color: var(--ground); background: var(--aqua); border-radius: 2px; font: 800 14px ui-monospace, monospace; }
+.runtime-error { margin: 0 0 10px; padding: 8px 10px; overflow-wrap: anywhere; color: #ffb0b0; background: #ff6b6b0b; border: 1px solid #814141; font: 10px/1.45 ui-monospace, monospace; }
 .runtime-summary-metrics { display: grid; grid-template-columns: 1.5fr 1.35fr repeat(3, 1fr); margin: 0; border: 1px solid var(--line); }
 .runtime-summary-metrics div { min-width: 0; padding: 10px 12px; border-right: 1px solid var(--line); }
 .runtime-summary-metrics div:last-child { border-right: 0; }

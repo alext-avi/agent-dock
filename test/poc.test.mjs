@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -15,6 +15,60 @@ async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return `http://127.0.0.1:${server.address().port}`;
+}
+
+function beginPartialJsonRequest(url, { method, first, rest }) {
+  let request;
+  let ended = false;
+  let markSent;
+  const sent = new Promise((resolve) => { markSent = resolve; });
+  const response = new Promise((resolve, reject) => {
+    request = httpRequest(url, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        'transfer-encoding': 'chunked'
+      }
+    }, (incoming) => {
+      const chunks = [];
+      incoming.on('data', (chunk) => chunks.push(chunk));
+      incoming.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let body = {};
+        try { body = text ? JSON.parse(text) : {}; } catch { body = { text }; }
+        resolve({ status: incoming.statusCode, body });
+      });
+    });
+    request.on('error', reject);
+    request.write(first, markSent);
+  });
+  return {
+    sent,
+    response,
+    finish() {
+      if (ended) return;
+      ended = true;
+      request.end(rest);
+    },
+    abort() {
+      ended = true;
+      request.destroy();
+    }
+  };
+}
+
+async function within(promise, message, timeoutMs = 2_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function createStatusWorker({ workerId, token, authenticated }) {
@@ -1106,6 +1160,100 @@ test('disjoint agents replace their containers concurrently and serialize only r
   assert.deepEqual((await Promise.all(requests)).map((response) => response.status), [201, 201]);
 });
 
+test('caller-paced data-source mutations cannot overtake attachment reservations', async (t) => {
+  const token = 'storage-source-race-secret';
+  const worker = createStatusWorker({ workerId: 'source-race-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'source-race-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  let releaseRecreate;
+  const partialRequests = [];
+  t.after(() => {
+    releaseRecreate?.();
+    for (const partial of partialRequests) partial.abort();
+    return Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+  });
+
+  const agent = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Source race', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  })).json()).agent;
+  let response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'source-race', name: 'Source race', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  async function raceMutationWithAttachment({ method, first, rest, mountName }) {
+    const mutation = beginPartialJsonRequest(`${controlUrl}/api/v1/data-sources/source-race`, { method, first, rest });
+    partialRequests.push(mutation);
+    await within(mutation.sent, `${method} partial request never reached the socket`);
+    // The first chunk has reached the socket. Give the server one event-loop
+    // turn to enter readJson and block on the deliberately unfinished body.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    let markRecreateStarted;
+    const recreateStarted = new Promise((resolve) => { markRecreateStarted = resolve; });
+    manager.recreateDelay = new Promise((resolve) => { releaseRecreate = resolve; });
+    manager.onRecreate = markRecreateStarted;
+    const attachment = fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        dataSourceId: 'source-race', mountName, access: 'read-write', purpose: 'data'
+      })
+    }).then(async (result) => ({ status: result.status, body: await result.json() }));
+    const firstOutcome = await within(Promise.race([
+      recreateStarted.then(() => ({ kind: 'recreate' })),
+      attachment.then((result) => ({ kind: 'response', result }))
+    ]), `${method} attachment never reached runtime replacement`);
+    assert.equal(
+      firstOutcome.kind,
+      'recreate',
+      `${method} attachment failed before runtime replacement: ${JSON.stringify(firstOutcome.result)}`
+    );
+    mutation.finish();
+    const mutationResult = await within(mutation.response, `${method} did not finish after its body was released`);
+    assert.equal(mutationResult.status, 409, `${method} passed a reservation created while its body was streaming`);
+    assert.match(mutationResult.body.error, /in-flight attachment change/);
+    releaseRecreate();
+    releaseRecreate = null;
+    manager.recreateDelay = null;
+    manager.onRecreate = null;
+    const attachmentResponse = await within(attachment, `${method} attachment did not finish after runtime release`);
+    assert.equal(attachmentResponse.status, 201);
+    return attachmentResponse.body.attachment;
+  }
+
+  const patchedRace = await raceMutationWithAttachment({
+    method: 'PATCH',
+    first: '{"relativePath":',
+    rest: '"moved"}',
+    mountName: 'patch-race'
+  });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal((await response.json()).dataSource.root.relativePath, 'repo', 'the rejected PATCH changed the source');
+  response = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments/${patchedRace.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 204);
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal(response.status, 200, 'detaching a shared source removed it before the DELETE race');
+
+  await raceMutationWithAttachment({ method: 'DELETE', first: '{', rest: '}', mountName: 'delete-race' });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal(response.status, 200, 'the rejected DELETE orphaned the live attachment');
+});
+
 test('a task cannot start while its runtime mount set is being replaced', async (t) => {
   const token = 'storage-task-race-secret';
   const worker = createStatusWorker({ workerId: 'task-race-worker', token, authenticated: true });
@@ -1200,6 +1348,14 @@ test('refreshing a runtime replaces its container while retaining every volume',
   assert.equal(body.runtime.id, before.id, 'refreshing must not change runtime identity');
   assert.equal(body.runtime.binding, 'dedicated', 'exclusivity must survive a refresh');
   assert.equal(body.runtime.attachmentCount, 1);
+  assert.equal(body.mcpReapplied, false, 'the stub worker unexpectedly accepted MCP configuration');
+  assert.match(body.runtime.lastError, /MCP configuration could not be re-applied/);
+  const afterFailedReapply = (await (await fetch(`${controlUrl}/api/v1/agents/${created.id}`)).json()).agent;
+  assert.equal(
+    afterFailedReapply.runtime.lastError,
+    body.runtime.lastError,
+    'the refresh failure disappeared after the mutating response'
+  );
 
   // The credential lives in the auth volume. Retaining it is the entire point:
   // a refresh that dropped it would force a fresh provider login.

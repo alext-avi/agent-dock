@@ -82,6 +82,13 @@ test('attachment validation enforces one working directory and exclusive overlap
     agentId: 'agent-b', source: aliased
   });
   assert.throws(() => assertWriteLease(aliasWriter, [first], aliasedSources, aliasedRoots), /overlaps agent agent-a/);
+
+  const missingSources = new Map([[child.id, child]]);
+  assert.throws(
+    () => assertWriteLease(secondAgent, [first], missingSources, roots),
+    /Attachment .* refers to a missing data source/,
+    'corrupt attachment state silently stopped holding its write lease'
+  );
 });
 
 test('container specs add exact mounts and move the task working directory', async () => {

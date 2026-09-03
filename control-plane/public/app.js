@@ -140,6 +140,7 @@ const ui = {
   agentName: $('#agent-name'),
   runtimeIcon: $('#runtime-icon'),
   runtimeLocation: $('#runtime-location'),
+  runtimeError: $('#runtime-error'),
   cliVersion: $('#cli-version'),
   runtimeModel: $('#runtime-model'),
   authState: $('#auth-state'),
@@ -347,6 +348,13 @@ function renderRuntimeDrift() {
   ui.runtimeDrift.disabled = false;
   ui.runtimeDrift.textContent = 'image update available · refresh';
   ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
+  renderRuntimeError(runtimeDrift.get(currentAgent?.runtime?.id) ?? currentAgent?.runtime);
+}
+
+function renderRuntimeError(runtime = {}) {
+  const message = typeof runtime?.lastError === 'string' ? runtime.lastError.trim() : '';
+  ui.runtimeError.textContent = message;
+  ui.runtimeError.classList.toggle('hidden', !message);
 }
 
 function runtimeIsOutdated(runtime) {
@@ -1208,6 +1216,7 @@ function populateAgentConfig(agent) {
   ui.agentName.textContent = plannedHarness;
   ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
   ui.runtimeLocation.textContent = `${runtimeLabel(agent.runtime)} · ${agent.runtime?.workerId || 'no worker identity'}`;
+  renderRuntimeError(agent.runtime);
 }
 
 function renderProviderConnections(result = {}) {
@@ -1920,6 +1929,7 @@ async function refreshRuntimeImage() {
   try {
     const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
     currentAgent.runtime = result.runtime;
+    renderRuntimeError(result.runtime);
     setConnection('online', `Runtime refreshed onto ${result.runtime.image || 'the current image'}`);
     await loadRuntimeDrift();
     await refreshStatus();

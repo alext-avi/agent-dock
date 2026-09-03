@@ -87,7 +87,8 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
       state: 'unprovisioned',
       credentials: 'none',
       storage: { auth: 'none', binary: 'none', telemetry: 'none', workspace: 'none', attachments: 0 },
-      workingDirectory: null
+      workingDirectory: null,
+      lastError: null
     };
   }
   const resolvedBinding = binding
@@ -117,6 +118,9 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
     // True when the configured image has been rebuilt since this container was
     // created, null when either side is unknown. Refreshing clears it.
     outdated: runtime.outdated ?? null,
+    // Runtime-level recovery failures must remain visible after the mutating
+    // request completes. This never contains connector credential values.
+    lastError: runtime.lastError ? String(runtime.lastError).slice(0, 4_000) : null,
     createdAt: runtime.createdAt ?? null,
     updatedAt: runtime.updatedAt ?? null
   };
@@ -1305,10 +1309,13 @@ export function createControlPlane(options = {}) {
       if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
       if (req.method === 'GET') return json(res, 200, { dataSource: publicDataSource(source, attachmentRoots) });
       if (req.method === 'PATCH') {
+        const body = await readJson(req);
+        // Request bodies are caller-paced. Re-check only after the final await
+        // and keep the check-to-write section synchronous so an attachment
+        // reservation cannot appear between the guard and the registry update.
         if (sourceHasPendingMutation(source.id)) {
           throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
         }
-        const body = await readJson(req);
         if (body.id !== undefined && body.id !== source.id) {
           throw Object.assign(new Error('Data source id cannot be changed'), { status: 409 });
         }
@@ -1332,15 +1339,17 @@ export function createControlPlane(options = {}) {
         return json(res, 200, { dataSource: publicDataSource(updated, attachmentRoots) });
       }
       if (req.method === 'DELETE') {
+        const body = await readJson(req);
+        if (source.kind === 'managed-volume' && (body.confirmation !== source.id || body.deleteVolume !== true)) {
+          throw Object.assign(new Error('Deleting a managed volume requires deleteVolume=true and confirmation matching the data source id'), { status: 400 });
+        }
+        // Do not put an await between these guards and delete: attachment
+        // reservations are made synchronously on the same event loop.
         if (sourceHasPendingMutation(source.id)) {
           throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
         }
         if ([...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id)) {
           throw Object.assign(new Error('Detach this data source from every agent before deleting it'), { status: 409 });
-        }
-        const body = await readJson(req);
-        if (source.kind === 'managed-volume' && (body.confirmation !== source.id || body.deleteVolume !== true)) {
-          throw Object.assign(new Error('Deleting a managed volume requires deleteVolume=true and confirmation matching the data source id'), { status: 400 });
         }
         dataSources.delete(source.id);
         try {
@@ -1492,6 +1501,10 @@ export function createControlPlane(options = {}) {
       } catch (error) {
         reapplied = false;
         runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+        await persistAgents();
+      }
+      if (reapplied && runtime.lastError) {
+        runtime.lastError = null;
         await persistAgents();
       }
       return json(res, 200, {

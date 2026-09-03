@@ -183,7 +183,10 @@ export function assertWriteLease(candidate, attachments, sources, roots = null) 
   for (const other of attachments) {
     if (other.id === candidate.id || other.access !== 'read-write') continue;
     const otherSource = sources.get(other.dataSourceId);
-    if (!otherSource) continue;
+    // An attachment without its source is corrupt registry state, not evidence
+    // that the mounted path is safe. Skipping it would erase that writer from
+    // the overlap check and could grant a second agent the same writable tree.
+    if (!otherSource) throw bad(`Attachment ${other.id} refers to a missing data source`, 409);
     const overlaps = source.kind === 'managed-volume'
       ? otherSource.kind === 'managed-volume' && otherSource.id === source.id
       : otherSource.kind === 'host-directory' && hostIntervalsOverlap(source, otherSource, roots);

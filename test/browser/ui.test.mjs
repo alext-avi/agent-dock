@@ -594,6 +594,19 @@ test('image drift is shown only for a managed runtime that is behind', async (t)
   assert.match(await agentPage.locator('#refresh-runtime').textContent(), /update available/);
 });
 
+test('a persisted runtime recovery failure remains visible on the agent page', async (t) => {
+  const agent = app.agents['claude-code'];
+  const runtime = app.runtimeManager.provisioned.find((candidate) => candidate.id === agent.runtime.id);
+  runtime.lastError = 'MCP configuration could not be re-applied after refresh: validation failed';
+  t.after(() => { runtime.lastError = null; });
+
+  const page = await openPage(`/agents/${agent.id}`);
+  t.after(() => page.close());
+  const alert = page.locator('#runtime-error');
+  await alert.waitFor({ state: 'visible' });
+  assert.match(await alert.textContent(), /MCP configuration could not be re-applied/);
+});
+
 test('the status poll cannot re-enable a runtime refresh that is still running', async (t) => {
   const page = await openPage(`/agents/${app.agents['codex-cli'].id}`);
   t.after(() => page.close());

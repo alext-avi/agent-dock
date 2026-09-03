@@ -25,6 +25,9 @@ export const openCodeMcpCapabilities = Object.freeze({
   // Advertised so the control plane can refuse to send a credentialId
   // definition to a worker that would apply it with no header at all.
   credentialDelivery: true,
+  // A definition may carry ${NAME} in an argument, a url, a header or an
+  // environment value, and the worker fills it at the last moment.
+  placeholders: true,
   localCommandPolicy: 'allowlist'
 });
 

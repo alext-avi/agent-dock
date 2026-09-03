@@ -271,6 +271,15 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       return { header: record.header, value: open(record.sealed, keyProvider.key()) };
     },
 
+    // A local process has no destination, so a host list cannot constrain where
+    // this value goes. Deliberately a separate, named method: reusing
+    // resolveForHost with a fabricated url would hide that the check did not
+    // happen, and this way the one caller that skips it is visible.
+    resolveForLocalProcess(id) {
+      const record = requireRecord(id);
+      return { header: record.header, value: open(record.sealed, keyProvider.key()) };
+    },
+
     // Constant-time comparison, used by tests and by any future verification path
     // so a value is never compared with ===.
     matches(id, candidate) {

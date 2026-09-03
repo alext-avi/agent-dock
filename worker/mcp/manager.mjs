@@ -92,6 +92,80 @@ function applyDeliveredCredentials(resolved, server, delivered) {
   resolved.headers[credential.header] = credential.value;
 }
 
+// Placeholders: one mechanism instead of three.
+//
+// A definition is written the way the connector actually looks, with ${NAME}
+// wherever a secret belongs — an argument, a url, a header, an environment
+// value. The presence of a placeholder is what declares that a binding is
+// needed; there is no separate question about whether the connector has
+// authentication, and nothing to ask when it has none.
+//
+// Substitution happens here, at the last possible moment, and the value is never
+// written back into the stored definition. A value substituted into argv is
+// readable by other processes in that same container, which is the same trust
+// boundary as its environment — the agent can already read its own secrets — but
+// it is a real difference from the environment on any host that shares a process
+// table, so it is documented rather than glossed.
+export const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+export function placeholderNames(server) {
+  const found = new Set();
+  const scan = (value) => {
+    if (typeof value !== 'string') return;
+    for (const match of value.matchAll(PLACEHOLDER)) found.add(match[1]);
+  };
+  scan(server?.url);
+  scan(server?.cwd);
+  for (const argument of server?.args ?? []) scan(argument);
+  for (const value of Object.values(server?.headers ?? {})) scan(value);
+  for (const value of Object.values(server?.environment ?? {})) scan(value);
+  return [...found];
+}
+
+function unboundPlaceholder(name) {
+  const error = new Error(
+    `The placeholder ${name} has no value. Bind it to a stored key or a connector secret, `
+    + 'or remove it from the definition.'
+  );
+  error.status = 409;
+  error.code = 'unbound_placeholder';
+  return error;
+}
+
+// Values come from two places and neither is the definition: a credential the
+// control plane resolved and delivered for this apply, or a connector secret
+// provisioned in this container's own MCP_SECRET_ namespace.
+function placeholderValues(server, environment, delivered) {
+  const values = {};
+  for (const name of placeholderNames(server)) {
+    const binding = server.placeholders?.[name];
+    if (!binding) throw unboundPlaceholder(name);
+    if (binding.source === 'credential') {
+      const credential = delivered?.[name];
+      if (!credential) {
+        const error = new Error(
+          `The stored key for ${name} was not delivered with this configuration. `
+          + 'Delivered values are held in memory, so a worker restart needs a fresh apply.'
+        );
+        error.status = 409;
+        error.code = 'missing_credential';
+        throw error;
+      }
+      values[name] = credential.value;
+      continue;
+    }
+    const value = environment[binding.name];
+    if (value === undefined) throw missingSecret(binding.name);
+    values[name] = value;
+  }
+  return values;
+}
+
+function fill(value, values) {
+  if (typeof value !== 'string') return value;
+  return value.replace(PLACEHOLDER, (whole, name) => (name in values ? values[name] : whole));
+}
+
 function resolveServers(servers, environment, { requireSecrets, credentials } = {}) {
   return servers.map((server) => {
     const resolved = clone(server);
@@ -108,6 +182,21 @@ function resolveServers(servers, environment, { requireSecrets, credentials } = 
       const value = environment[reference.sourceEnv];
       if (value === undefined && requireSecrets) throw missingSecret(reference.sourceEnv);
       if (value !== undefined) resolved.headers[header] = `${reference.prefix ?? ''}${value}`;
+    }
+
+    // Fill the definition itself. Only when secrets are required: validation runs
+    // without them and must not report a shape nobody will ever run.
+    if (requireSecrets) {
+      const values = placeholderValues(server, environment, credentials);
+      resolved.url = fill(resolved.url, values);
+      resolved.cwd = fill(resolved.cwd, values);
+      resolved.args = (resolved.args ?? []).map((argument) => fill(argument, values));
+      for (const [header, value] of Object.entries(resolved.headers)) {
+        resolved.headers[header] = fill(value, values);
+      }
+      for (const [key, value] of Object.entries(resolved.environment)) {
+        resolved.environment[key] = fill(value, values);
+      }
     }
     return resolved;
   });

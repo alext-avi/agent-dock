@@ -61,3 +61,30 @@ Connector secrets are provisioned under the `MCP_SECRET_` namespace, separately 
 ## Control-plane MCP privilege boundary
 
 The future control-plane MCP server will call selected internal control-plane services rather than the browser routes. Its tool registry is an explicit allowlist and will not register tools that create, update, delete, bind, unbind, or apply MCP definitions. It will also omit storage, volume, and mount mutation tools. Those administrative capabilities remain available only through the authenticated operator REST/UI surface. This is a code-level capability boundary, not a prompt instruction.
+
+## What a key's host list does, and does not do
+
+A stored key may name the hosts it is for. That list is compared with the
+connector definition's `url` in the control plane, at the moment configuration is
+applied, and an apply is refused when the two disagree.
+
+That is the whole mechanism, so it is worth being exact about its reach:
+
+- **It is not egress control.** No DNS restriction, proxy, or network policy is
+  applied to a runtime container. Once a worker holds a value it can send it
+  anywhere it can reach, and an agent can read its own secrets by design.
+- **It is an integrity check on the definition.** What it prevents is a
+  connector's `url` being edited to point a key somewhere it was not issued for,
+  which is the shape an earlier review found reachable in two calls.
+- **A local process has no destination to check.** A `stdio` connector has no
+  `url`, so the list is not consulted; that path is a separately named
+  `resolveForLocalProcess` so the one caller that skips the check is visible.
+- **An empty list means no restriction.** The allowlist is opt-in, so a key that
+  names no hosts is accepted for any destination.
+
+A hostname is resolved inside the agent's own container, which is the part most
+likely to surprise. `127.0.0.1` and `localhost` mean that container, not the
+machine running Agent Dock and not another container. A proxy running elsewhere
+is reached by its container or service name on the shared Docker network, or by
+`host.docker.internal` for the host — the same name the bundled OpenCode worker
+uses to reach Ollama.

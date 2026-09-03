@@ -1406,11 +1406,30 @@ function bindingLabel(binding) {
         ' exists but has no value yet. Add its value under Stored keys below, or this connector cannot start.'
       ];
     }
-    // Whether the key is limited to anywhere is now the operator's choice, so
-    // say which it is rather than implying a restriction that may not exist.
+    // A host list is checked against this connector's url when the definition is
+    // saved. It is not egress control: nothing stops the agent sending the value
+    // somewhere else once it holds it, and a local process has no url to check
+    // at all. Saying "limited to" implied an enforcement that does not exist.
+    if (ui.mcpTransport.value === 'stdio') {
+      return [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. A local process has no URL, so its host list is not consulted here.'
+      ];
+    }
     return credential.restricted
-      ? ['Uses the stored key ', { code: credential.name }, ', which is limited to ', { code: credential.hosts.join(', ') }, '.']
-      : ['Uses the stored key ', { code: credential.name }, '. It is not limited to any host, so it can be sent wherever this connector points.'];
+      ? [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. This connector\'s URL is checked against ',
+        { code: credential.hosts.join(', ') },
+        ' when you save — that stops the URL being changed to redirect the key, not the agent from using it elsewhere.'
+      ]
+      : [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. It names no hosts, so nothing checks where this connector points.'
+      ];
   }
   return [
     'Read from ',

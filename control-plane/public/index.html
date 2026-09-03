@@ -402,7 +402,7 @@
         <div class="dialog-heading"><div><p class="kicker">CONNECTOR CREDENTIAL</p><h2 id="credential-dialog-title">New credential</h2></div><button id="close-credential-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">The value is write-only. Once saved it is never displayed or returned again — only the last four characters, so you can recognise a key you already hold.</p>
         <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company-docs"></label>
-        <label class="field">Permitted hosts <span>optional; one per line. Left empty, this key is not limited to any host.</span><textarea id="credential-hosts" rows="3" placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
+        <label class="field">Permitted hosts <span>optional; one per line. Checked against a connector's URL when it is saved — not egress control, and not consulted for a local process. Hostnames resolve inside the agent's container, so a proxy elsewhere is its container name or <code>host.docker.internal</code>, never <code>127.0.0.1</code>.</span><textarea id="credential-hosts" rows="3" placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
         <details class="credential-advanced">
           <summary>Send as a header (older connectors only)</summary>
           <label class="field">Header <span>not needed when a connector uses a placeholder</span><input id="credential-header" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="X-Api-Key"></label>

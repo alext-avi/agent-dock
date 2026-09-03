@@ -1138,8 +1138,9 @@ test('a key named after the placeholder is preselected', async (t) => {
   await row.waitFor();
   assert.match(await row.locator('select').inputValue(), /^credential:/);
   assert.match(await row.textContent(), /Uses the stored key/);
-  // And it says the key is unrestricted, rather than implying a limit it has not got.
-  assert.match(await row.textContent(), /not limited to any host/);
+  // And it describes the mechanism rather than implying an enforcement that does
+  // not exist: an unrestricted key means nothing checks the destination at all.
+  assert.match(await row.textContent(), /names no hosts, so nothing checks where this connector points/);
 });
 
 test('a placeholder with no key can create one to complete', async (t) => {
@@ -1183,4 +1184,32 @@ test('a placeholder with no key can create one to complete', async (t) => {
     const row = [...document.querySelectorAll('.credential-row')].find((node) => node.textContent.includes('BRAND_NEW_TOKEN'));
     return row && !row.textContent.includes('needs a value');
   });
+});
+
+test('a local process is not described as limited by a host list', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-credential');
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'SCOPED_KEY');
+  await page.fill('#credential-hosts', 'only.example.test');
+  await page.fill('#credential-value', 'sk-scoped-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.locator('.credential-row', { hasText: 'SCOPED_KEY' }).waitFor();
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${SCOPED_KEY}');
+
+  // A stdio connector has no url, so the host list is never consulted. Saying it
+  // is "limited to only.example.test" here would describe a check that does not
+  // happen — the value is handed to a local process either way.
+  const row = page.locator('.placeholder-row', { hasText: 'SCOPED_KEY' });
+  await row.waitFor();
+  const text = await row.textContent();
+  assert.match(text, /no URL, so its host list is not consulted/);
+  assert.doesNotMatch(text, /limited to/i);
+  assert.doesNotMatch(text, /only\.example\.test/);
 });

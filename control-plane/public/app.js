@@ -1467,7 +1467,9 @@ const WORKSHOP_LOG_LIMIT = 60;
 // Every line says who produced it. The operator's own words were being styled
 // with the class named for the model and rendered brighter than the model's
 // output, which makes a transcript impossible to read honestly.
-function workshopNote(speaker, text, kind = '', token = workshopRunToken) {
+function workshopNote(speaker, text, kind, token) {
+  // The token is required, not defaulted. Defaulting it to the current token
+  // made this comparison always false, which is the whole point of the check.
   if (!text || token !== workshopRunToken) return;
   const line = document.createElement('p');
   line.className = [kind, speaker === 'you' ? 'from-operator' : 'from-harness'].filter(Boolean).join(' ');
@@ -1483,6 +1485,12 @@ function workshopNote(speaker, text, kind = '', token = workshopRunToken) {
 }
 
 async function prepareWorkshop(server) {
+  // Bump first, then capture, so the token this call owns is a fact rather than
+  // a prediction about a later line.
+  workshopRunToken += 1;
+  const token = workshopRunToken;
+  workshopAbort?.abort();
+  workshopAbort = null;
   workshopConversationId = null;
   workshopConversationAgentId = null;
   workshopTurns = 0;
@@ -1495,17 +1503,17 @@ async function prepareWorkshop(server) {
   // A run that threw outside the try used to leave this disabled for the life of
   // the page, so the button silently did nothing ever again.
   ui.workshopRun.disabled = false;
-  workshopRunToken += 1;
-  workshopAbort?.abort();
-  workshopAbort = null;
-  // Only offered when defining something new. Editing an existing connector is
-  // a deliberate act on a known shape, not a question for a harness.
-  // Hidden until the harness list is known: it used to appear at once with
-  // "No agents available" as its only option, then either fill in or vanish.
+  // Only offered when defining something new — editing a known shape is a
+  // deliberate act, not a question — and hidden until the harness list is known,
+  // because it used to appear at once with "No agents available" as its only
+  // option and then either fill in or vanish.
   ui.workshop.classList.add('hidden');
   if (server) return;
   try {
     const { agents } = await api(`${API_ROOT}/agents`);
+    // The dialog may have been closed and reopened for something else while
+    // this was in flight.
+    if (token !== workshopRunToken) return;
     const usable = (agents ?? []).filter((agent) => agent.runtime);
     ui.workshopAgent.replaceChildren();
     if (!usable.length) {
@@ -1556,10 +1564,10 @@ async function runWorkshop() {
   workshopRunning = true;
   ui.workshopRun.disabled = true;
   ui.workshopStatus.textContent = 'Asking…';
-  workshopNote('you', objective);
 
   const token = workshopRunToken;
   const mine = () => token === workshopRunToken;
+  workshopNote('you', objective, '', token);
   workshopAbort?.abort();
   const abort = new AbortController();
   workshopAbort = abort;
@@ -1584,9 +1592,10 @@ async function runWorkshop() {
     // feature, so ask again without one and tell the operator what they lost.
     if (response.status === 409 && workshopContinuity) {
       const failure = await response.clone().json().catch(() => ({}));
+      if (!mine()) return;
       if (/cannot continue a conversation/i.test(failure.error ?? '')) {
         workshopContinuity = false;
-        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'failed');
+        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'failed', token);
         response = await workshopDispatch(agentId, buildMcpWorkshopPrompt(objective), null, abort);
       }
     }
@@ -1613,12 +1622,12 @@ async function runWorkshop() {
         observeWorkshopRunEvent(runState, event);
         if (event.type === 'message.completed' && event.data?.text) {
           output += `${event.data.text}\n`;
-          workshopNote('harness', event.data.text);
+          workshopNote('harness', event.data.text, '', token);
         }
         if (event.type === 'activity.started' && event.data?.name) {
           ui.workshopStatus.textContent = `Working — ${event.data.name}`;
         }
-        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'failed');
+        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'failed', token);
       }
       if (done) {
         if (!buffer.trim()) break;
@@ -1628,6 +1637,9 @@ async function runWorkshop() {
           if (event.type === 'message.completed' && event.data?.text) {
             output += `${event.data.text}\n`;
             workshopNote('harness', event.data.text, '', token);
+          }
+          if (event.type === 'error' && event.data?.message) {
+            workshopNote('harness', event.data.message, 'failed', token);
           }
         } catch { /* a partial final line is not an event */ }
         break;
@@ -1642,7 +1654,7 @@ async function runWorkshop() {
     requireSuccessfulWorkshopRun(runState);
     const { proposal, warnings } = extractMcpWorkshopProposal(output);
     applyProposalToForm(proposal);
-    for (const warning of warnings) workshopNote('harness', warning, 'failed');
+    for (const warning of warnings) workshopNote('harness', warning, 'failed', token);
 
     workshopTurns += 1;
 
@@ -1651,12 +1663,12 @@ async function runWorkshop() {
     // something checked. This proves payload and adapter policy compatibility —
     // not that the connector works, and not that its credentials are right.
     ui.workshopStatus.textContent = 'Checking the proposal against this harness…';
-    const checked = await checkProposal(agentId, proposal);
+    const checked = await checkProposal(agentId, proposal, token, abort.signal);
     if (mine()) ui.workshopStatus.textContent = checked;
   } catch (error) {
     if (!mine() || error.name === 'AbortError') return;
     // Not fatal: the exchange stays open so the next ask is a correction.
-    workshopNote('harness', error.message, 'failed');
+    workshopNote('harness', error.message, 'failed', token);
     ui.workshopStatus.textContent = 'Nothing was filled in. Tell it what was wrong and ask again.';
   } finally {
     if (mine()) {
@@ -1681,24 +1693,32 @@ function workshopDispatch(agentId, prompt, conversationId, abort) {
   const body = conversationId ? { prompt, conversationId } : { prompt };
   return fetch(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/tasks`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    // Same headers api() would send. This reads the stream itself rather than
+    // going through api(), which must not mean losing the CSRF header: without
+    // it an OIDC session refuses the request outright.
+    headers: { 'content-type': 'application/json', 'x-agent-dock-csrf': '1' },
     body: JSON.stringify(body),
     signal: abort.signal
   });
 }
 
-async function checkProposal(agentId, proposal) {
+async function checkProposal(agentId, proposal, token, signal) {
   try {
     const result = await api(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/mcp/validate`, {
       method: 'POST',
-      body: JSON.stringify({ server: proposal })
+      body: JSON.stringify({ server: proposal }),
+      signal
     });
     const warnings = result.mcp?.validation?.warnings?.length ?? 0;
     return `Filled in below. Valid for this harness${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
   } catch (error) {
-    // Worth filling in anyway: the operator can fix it in the form. But say so.
-    workshopNote('harness', error.message, 'failed');
-    return 'Filled in below, but this harness rejected the shape. Review and correct before saving.';
+    workshopNote('harness', error.message, 'failed', token);
+    // Only a 400 is the adapter judging the shape. A duplicate name, an unknown
+    // agent, or an unreachable worker are the control plane's own answers and
+    // never reach the harness at all, so they must not be reported as its verdict.
+    return error.status === 400
+      ? 'Filled in below, but this harness rejected the shape. Review and correct before saving.'
+      : 'Filled in below. The compatibility check could not be completed, so nothing about the shape was confirmed.';
   }
 }
 
@@ -2645,6 +2665,7 @@ async function loadCredentials() {
     const result = await api(`${API_ROOT}/credentials`);
     storedCredentials = result.credentials ?? [];
     credentialsLoaded = true;
+    ui.credentialListMessage.textContent = '';
     renderCredentialStorage(result.storage ?? {});
     renderCredentials();
     ui.credentialsRefreshed.textContent = `${storedCredentials.length} stored`;

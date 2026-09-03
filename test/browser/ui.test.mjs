@@ -845,3 +845,42 @@ test('a runtime that cannot carry a conversation still gets a proposal, and says
   const log = await page.locator('#workshop-log').textContent();
   assert.match(log ?? '', /cannot carry a conversation/i);
 });
+
+test('a slow harness list cannot reveal the workshop inside an edit dialog', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // Define something to edit.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'existing-shape');
+  await page.fill('#mcp-url', 'https://existing-shape.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'existing-shape' });
+  await row.waitFor();
+
+  // Now make the harness list slow. Opening New starts that fetch; switching to
+  // Edit before it resolves used to let the reveal land in the edit dialog — and
+  // a run from there rewrites a saved connector into the model's proposed shape,
+  // because the definition id is populated and Save becomes a PATCH.
+  await page.route('**/api/v1/agents', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await route.continue();
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.click('#cancel-mcp');
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.inputValue('#mcp-name'), 'existing-shape');
+
+  // Long enough for the earlier list request to have resolved.
+  await page.waitForTimeout(4000);
+  assert.equal(
+    await page.locator('#workshop').isVisible(),
+    false,
+    'the workshop was revealed while editing a saved connector'
+  );
+});

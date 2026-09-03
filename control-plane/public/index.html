@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=8">
+    <link rel="stylesheet" href="/styles.css?v=10">
   </head>
   <body>
     <header class="topbar">
@@ -145,6 +145,7 @@
               <span id="worker-state" class="pill neutral">checking</span>
               <button id="runtime-drift" type="button" class="pill warn hidden" title="Replace this runtime with a container built from the current image, keeping its volumes">image update available · refresh</button>
             </div>
+            <p id="runtime-error" class="runtime-error hidden" role="alert"></p>
             <dl class="runtime-summary-metrics">
               <div><dt>HARNESS</dt><dd id="cli-version">—</dd></div>
               <div><dt>MODEL</dt><dd id="runtime-model">provider default</dd></div>
@@ -278,15 +279,21 @@
             <article class="panel workspace-panel">
               <div class="panel-heading">
                 <div><p class="kicker">ATTACHED VOLUME</p><h2>Workspace</h2></div>
-                <span class="pill ready">read / write</span>
+                <span id="workspace-access" class="pill ready">read / write</span>
               </div>
-              <div class="mount-summary"><code>/workspace</code><span>Primary durable artifact volume</span><button id="refresh-files" class="icon-button" title="Refresh workspace">↻</button></div>
-              <div id="file-list" class="file-list"><p class="empty">No artifacts yet.</p></div>
+              <div class="mount-summary"><code id="workspace-root">/workspace</code><span id="workspace-description">Private durable task workspace</span><button id="refresh-files" class="icon-button" title="Refresh workspace">↻</button></div>
+              <div class="workspace-navigator-toolbar">
+                <label class="workspace-search"><span class="sr-only">Filter workspace files</span><input id="workspace-search" type="search" placeholder="Filter files…" autocomplete="off"></label>
+                <div class="workspace-tree-actions"><button id="expand-workspace" class="text-button" type="button">Expand all</button><button id="collapse-workspace" class="text-button" type="button">Collapse</button></div>
+              </div>
+              <div id="file-list" class="file-list" role="tree" aria-label="Workspace files"><p class="empty">No artifacts yet.</p></div>
+              <p id="workspace-list-message" class="workspace-list-message" role="status"></p>
             </article>
-            <article class="panel capability-card data-empty-card">
-              <div class="panel-heading"><div><p class="kicker">DATA SOURCES</p><h2>Additional attachments</h2></div><span class="pill neutral">0 attached</span></div>
-              <div class="empty-capability"><span class="empty-icon">▤</span><h3>No additional data attached</h3><p>Future attachments can be mounted read-only or read/write with an explicit container path and access policy.</p></div>
-              <button class="button secondary" disabled>Attach data or volume · next iteration</button>
+            <article class="panel capability-card">
+              <div class="panel-heading"><div><p class="kicker">RUNTIME MOUNTS</p><h2>Mapped folders</h2></div><span id="attachment-count" class="pill neutral">checking</span></div>
+              <p class="capability-copy">Map an approved host folder directly into this agent. Choose read-only or read/write access; the agent's private login and workspace volumes remain isolated.</p>
+              <div id="attachment-list" class="data-record-list"><p class="empty">Loading attachments…</p></div>
+              <div class="data-card-footer"><span id="attachment-message" class="run-message" role="status"></span><button id="new-attachment" class="button secondary" type="button">Map folder</button></div>
             </article>
           </div>
         </section>
@@ -430,6 +437,37 @@
       </form>
     </dialog>
 
+    <dialog id="attachment-dialog" aria-labelledby="attachment-dialog-title">
+      <form id="attachment-form" method="dialog">
+        <input id="attachment-id" type="hidden">
+        <div class="dialog-heading"><div><p class="kicker">ISOLATED RUNTIME</p><h2 id="attachment-dialog-title">Map folder</h2></div><button id="close-attachment-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
+        <p class="dialog-copy">Choose a host folder and how this agent may use it. The agent must be idle because saving safely replaces its container.</p>
+        <section id="attachment-location-fields">
+          <div class="form-grid">
+            <label id="attachment-root-field" class="field">Approved root<select id="attachment-root"></select></label>
+            <label id="attachment-folder-field" class="field">Folder <span>choose within the approved root; symlinks are excluded</span><div class="input-action"><input id="attachment-path" maxlength="1000" value="." readonly><button id="browse-attachment" class="button secondary" type="button">Browse…</button></div></label>
+          </div>
+          <p id="attachment-root-policy" class="schedule-note"></p>
+          <section id="host-folder-browser" class="host-folder-browser hidden" aria-label="Approved host folders">
+            <div class="folder-browser-heading"><div><span>FOLDER PICKER</span><strong id="folder-browser-root">Approved root</strong></div><button id="close-folder-browser" class="icon-button" type="button" aria-label="Close folder picker">×</button></div>
+            <nav id="folder-browser-breadcrumbs" class="folder-browser-breadcrumbs" aria-label="Selected folder"></nav>
+            <div id="folder-browser-list" class="folder-browser-list"><p class="empty">Choose Browse to load folders.</p></div>
+            <div class="folder-browser-footer"><span>Selected <code id="folder-browser-selection">.</code></span><button id="choose-folder" class="button primary" type="button">Choose this folder</button></div>
+            <p id="folder-browser-message" class="workspace-list-message" role="status"></p>
+          </section>
+        </section>
+        <p id="attachment-existing-location" class="data-safety-note hidden"></p>
+        <div class="form-grid">
+          <label class="field">Container name <span>becomes /data/name</span><input id="attachment-name" required maxlength="80" placeholder="project"></label>
+          <label class="field">Access<select id="attachment-access"><option value="read-only">Read only</option><option value="read-write">Read and write</option></select></label>
+          <label class="field full">Use as<select id="attachment-purpose"><option value="data">Additional data</option><option value="working-directory">Agent working directory</option></select></label>
+        </div>
+        <p id="attachment-policy" class="data-safety-note"></p>
+        <p id="attachment-form-message" class="usage-error hidden"></p>
+        <div class="actions dialog-actions"><button id="detach-data-source" class="button danger hidden" type="button">Unmap folder</button><span class="dialog-spacer"></span><button id="cancel-attachment" class="button secondary" type="button">Cancel</button><button id="save-attachment" class="button primary" type="submit">Map and restart</button></div>
+      </form>
+    </dialog>
+
     <dialog id="access-policy-dialog" class="access-policy-dialog">
       <div class="dialog-heading"><div><p class="kicker">CONTROL PLANE ACCESS</p><h2>Authentication &amp; authorization</h2></div><button id="close-access-policy" class="icon-button" type="button" aria-label="Close">×</button></div>
       <p class="dialog-copy">WorkOS and GitHub prove identity. Agent Dock assigns permissions locally from control-plane deployment configuration; roles are not currently editable in this web interface.</p>
@@ -455,6 +493,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=10"></script>
+    <script type="module" src="/app.js?v=15"></script>
   </body>
 </html>

@@ -155,6 +155,11 @@ function permissionForRequest(req, url) {
   if (/^\/api\/v1\/mcp(?:\/|$)/.test(path) || /^\/api\/v1\/agents\/[^/]+\/mcp(?:\/|$)/.test(path)) {
     return 'mcp:manage';
   }
+  if (/^\/api\/v1\/attachment-roots(?:\/|$)/.test(path)
+    || /^\/api\/v1\/data-sources(?:\/|$)/.test(path)
+    || /^\/api\/v1\/agents\/[^/]+\/attachments(?:\/|$)/.test(path)) {
+    return 'storage:manage';
+  }
   if (/^\/api\/v1\/agents\/[^/]+\/workspace$/.test(path) || path === '/api/v1/workspace' || path === '/api/workspace') {
     return 'workspace:read';
   }

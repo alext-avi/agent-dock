@@ -638,6 +638,7 @@ test('a runtime refresh re-delivers the credentials the replacement process lost
         managed: true,
         dedicated: true,
         binding: 'dedicated',
+        lastError: 'MCP configuration could not be re-applied after an earlier refresh',
         image: this.currentImage,
         imageId: this.currentImage,
         createdAt: new Date().toISOString()
@@ -687,7 +688,11 @@ test('a runtime refresh re-delivers the credentials the replacement process lost
 
   const refresh = await post(`/api/v1/agents/${agent.id}/runtime/refresh`, {});
   assert.equal(refresh.status, 200);
-  assert.equal((await refresh.json()).mcpReapplied, true, 'a refresh left the agent unable to configure its connectors');
+  const refreshed = await refresh.json();
+  assert.equal(refreshed.mcpReapplied, true, 'a refresh left the agent unable to configure its connectors');
+  assert.equal(refreshed.runtime.lastError, null, 'a successful reapply retained an obsolete failure');
+  const reloaded = await fetch(`${controlUrl}/api/v1/agents/${agent.id}`);
+  assert.equal((await reloaded.json()).agent.runtime.lastError, null, 'the cleared failure was not persisted');
 
   const rendered = JSON.parse(await readFile(join(configDir, 'claude.json'), 'utf8'));
   assert.equal(rendered.mcpServers.docs.headers['X-Api-Key'], 'sk-live-REDELIVERED');

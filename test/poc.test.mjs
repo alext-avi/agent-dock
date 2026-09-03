@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
-import { DockerRuntimeManager } from '../control-plane/docker-runtime.mjs';
+import { DockerRuntimeManager, dockerError } from '../control-plane/docker-runtime.mjs';
 import { normalizeClaudeEvent } from '../worker/adapters/claude.mjs';
 import { normalizeOpenCodeEvent } from '../worker/adapters/opencode.mjs';
 
@@ -15,6 +15,60 @@ async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return `http://127.0.0.1:${server.address().port}`;
+}
+
+function beginPartialJsonRequest(url, { method, first, rest }) {
+  let request;
+  let ended = false;
+  let markSent;
+  const sent = new Promise((resolve) => { markSent = resolve; });
+  const response = new Promise((resolve, reject) => {
+    request = httpRequest(url, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        'transfer-encoding': 'chunked'
+      }
+    }, (incoming) => {
+      const chunks = [];
+      incoming.on('data', (chunk) => chunks.push(chunk));
+      incoming.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let body = {};
+        try { body = text ? JSON.parse(text) : {}; } catch { body = { text }; }
+        resolve({ status: incoming.statusCode, body });
+      });
+    });
+    request.on('error', reject);
+    request.write(first, markSent);
+  });
+  return {
+    sent,
+    response,
+    finish() {
+      if (ended) return;
+      ended = true;
+      request.end(rest);
+    },
+    abort() {
+      ended = true;
+      request.destroy();
+    }
+  };
+}
+
+async function within(promise, message, timeoutMs = 2_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function createStatusWorker({ workerId, token, authenticated }) {
@@ -50,6 +104,11 @@ class FakeRuntimeManager {
     this.stopped = [];
     this.destroyed = [];
     this.recreated = [];
+    this.createdDataVolumes = [];
+    this.deletedDataVolumes = [];
+    this.directoryListings = [];
+    this.recreateDelay = null;
+    this.onRecreate = null;
     this.image = 'agent-dock-worker:v1';
   }
 
@@ -76,6 +135,8 @@ class FakeRuntimeManager {
         telemetry: `telemetry-${suffix}`,
         workspace: `workspace-${suffix}`
       },
+      appliedAttachmentIds: [],
+      workingDirectory: '/workspace',
       state: 'running',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -95,8 +156,10 @@ class FakeRuntimeManager {
 
   // Mirrors the real manager: a new container id, the same name and volumes, and
   // the currently configured image. Volumes are never touched.
-  async recreate(runtime, { agentId = null } = {}) {
-    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes });
+  async recreate(runtime, { agentId = null, attachments = [], previousAttachments = attachments } = {}) {
+    this.onRecreate?.(runtime);
+    if (this.recreateDelay) await this.recreateDelay;
+    this.recreated.push({ id: runtime.id, agentId, volumes: runtime.volumes, attachments, previousAttachments });
     return {
       containerId: `container-${runtime.id}-${this.recreated.length}`,
       containerName: runtime.containerName,
@@ -104,8 +167,42 @@ class FakeRuntimeManager {
       image: this.image,
       imageId: this.image,
       volumes: runtime.volumes,
+      appliedAttachmentIds: attachments.map((attachment) => attachment.id),
+      workingDirectory: attachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
       state: 'starting',
       updatedAt: new Date().toISOString()
+    };
+  }
+  async materializeAttachments({ attachments, sources }) {
+    return attachments.map((attachment) => {
+      const source = sources.get(attachment.dataSourceId);
+      if (!source) throw new Error('Data source missing');
+      return {
+        ...attachment,
+        mount: {
+          Type: source.kind === 'managed-volume' ? 'volume' : 'bind',
+          Source: source.volumeName ?? `/approved/${source.rootId}/${source.relativePath}`,
+          Target: attachment.target,
+          ReadOnly: attachment.access === 'read-only'
+        }
+      };
+    });
+  }
+  async createManagedDataVolume(dataSourceId) {
+    const volume = `managed-${dataSourceId}`;
+    this.createdDataVolumes.push(volume);
+    return volume;
+  }
+  async deleteManagedDataVolume(dataSourceId, volumeName) {
+    this.deletedDataVolumes.push({ dataSourceId, volumeName });
+  }
+  async listHostDirectories(request) {
+    this.directoryListings.push(request);
+    const prefix = request.relativePath === '.' ? '' : `${request.relativePath}/`;
+    return {
+      relativePath: request.relativePath,
+      directories: [{ name: 'child', relativePath: `${prefix}child` }],
+      truncated: false
     };
   }
   async start(runtime) { runtime.state = 'running'; this.started.push(runtime.id); }
@@ -153,7 +250,7 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   assert.equal(initialAgents[0].runtime.dedicated, false);
   assert.equal(initialAgents[0].runtime.credentials, 'shared-worker-local');
   assert.deepEqual(initialAgents[0].runtime.storage, {
-    auth: 'shared', binary: 'shared', telemetry: 'shared', workspace: 'shared'
+    auth: 'shared', binary: 'shared', telemetry: 'shared', workspace: 'shared', attachments: 0
   });
   assert.deepEqual(initialAgents[0].modelPolicy, {
     mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false
@@ -255,7 +352,8 @@ test('control plane speaks the vendor-neutral v1 wrapper contract', async (t) =>
   const agentPage = await (await fetch(`${controlUrl}/agents/${created.id}`)).text();
   assert.doesNotMatch(agentPage, /Worker URL|Worker token/);
   assert.match(agentPage, /Tools &amp; MCP/);
-  assert.match(agentPage, /Attach data or volume/);
+  assert.match(agentPage, /Mapped folders/);
+  assert.match(agentPage, /Map folder/);
 
   const deleteResponse = await fetch(`${controlUrl}/api/v1/agents/${created.id}`, {
     method: 'DELETE',
@@ -356,7 +454,7 @@ test('two same-adapter agents receive exclusive runtimes and different authentic
   assert.equal(second.runtime.binding, 'dedicated');
   assert.equal(first.runtime.credentials, 'isolated-worker-local');
   assert.deepEqual(first.runtime.storage, {
-    auth: 'isolated', binary: 'isolated', telemetry: 'isolated', workspace: 'isolated'
+    auth: 'isolated', binary: 'isolated', telemetry: 'isolated', workspace: 'isolated', attachments: 0
   });
   assert.doesNotMatch(JSON.stringify([first, second]), /token-one|token-two|auth-1|auth-2|container-1|container-2|127\.0\.0\.1/);
   for (const volumeType of ['auth', 'binary', 'telemetry', 'workspace']) {
@@ -745,6 +843,471 @@ test('OpenCode discovers Ollama and executes a durable pinned model policy', asy
   assert.equal(normalizeOpenCodeEvent({ type: 'text', part: { type: 'text', text: 'hello' } }).data.text, 'hello');
 });
 
+test('data-source registry applies scoped mounts, persists them, and enforces exclusive writes', async (t) => {
+  const token = 'storage-worker-secret';
+  const worker = createStatusWorker({ workerId: 'storage-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'storage-worker', workerUrl, token },
+    { workerId: 'storage-worker', workerUrl, token }
+  ]);
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-storage-'));
+  const dataPath = join(temporary, 'agents.json');
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath,
+    schedulerEnabled: false,
+    attachmentRoots: {
+      projects: { label: 'Projects', hostPath: '/Users/operator/Projects', allowWrite: true },
+      reference: { label: 'Reference', hostPath: '/Users/operator/Reference', allowWrite: false }
+    }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve)),
+    rm(temporary, { recursive: true, force: true })
+  ]));
+
+  const createAgent = async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, adapter: 'claude-code', runtime: { mode: 'provision' } })
+    });
+    assert.equal(response.status, 201);
+    return (await response.json()).agent;
+  };
+  const first = await createAgent('Writer one');
+  const second = await createAgent('Writer two');
+
+  let response = await fetch(`${controlUrl}/api/v1/attachment-roots`);
+  assert.equal(response.status, 200);
+  const rootPayload = await response.json();
+  assert.deepEqual(rootPayload.roots, [
+    { id: 'projects', label: 'Projects', allowWrite: true },
+    { id: 'reference', label: 'Reference', allowWrite: false }
+  ]);
+  assert.equal(JSON.stringify(rootPayload).includes('/Users/operator'), false);
+
+  response = await fetch(`${controlUrl}/api/v1/attachment-roots/projects/directories?agentId=${encodeURIComponent(first.id)}&path=agent-dock`);
+  assert.equal(response.status, 200);
+  const directoryPayload = await response.json();
+  assert.deepEqual(directoryPayload, {
+    root: { id: 'projects', label: 'Projects', allowWrite: true },
+    relativePath: 'agent-dock',
+    directories: [{ name: 'child', relativePath: 'agent-dock/child' }],
+    truncated: false
+  });
+  assert.deepEqual(manager.directoryListings, [{ rootId: 'projects', relativePath: 'agent-dock', adapter: 'claude-code' }]);
+  assert.equal(JSON.stringify(directoryPayload).includes('/Users/operator'), false);
+
+  const createSource = async (body) => {
+    const result = await fetch(`${controlUrl}/api/v1/data-sources`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    assert.equal(result.status, 201);
+    return (await result.json()).dataSource;
+  };
+  const project = await createSource({
+    id: 'project', name: 'Project', kind: 'host-directory', rootId: 'projects', relativePath: 'agent-dock'
+  });
+  const child = await createSource({
+    id: 'project-child', name: 'Project child', kind: 'host-directory', rootId: 'projects', relativePath: 'agent-dock/packages/ui'
+  });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/${project.id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'renamed-behind-the-registry' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /id cannot be changed/);
+  const scratch = await createSource({ id: 'scratch', name: 'Scratch', kind: 'managed-volume' });
+  assert.deepEqual(manager.createdDataVolumes, ['managed-scratch']);
+  response = await fetch(`${controlUrl}/api/v1/data-sources/${scratch.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ deleteVolume: true, confirmation: scratch.id })
+  });
+  assert.equal(response.status, 204);
+  assert.deepEqual(manager.deletedDataVolumes, [{ dataSourceId: 'scratch', volumeName: 'managed-scratch' }]);
+  assert.equal(JSON.stringify(project).includes('/Users/operator'), false);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      source: { name: 'Direct project mapping', rootId: 'projects', relativePath: 'agent-dock' },
+      mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  assert.equal(response.status, 201);
+  const firstAttachment = (await response.json()).attachment;
+  assert.equal(firstAttachment.target, '/data/repo');
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.Source, '/approved/projects/agent-dock');
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.ReadOnly, false);
+
+  const firstAfterMount = (await (await fetch(`${controlUrl}/api/v1/agents/${first.id}`)).json()).agent;
+  assert.equal(firstAfterMount.runtime.storage.attachments, 1);
+  assert.equal(firstAfterMount.runtime.workingDirectory, '/data/repo');
+
+  const recreatesBeforeConflict = manager.recreated.length;
+  response = await fetch(`${controlUrl}/api/v1/agents/${second.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      source: { name: 'Rejected direct mapping', rootId: 'projects', relativePath: 'agent-dock/packages/ui' },
+      mountName: 'child', access: 'read-write', purpose: 'data'
+    })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /agent/);
+  assert.equal(manager.recreated.length, recreatesBeforeConflict, 'a rejected write lease replaced a container');
+  const sourcesAfterConflict = await (await fetch(`${controlUrl}/api/v1/data-sources`)).json();
+  assert.equal(sourcesAfterConflict.dataSources.some((source) => source.name === 'Rejected direct mapping'), false);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments/${firstAttachment.id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ access: 'read-only' })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(manager.recreated.at(-1).attachments[0].mount.ReadOnly, true);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${second.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: child.id, mountName: 'child', access: 'read-write', purpose: 'data'
+    })
+  });
+  assert.equal(response.status, 201, 'a read-only overlapping mount incorrectly held the write lease');
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runtimeAction: 'retain' })
+  });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /Detach every data source/);
+
+  response = await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments/${firstAttachment.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 204);
+  const afterDetach = await (await fetch(`${controlUrl}/api/v1/agents/${first.id}/attachments`)).json();
+  assert.deepEqual(afterDetach.attachments, []);
+  assert.equal(afterDetach.workingDirectory, '/workspace');
+  const sourcesAfterDetach = await (await fetch(`${controlUrl}/api/v1/data-sources`)).json();
+  assert.equal(sourcesAfterDetach.dataSources.some((source) => source.name === 'Direct project mapping'), false);
+
+  const persisted = JSON.parse(await readFile(dataPath, 'utf8'));
+  assert.equal(persisted.schemaVersion, 4);
+  assert.equal(persisted.dataSources.length, 2);
+  assert.equal(persisted.dataAttachments.length, 1);
+  assert.equal(JSON.stringify(persisted).includes('/Users/operator/Projects'), false, 'deployment roots leaked into the registry');
+});
+
+test('an inline attachment persistence failure restores the runtime without leaking its provisional source', async (t) => {
+  const token = 'storage-rollback-secret';
+  const worker = createStatusWorker({ workerId: 'rollback-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'rollback-worker', workerUrl, token }]);
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-storage-rollback-'));
+  const registryDirectory = join(temporary, 'registry');
+  const dataPath = join(registryDirectory, 'agents.json');
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve)),
+    rm(temporary, { recursive: true, force: true })
+  ]));
+
+  let response = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Rollback agent', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  });
+  const agent = (await response.json()).agent;
+  await rm(registryDirectory, { recursive: true, force: true });
+  await writeFile(registryDirectory, 'blocks the registry directory');
+  response = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      source: { name: 'Rollback source', rootId: 'projects', relativePath: 'repo' },
+      mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  assert.equal(response.status, 500);
+  assert.equal(manager.recreated.length, 2, 'the live runtime was not rolled back after the registry write failed');
+  assert.equal(manager.recreated[0].attachments.length, 1);
+  assert.equal(manager.recreated[1].attachments.length, 0);
+
+  const state = await (await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`)).json();
+  assert.deepEqual(state.attachments, []);
+  assert.equal(state.workingDirectory, '/workspace');
+  const provisionalSourceId = manager.recreated[0].attachments[0].dataSourceId;
+  assert.equal((await fetch(`${controlUrl}/api/v1/data-sources/${provisionalSourceId}`)).status, 404);
+});
+
+test('simultaneous attachment requests cannot both acquire one write lease', async (t) => {
+  const token = 'storage-concurrency-secret';
+  const worker = createStatusWorker({ workerId: 'concurrency-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'concurrency-worker', workerUrl, token },
+    { workerId: 'concurrency-worker', workerUrl, token }
+  ]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const agents = await Promise.all(['One', 'Two'].map(async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, adapter: 'claude-code', runtime: { mode: 'provision' }
+      })
+    });
+    return (await response.json()).agent;
+  }));
+  let response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'shared-repo', name: 'Shared repo', kind: 'host-directory', rootId: 'projects', relativePath: 'shared'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  const results = await Promise.all(agents.map((agent, index) => fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: 'shared-repo', mountName: `repo-${index}`, access: 'read-write', purpose: 'data'
+    })
+  })));
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  assert.equal(manager.recreated.length, 1, 'both concurrent requests replaced a runtime');
+});
+
+test('disjoint agents replace their containers concurrently and serialize only registry commits', async (t) => {
+  const token = 'storage-parallel-secret';
+  const worker = createStatusWorker({ workerId: 'parallel-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([
+    { workerId: 'parallel-worker', workerUrl, token },
+    { workerId: 'parallel-worker', workerUrl, token }
+  ]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  let releaseRecreates;
+  const recreateDelay = new Promise((resolve) => { releaseRecreates = resolve; });
+  t.after(() => {
+    releaseRecreates?.();
+    return Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+  });
+
+  const agents = await Promise.all(['Parallel one', 'Parallel two'].map(async (name) => {
+    const response = await fetch(`${controlUrl}/api/v1/agents`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        name, adapter: 'claude-code', runtime: { mode: 'provision' }
+      })
+    });
+    return (await response.json()).agent;
+  }));
+  const sources = [];
+  for (const [index, relativePath] of ['repo-one', 'repo-two'].entries()) {
+    const response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        id: `parallel-${index}`, name: `Parallel ${index}`, kind: 'host-directory', rootId: 'projects', relativePath
+      })
+    });
+    sources.push((await response.json()).dataSource);
+  }
+
+  manager.recreateDelay = recreateDelay;
+  let markBothStarted;
+  const bothStarted = new Promise((resolve) => { markBothStarted = resolve; });
+  const started = new Set();
+  manager.onRecreate = (runtime) => {
+    started.add(runtime.id);
+    if (started.size === 2) markBothStarted();
+  };
+  const requests = agents.map((agent, index) => fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: sources[index].id, mountName: `repo-${index}`, access: 'read-write', purpose: 'data'
+    })
+  }));
+
+  await Promise.race([
+    bothStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('unrelated runtime replacements were serialized')), 500))
+  ]);
+  const sourceMutation = await fetch(`${controlUrl}/api/v1/data-sources/${sources[0].id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Must wait' })
+  });
+  assert.equal(sourceMutation.status, 409, 'a source changed while its replacement container was in flight');
+  releaseRecreates();
+  assert.deepEqual((await Promise.all(requests)).map((response) => response.status), [201, 201]);
+});
+
+test('caller-paced data-source mutations cannot overtake attachment reservations', async (t) => {
+  const token = 'storage-source-race-secret';
+  const worker = createStatusWorker({ workerId: 'source-race-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'source-race-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  let releaseRecreate;
+  const partialRequests = [];
+  t.after(() => {
+    releaseRecreate?.();
+    for (const partial of partialRequests) partial.abort();
+    return Promise.all([
+      new Promise((resolve) => control.close(resolve)),
+      new Promise((resolve) => worker.close(resolve))
+    ]);
+  });
+
+  const agent = (await (await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Source race', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  })).json()).agent;
+  let response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'source-race', name: 'Source race', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  async function raceMutationWithAttachment({ method, first, rest, mountName }) {
+    const mutation = beginPartialJsonRequest(`${controlUrl}/api/v1/data-sources/source-race`, { method, first, rest });
+    partialRequests.push(mutation);
+    await within(mutation.sent, `${method} partial request never reached the socket`);
+    // The first chunk has reached the socket. Give the server one event-loop
+    // turn to enter readJson and block on the deliberately unfinished body.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    let markRecreateStarted;
+    const recreateStarted = new Promise((resolve) => { markRecreateStarted = resolve; });
+    manager.recreateDelay = new Promise((resolve) => { releaseRecreate = resolve; });
+    manager.onRecreate = markRecreateStarted;
+    const attachment = fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        dataSourceId: 'source-race', mountName, access: 'read-write', purpose: 'data'
+      })
+    }).then(async (result) => ({ status: result.status, body: await result.json() }));
+    const firstOutcome = await within(Promise.race([
+      recreateStarted.then(() => ({ kind: 'recreate' })),
+      attachment.then((result) => ({ kind: 'response', result }))
+    ]), `${method} attachment never reached runtime replacement`);
+    assert.equal(
+      firstOutcome.kind,
+      'recreate',
+      `${method} attachment failed before runtime replacement: ${JSON.stringify(firstOutcome.result)}`
+    );
+    mutation.finish();
+    const mutationResult = await within(mutation.response, `${method} did not finish after its body was released`);
+    assert.equal(mutationResult.status, 409, `${method} passed a reservation created while its body was streaming`);
+    assert.match(mutationResult.body.error, /in-flight attachment change/);
+    releaseRecreate();
+    releaseRecreate = null;
+    manager.recreateDelay = null;
+    manager.onRecreate = null;
+    const attachmentResponse = await within(attachment, `${method} attachment did not finish after runtime release`);
+    assert.equal(attachmentResponse.status, 201);
+    return attachmentResponse.body.attachment;
+  }
+
+  const patchedRace = await raceMutationWithAttachment({
+    method: 'PATCH',
+    first: '{"relativePath":',
+    rest: '"moved"}',
+    mountName: 'patch-race'
+  });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal((await response.json()).dataSource.root.relativePath, 'repo', 'the rejected PATCH changed the source');
+  response = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments/${patchedRace.id}`, { method: 'DELETE' });
+  assert.equal(response.status, 204);
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal(response.status, 200, 'detaching a shared source removed it before the DELETE race');
+
+  await raceMutationWithAttachment({ method: 'DELETE', first: '{', rest: '}', mountName: 'delete-race' });
+  response = await fetch(`${controlUrl}/api/v1/data-sources/source-race`);
+  assert.equal(response.status, 200, 'the rejected DELETE orphaned the live attachment');
+});
+
+test('a task cannot start while its runtime mount set is being replaced', async (t) => {
+  const token = 'storage-task-race-secret';
+  const worker = createStatusWorker({ workerId: 'task-race-worker', token, authenticated: true });
+  const workerUrl = await listen(worker);
+  const manager = new FakeRuntimeManager([{ workerId: 'task-race-worker', workerUrl, token }]);
+  const control = createControlPlane({
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    runtimeManager: manager,
+    dataPath: null,
+    schedulerEnabled: false,
+    attachmentRoots: { projects: { label: 'Projects', hostPath: '/srv/projects', allowWrite: true } }
+  });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  let response = await fetch(`${controlUrl}/api/v1/agents`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: 'Task race', adapter: 'claude-code', runtime: { mode: 'provision' }
+    })
+  });
+  const agent = (await response.json()).agent;
+  response = await fetch(`${controlUrl}/api/v1/data-sources`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id: 'task-race-source', name: 'Task race source', kind: 'host-directory', rootId: 'projects', relativePath: 'repo'
+    })
+  });
+  assert.equal(response.status, 201);
+
+  let releaseRecreate;
+  let markStarted;
+  t.after(() => releaseRecreate?.());
+  manager.recreateDelay = new Promise((resolve) => { releaseRecreate = resolve; });
+  const recreateStarted = new Promise((resolve) => { markStarted = resolve; });
+  manager.onRecreate = markStarted;
+  const attachmentRequest = fetch(`${controlUrl}/api/v1/agents/${agent.id}/attachments`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      dataSourceId: 'task-race-source', mountName: 'repo', access: 'read-write', purpose: 'working-directory'
+    })
+  });
+  await recreateStarted;
+
+  const taskResponse = await fetch(`${controlUrl}/api/v1/agents/${agent.id}/tasks`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'must not start' })
+  });
+  assert.equal(taskResponse.status, 409);
+  assert.match((await taskResponse.json()).error, /runtime storage reconfiguration/);
+  releaseRecreate();
+  assert.equal((await attachmentRequest).status, 201);
+});
+
 
 test('refreshing a runtime replaces its container while retaining every volume', async (t) => {
   const token = 'refresh-worker-secret';
@@ -785,6 +1348,14 @@ test('refreshing a runtime replaces its container while retaining every volume',
   assert.equal(body.runtime.id, before.id, 'refreshing must not change runtime identity');
   assert.equal(body.runtime.binding, 'dedicated', 'exclusivity must survive a refresh');
   assert.equal(body.runtime.attachmentCount, 1);
+  assert.equal(body.mcpReapplied, false, 'the stub worker unexpectedly accepted MCP configuration');
+  assert.match(body.runtime.lastError, /MCP configuration could not be re-applied/);
+  const afterFailedReapply = (await (await fetch(`${controlUrl}/api/v1/agents/${created.id}`)).json()).agent;
+  assert.equal(
+    afterFailedReapply.runtime.lastError,
+    body.runtime.lastError,
+    'the refresh failure disappeared after the mutating response'
+  );
 
   // The credential lives in the auth volume. Retaining it is the entire point:
   // a refresh that dropped it would force a fresh provider login.
@@ -1026,7 +1597,81 @@ test('the shared container spec carries every setting a worker needs', async () 
   assert.deepEqual(mounts.map((mount) => mount.Source).sort(), Object.values(volumes).sort());
   assert.ok(mounts.every((mount) => mount.Type === 'volume'), 'a bind mount reached a managed runtime');
   assert.equal(body.HostConfig.NetworkMode, 'test-net');
+  assert.equal(body.User, '10001:10001', 'the worker UID drifted from the attachment validator UID');
   assert.ok(!body.HostConfig.Privileged);
+});
+
+test('Docker errors keep host-only details out of public messages', () => {
+  const error = dockerError(500, JSON.stringify({ message: 'bind source path does not exist: /Users/operator/Projects/private' }), '/containers/create');
+  assert.equal(error.status, 502);
+  assert.match(error.message, /status 500/);
+  assert.doesNotMatch(error.message, /Users\/operator/);
+  assert.match(error.dockerMessage, /Users\/operator/);
+  assert.equal(JSON.stringify({ error: error.message }).includes('/Users/operator'), false);
+});
+
+test('the attachment validator image is pulled once when a fresh engine lacks it', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  let inspections = 0;
+  let pulls = 0;
+  manager.request = async (method, path) => {
+    if (method === 'GET' && path.startsWith('/images/')) {
+      inspections += 1;
+      if (inspections === 1) throw dockerError(404, '{"message":"No such image"}', path);
+      return { Id: 'sha256:validator' };
+    }
+    if (method === 'POST' && path.startsWith('/images/create?')) {
+      pulls += 1;
+      return null;
+    }
+    throw new Error(`unexpected Docker call ${method} ${path}`);
+  };
+
+  await Promise.all([
+    manager.ensureAttachmentValidatorImage(),
+    manager.ensureAttachmentValidatorImage()
+  ]);
+  await manager.ensureAttachmentValidatorImage();
+  assert.equal(pulls, 1);
+  assert.equal(inspections, 2);
+});
+
+test('runtime replacement revalidates host mounts only after the old agent is gone', async () => {
+  const manager = new DockerRuntimeManager({ network: 'test-net', socketPath: '/nonexistent.sock' });
+  const events = [];
+  manager.containerSpec = async ({ attachments }) => ({ image: 'worker:test', body: { attachments } });
+  manager.resolveContainer = async () => ({ id: 'old-container' });
+  manager.validateHostDirectory = async () => {
+    events.push('validate');
+    return '/approved/projects/repo';
+  };
+  manager.request = async (method, path, body) => {
+    if (method === 'DELETE' && path.startsWith('/containers/old-container')) {
+      events.push('delete-old');
+      return null;
+    }
+    if (method === 'POST' && path.startsWith('/containers/create?')) {
+      events.push('create-new');
+      assert.equal(body.attachments[0].mount.Source, '/approved/projects/repo');
+      return { Id: 'new-container' };
+    }
+    if (method === 'POST' && path === '/containers/new-container/start') return null;
+    if (method === 'GET' && path === '/containers/new-container/json') return { Image: 'sha256:worker' };
+    throw new Error(`unexpected Docker call ${method} ${path}`);
+  };
+  const runtime = {
+    id: 'runtime-race', adapter: 'claude-code', workerId: 'worker-race', workerToken: 'token-race',
+    containerId: 'old-container', containerName: 'agent-dock-runtime-race',
+    volumes: { auth: 'auth', binary: 'binary', telemetry: 'telemetry', workspace: 'workspace' }
+  };
+  const attachment = {
+    id: 'attachment-race', purpose: 'data', target: '/data/repo',
+    mount: { Type: 'bind', Source: '/preflight/repo', Target: '/data/repo', ReadOnly: false },
+    hostDirectory: { rootId: 'projects', relativePath: 'repo', access: 'read-write', adapter: 'claude-code' }
+  };
+
+  await manager.recreate(runtime, { agentId: 'agent-race', attachments: [attachment], previousAttachments: [] });
+  assert.deepEqual(events, ['delete-old', 'validate', 'create-new']);
 });
 
 test('destructive runtime operations cannot overlap', async () => {

@@ -140,6 +140,7 @@ const ui = {
   agentName: $('#agent-name'),
   runtimeIcon: $('#runtime-icon'),
   runtimeLocation: $('#runtime-location'),
+  runtimeError: $('#runtime-error'),
   cliVersion: $('#cli-version'),
   runtimeModel: $('#runtime-model'),
   authState: $('#auth-state'),
@@ -191,6 +192,40 @@ const ui = {
   conversation: $('#conversation'),
   rawOutput: $('#raw-output'),
   fileList: $('#file-list'),
+  workspaceSearch: $('#workspace-search'),
+  workspaceListMessage: $('#workspace-list-message'),
+  workspaceRoot: $('#workspace-root'),
+  workspaceAccess: $('#workspace-access'),
+  workspaceDescription: $('#workspace-description'),
+  attachmentCount: $('#attachment-count'),
+  attachmentList: $('#attachment-list'),
+  attachmentMessage: $('#attachment-message'),
+  hostFolderBrowser: $('#host-folder-browser'),
+  folderBrowserRoot: $('#folder-browser-root'),
+  folderBrowserBreadcrumbs: $('#folder-browser-breadcrumbs'),
+  folderBrowserList: $('#folder-browser-list'),
+  folderBrowserSelection: $('#folder-browser-selection'),
+  folderBrowserMessage: $('#folder-browser-message'),
+  chooseFolder: $('#choose-folder'),
+  attachmentDialog: $('#attachment-dialog'),
+  attachmentForm: $('#attachment-form'),
+  attachmentId: $('#attachment-id'),
+  attachmentDialogTitle: $('#attachment-dialog-title'),
+  attachmentLocationFields: $('#attachment-location-fields'),
+  attachmentRootField: $('#attachment-root-field'),
+  attachmentFolderField: $('#attachment-folder-field'),
+  attachmentRoot: $('#attachment-root'),
+  attachmentPath: $('#attachment-path'),
+  browseAttachment: $('#browse-attachment'),
+  attachmentRootPolicy: $('#attachment-root-policy'),
+  attachmentExistingLocation: $('#attachment-existing-location'),
+  attachmentName: $('#attachment-name'),
+  attachmentAccess: $('#attachment-access'),
+  attachmentPurpose: $('#attachment-purpose'),
+  attachmentPolicy: $('#attachment-policy'),
+  attachmentFormMessage: $('#attachment-form-message'),
+  detachDataSource: $('#detach-data-source'),
+  saveAttachment: $('#save-attachment'),
   testAgentButton: $('#test-agent-button'),
   agentMenu: $('.agent-menu'),
   tabList: $('.tab-list'),
@@ -217,13 +252,23 @@ let retainedRuntimes = [];
 let mcpDefinitions = [];
 let mcpBindings = [];
 let mcpRefreshInFlight = false;
+let attachmentRoots = [];
+let agentAttachments = [];
+let dataRefreshInFlight = false;
+let workspaceEntries = [];
+let workspaceTree = null;
+let workspaceTruncated = false;
+let currentWorkspaceRoot = null;
+const expandedWorkspaceDirectories = new Set();
+let folderBrowserPath = '.';
+let folderBrowserRequestId = 0;
 
 function setConnection(state, label) {
   ui.connectionDot.className = `dot ${state}`;
   ui.connectionLabel.textContent = label;
 }
 
-async function api(path, options = {}) {
+async function authenticatedFetch(path, options = {}) {
   const method = (options.method ?? 'GET').toUpperCase();
   const response = await fetch(path, {
     ...options,
@@ -243,6 +288,11 @@ async function api(path, options = {}) {
     window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
     throw new Error('Authentication required');
   }
+  return response;
+}
+
+async function api(path, options = {}) {
+  const response = await authenticatedFetch(path, options);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
   if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
@@ -298,6 +348,13 @@ function renderRuntimeDrift() {
   ui.runtimeDrift.disabled = false;
   ui.runtimeDrift.textContent = 'image update available · refresh';
   ui.refreshRuntime.textContent = outdated ? 'Refresh runtime image · update available' : 'Refresh runtime image';
+  renderRuntimeError(runtimeDrift.get(currentAgent?.runtime?.id) ?? currentAgent?.runtime);
+}
+
+function renderRuntimeError(runtime = {}) {
+  const message = typeof runtime?.lastError === 'string' ? runtime.lastError.trim() : '';
+  ui.runtimeError.textContent = message;
+  ui.runtimeError.classList.toggle('hidden', !message);
 }
 
 function runtimeIsOutdated(runtime) {
@@ -413,6 +470,7 @@ function selectTab(name, { updateHash = true, focus = false } = {}) {
   if (updateHash) history.replaceState(null, '', `#${selected}`);
   if (focus && selected === 'test') setTimeout(() => ui.prompt.focus(), 100);
   if (selected === 'tools' && currentAgent) refreshMcp();
+  if (selected === 'data' && currentAgent) refreshData();
 }
 
 function createAgentCard(agent) {
@@ -1158,6 +1216,7 @@ function populateAgentConfig(agent) {
   ui.agentName.textContent = plannedHarness;
   ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
   ui.runtimeLocation.textContent = `${runtimeLabel(agent.runtime)} · ${agent.runtime?.workerId || 'no worker identity'}`;
+  renderRuntimeError(agent.runtime);
 }
 
 function renderProviderConnections(result = {}) {
@@ -1510,6 +1569,298 @@ async function deleteMcpDefinition() {
   }
 }
 
+function dataSourceLocation(source) {
+  if (source.kind === 'managed-volume') return 'Managed Docker volume';
+  return `${source.root?.label ?? source.root?.id ?? 'Unconfigured root'} / ${source.root?.relativePath ?? '.'}`;
+}
+
+function renderWorkspaceSummary(workingDirectory = '/workspace') {
+  const attachment = agentAttachments.find((candidate) => (
+    candidate.purpose === 'working-directory' && candidate.target === workingDirectory
+  ));
+  const writable = !attachment || attachment.access === 'read-write';
+  ui.workspaceRoot.textContent = workingDirectory;
+  ui.workspaceAccess.textContent = writable ? 'read / write' : 'read only';
+  ui.workspaceAccess.className = `pill ${writable ? 'ready' : 'neutral'}`;
+  ui.workspaceDescription.textContent = attachment
+    ? `${attachment.source.name} · task working directory`
+    : 'Private durable task workspace';
+}
+
+function renderAttachments(workingDirectory = '/workspace') {
+  renderWorkspaceSummary(workingDirectory);
+  ui.attachmentCount.textContent = `${agentAttachments.length} attached`;
+  ui.attachmentCount.className = `pill ${agentAttachments.length ? 'ready' : 'neutral'}`;
+  ui.attachmentList.replaceChildren();
+  if (!agentAttachments.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = 'No host folders are mapped into this runtime.';
+    ui.attachmentList.append(empty);
+    return;
+  }
+  for (const attachment of agentAttachments) {
+    const row = document.createElement('article');
+    row.className = 'data-record';
+    const heading = document.createElement('div');
+    heading.className = 'data-record-heading';
+    const title = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = attachment.source.name;
+    const kind = document.createElement('small');
+    kind.textContent = attachment.purpose === 'working-directory' ? 'WORKING DIRECTORY' : 'ADDITIONAL DATA';
+    title.append(name, kind);
+    const badge = document.createElement('span');
+    badge.className = `pill ${attachment.access === 'read-write' ? 'busy' : 'neutral'}`;
+    badge.textContent = attachment.access === 'read-write' ? 'read / write' : 'read only';
+    heading.append(title, badge);
+    const target = document.createElement('code');
+    target.className = 'data-record-path';
+    target.textContent = attachment.target;
+    const copy = document.createElement('p');
+    copy.className = 'data-record-copy';
+    copy.textContent = `${dataSourceLocation(attachment.source)}${attachment.target === workingDirectory ? ' · task cwd' : ''}`;
+    const actions = document.createElement('div');
+    actions.className = 'data-record-actions';
+    const edit = document.createElement('button');
+    edit.className = 'text-button';
+    edit.type = 'button';
+    edit.textContent = 'Change access';
+    edit.addEventListener('click', () => openAttachmentDialog(attachment));
+    actions.append(edit);
+    row.append(heading, target, copy, actions);
+    ui.attachmentList.append(row);
+  }
+}
+
+async function refreshData() {
+  if (!currentAgent || dataRefreshInFlight) return;
+  dataRefreshInFlight = true;
+  try {
+    const [rootsResult, attachmentsResult] = await Promise.all([
+      api(`${API_ROOT}/attachment-roots`),
+      api(agentApi('attachments'))
+    ]);
+    attachmentRoots = rootsResult.roots ?? [];
+    agentAttachments = attachmentsResult.attachments ?? [];
+    renderAttachments(attachmentsResult.workingDirectory);
+    ui.attachmentMessage.textContent = currentAgent.runtime?.managed && currentAgent.runtime?.dedicated
+      ? (attachmentRoots.length ? '' : 'No approved host roots are configured for this deployment.')
+      : 'Additional mounts require a managed dedicated runtime; legacy bootstrap workers remain unchanged.';
+    $('#new-attachment').disabled = !attachmentRoots.length || currentAgent.runtime?.managed !== true || currentAgent.runtime?.dedicated !== true;
+  } catch (error) {
+    ui.attachmentMessage.textContent = 'Storage configuration requires administrator access.';
+    ui.attachmentCount.textContent = 'unavailable';
+    $('#new-attachment').disabled = true;
+  } finally {
+    dataRefreshInFlight = false;
+  }
+}
+
+function renderFolderBreadcrumbs(root, relativePath) {
+  ui.folderBrowserBreadcrumbs.replaceChildren();
+  const rootButton = document.createElement('button');
+  rootButton.type = 'button';
+  rootButton.textContent = root.label;
+  rootButton.addEventListener('click', () => browseHostFolder('.'));
+  ui.folderBrowserBreadcrumbs.append(rootButton);
+  if (relativePath === '.') return;
+  const segments = relativePath.split('/');
+  for (let index = 0; index < segments.length; index += 1) {
+    const separator = document.createElement('span');
+    separator.textContent = '/';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = segments[index];
+    const target = segments.slice(0, index + 1).join('/');
+    button.addEventListener('click', () => browseHostFolder(target));
+    ui.folderBrowserBreadcrumbs.append(separator, button);
+  }
+}
+
+async function browseHostFolder(relativePath = '.') {
+  if (!currentAgent) return;
+  const rootId = ui.attachmentRoot.value;
+  if (!rootId) return;
+  const requestId = ++folderBrowserRequestId;
+  ui.folderBrowserList.innerHTML = '<p class="empty">Loading approved folders…</p>';
+  ui.folderBrowserMessage.textContent = '';
+  ui.chooseFolder.disabled = true;
+  let succeeded = false;
+  try {
+    const query = new URLSearchParams({ agentId: currentAgent.id, path: relativePath || '.' });
+    const result = await api(`${API_ROOT}/attachment-roots/${encodeURIComponent(rootId)}/directories?${query}`);
+    if (requestId !== folderBrowserRequestId) return;
+    folderBrowserPath = result.relativePath;
+    ui.folderBrowserRoot.textContent = result.root.label;
+    ui.folderBrowserSelection.textContent = folderBrowserPath;
+    renderFolderBreadcrumbs(result.root, folderBrowserPath);
+    ui.folderBrowserList.replaceChildren();
+    if (!result.directories.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'This folder has no readable child folders.';
+      ui.folderBrowserList.append(empty);
+    }
+    for (const directory of result.directories) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'folder-browser-row';
+      const icon = document.createElement('span');
+      icon.textContent = '□';
+      const name = document.createElement('strong');
+      name.textContent = directory.name;
+      const arrow = document.createElement('span');
+      arrow.textContent = '→';
+      button.append(icon, name, arrow);
+      button.addEventListener('click', () => browseHostFolder(directory.relativePath));
+      ui.folderBrowserList.append(button);
+    }
+    ui.folderBrowserMessage.textContent = result.truncated ? 'Showing the first 500 readable folders.' : `${result.directories.length} child folder${result.directories.length === 1 ? '' : 's'}`;
+    succeeded = true;
+  } catch (error) {
+    if (requestId !== folderBrowserRequestId) return;
+    ui.folderBrowserList.innerHTML = '<p class="empty">Unable to browse this folder.</p>';
+    ui.folderBrowserMessage.textContent = error.message;
+  } finally {
+    if (requestId === folderBrowserRequestId) ui.chooseFolder.disabled = !succeeded;
+  }
+}
+
+function openHostFolderBrowser() {
+  ui.hostFolderBrowser.classList.remove('hidden');
+  void browseHostFolder(ui.attachmentPath.value || '.');
+}
+
+function closeHostFolderBrowser() {
+  folderBrowserRequestId += 1;
+  ui.hostFolderBrowser.classList.add('hidden');
+}
+
+function chooseHostFolder() {
+  ui.attachmentPath.value = folderBrowserPath;
+  if (!ui.attachmentName.value) {
+    ui.attachmentName.value = folderBrowserPath === '.' ? 'data' : folderBrowserPath.split('/').at(-1);
+  }
+  closeHostFolderBrowser();
+  syncAttachmentRootPolicy();
+}
+
+function syncAttachmentRootPolicy() {
+  const root = attachmentRoots.find((candidate) => candidate.id === ui.attachmentRoot.value);
+  const selection = root ? `${root.label} / ${ui.attachmentPath.value || '.'}` : '';
+  ui.attachmentRootPolicy.textContent = !root
+    ? 'No approved host roots are configured for this control plane.'
+    : root.allowWrite
+      ? `Selected folder: ${selection} — choose read-only or exclusive read/write access below.`
+      : `Selected folder: ${selection} — this root permits read-only access only.`;
+  ui.browseAttachment.disabled = !root;
+  if (!ui.attachmentId.value) ui.saveAttachment.disabled = !root;
+}
+
+function syncAttachmentPolicy() {
+  const attachment = agentAttachments.find((candidate) => candidate.id === ui.attachmentId.value);
+  const source = attachment?.source;
+  const root = source?.kind === 'host-directory' ? attachmentRoots.find((candidate) => candidate.id === source.root?.id) : null;
+  const selectedRoot = attachmentRoots.find((candidate) => candidate.id === ui.attachmentRoot.value);
+  const writeOption = ui.attachmentAccess.querySelector('option[value="read-write"]');
+  const writeAllowed = source?.kind === 'managed-volume' || (attachment ? root?.allowWrite === true : selectedRoot?.allowWrite === true);
+  writeOption.disabled = !writeAllowed;
+  if (!writeAllowed && ui.attachmentAccess.value === 'read-write') ui.attachmentAccess.value = 'read-only';
+  const write = ui.attachmentAccess.value === 'read-write';
+  const workingDirectory = ui.attachmentPurpose.value === 'working-directory';
+  ui.attachmentPolicy.textContent = write
+    ? 'Read/write is exclusive: no overlapping source may be writable by another agent. The agent can modify or delete files in this source.'
+    : workingDirectory
+      ? 'Tasks will start in this folder, but the read-only mount prevents Git, builds, and the agent from changing it. The private /workspace volume remains writable.'
+    : 'Read-only prevents file changes through this mount. Git and build tools may still write to the agent’s private /workspace volume.';
+}
+
+function openAttachmentDialog(attachment = null) {
+  ui.attachmentForm.reset();
+  ui.attachmentId.value = attachment?.id ?? '';
+  ui.attachmentDialogTitle.textContent = attachment ? `Configure ${attachment.source.name}` : 'Map folder';
+  ui.attachmentRoot.replaceChildren();
+  for (const root of attachmentRoots) {
+    const option = document.createElement('option');
+    option.value = root.id;
+    option.textContent = `${root.label} · ${root.allowWrite ? 'read-only or read/write' : 'read-only'}`;
+    ui.attachmentRoot.append(option);
+  }
+  ui.attachmentRoot.value = attachment?.source?.root?.id ?? attachmentRoots[0]?.id ?? '';
+  const chooseRoot = !attachment && attachmentRoots.length > 1;
+  ui.attachmentRootField.classList.toggle('hidden', !chooseRoot);
+  ui.attachmentFolderField.classList.toggle('full', !chooseRoot);
+  folderBrowserPath = attachment?.source?.root?.relativePath ?? '.';
+  ui.attachmentPath.value = folderBrowserPath;
+  closeHostFolderBrowser();
+  ui.attachmentLocationFields.classList.toggle('hidden', Boolean(attachment));
+  ui.attachmentExistingLocation.classList.toggle('hidden', !attachment);
+  ui.attachmentExistingLocation.textContent = attachment
+    ? `Mapped folder: ${dataSourceLocation(attachment.source)}. Unmap it first if you need to choose a different folder.`
+    : '';
+  ui.attachmentName.value = attachment?.mountName ?? '';
+  ui.attachmentAccess.value = attachment?.access ?? 'read-only';
+  ui.attachmentPurpose.value = attachment?.purpose ?? 'data';
+  ui.attachmentFormMessage.textContent = '';
+  ui.attachmentFormMessage.classList.add('hidden');
+  ui.detachDataSource.classList.toggle('hidden', !attachment);
+  ui.saveAttachment.textContent = attachment ? 'Save and restart' : 'Map and restart';
+  syncAttachmentRootPolicy();
+  syncAttachmentPolicy();
+  ui.attachmentDialog.showModal();
+}
+
+async function saveAttachment(event) {
+  event.preventDefault();
+  ui.saveAttachment.disabled = true;
+  ui.attachmentFormMessage.textContent = 'Validating the source and replacing the idle runtime…';
+  ui.attachmentFormMessage.classList.remove('hidden');
+  try {
+    const id = ui.attachmentId.value;
+    await api(id ? agentApi(`attachments/${encodeURIComponent(id)}`) : agentApi('attachments'), {
+      method: id ? 'PATCH' : 'POST',
+      body: JSON.stringify({
+        ...(!id ? {
+          source: {
+            rootId: ui.attachmentRoot.value,
+            relativePath: ui.attachmentPath.value.trim() || '.',
+            name: (ui.attachmentPath.value === '.' ? ui.attachmentRoot.selectedOptions[0]?.textContent.split(' · ')[0] : ui.attachmentPath.value.split('/').at(-1)) || ui.attachmentName.value.trim()
+          }
+        } : {}),
+        mountName: ui.attachmentName.value.trim(),
+        access: ui.attachmentAccess.value,
+        purpose: ui.attachmentPurpose.value
+      })
+    });
+    ui.attachmentDialog.close();
+    await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
+    ui.attachmentMessage.textContent = id ? 'Folder access updated. The replacement runtime is starting.' : 'Folder mapped. The replacement runtime is starting.';
+  } catch (error) {
+    ui.attachmentFormMessage.textContent = error.message;
+  } finally {
+    ui.saveAttachment.disabled = false;
+  }
+}
+
+async function detachDataSource() {
+  const attachment = agentAttachments.find((candidate) => candidate.id === ui.attachmentId.value);
+  if (!attachment || !window.confirm(`Unmap “${attachment.source.name}” and restart this agent runtime? Files in the host folder will not be deleted.`)) return;
+  ui.detachDataSource.disabled = true;
+  ui.attachmentFormMessage.textContent = 'Removing the mount and replacing the idle runtime…';
+  ui.attachmentFormMessage.classList.remove('hidden');
+  try {
+    await api(agentApi(`attachments/${encodeURIComponent(attachment.id)}`), { method: 'DELETE' });
+    ui.attachmentDialog.close();
+    await Promise.all([refreshData(), refreshStatus(), refreshWorkspace()]);
+    ui.attachmentMessage.textContent = 'Folder unmapped; its host files were left intact.';
+  } catch (error) {
+    ui.attachmentFormMessage.textContent = error.message;
+  } finally {
+    ui.detachDataSource.disabled = false;
+  }
+}
+
 async function saveAgent(event) {
   event.preventDefault();
   ui.saveAgent.disabled = true;
@@ -1578,6 +1929,7 @@ async function refreshRuntimeImage() {
   try {
     const result = await api(agentApi('runtime/refresh'), { method: 'POST' });
     currentAgent.runtime = result.runtime;
+    renderRuntimeError(result.runtime);
     setConnection('online', `Runtime refreshed onto ${result.runtime.image || 'the current image'}`);
     await loadRuntimeDrift();
     await refreshStatus();
@@ -1903,6 +2255,7 @@ async function refreshAgentLive() {
   await loadRuntimeDrift({ maxAgeMs: DRIFT_RESYNC_MS });
   await refreshStatus();
   if (location.hash === '#tools') await refreshMcp();
+  if (location.hash === '#data') await refreshData();
 }
 
 async function startAuth() {
@@ -1975,35 +2328,152 @@ async function refreshAuthentication() {
   }
 }
 
+function buildWorkspaceTree(entries) {
+  const root = { name: '', path: '', type: 'directory', children: new Map() };
+  for (const entry of entries) {
+    if (!entry || !['directory', 'file'].includes(entry.type) || typeof entry.path !== 'string') continue;
+    const normalized = entry.path.replace(/\/+$/, '');
+    const segments = normalized.split('/').filter(Boolean);
+    if (!segments.length || segments.some((segment) => segment === '.' || segment === '..')) continue;
+    let parent = root;
+    for (let index = 0; index < segments.length; index += 1) {
+      const name = segments[index];
+      const path = segments.slice(0, index + 1).join('/');
+      const last = index === segments.length - 1;
+      const type = last ? entry.type : 'directory';
+      let node = parent.children.get(name);
+      if (!node) {
+        node = { name, path, type, size: last ? entry.size ?? null : null, children: new Map() };
+        parent.children.set(name, node);
+      } else if (last) {
+        node.type = type;
+        node.size = entry.size ?? null;
+      }
+      parent = node;
+    }
+  }
+  return root;
+}
+
+function sortedWorkspaceChildren(node) {
+  return [...node.children.values()].sort((left, right) => (
+    left.type === right.type
+      ? left.name.localeCompare(right.name)
+      : left.type === 'directory' ? -1 : 1
+  ));
+}
+
+function workspaceNodeMatches(node, query) {
+  if (!query || node.path.toLowerCase().includes(query)) return true;
+  return node.type === 'directory' && sortedWorkspaceChildren(node).some((child) => workspaceNodeMatches(child, query));
+}
+
+function renderWorkspaceNode(node, depth, query) {
+  const item = document.createElement('div');
+  item.className = `file-tree-item ${node.type === 'directory' ? 'directory' : 'file'}`;
+  item.dataset.path = node.path;
+  item.setAttribute('role', 'treeitem');
+  item.setAttribute('aria-level', String(depth + 1));
+
+  const row = document.createElement(node.type === 'directory' ? 'button' : 'div');
+  row.className = 'file-tree-row';
+  row.style.setProperty('--tree-indent', `${depth * 17}px`);
+  row.title = node.path;
+  if (node.type === 'directory') row.type = 'button';
+
+  const forcedOpen = Boolean(query);
+  const open = forcedOpen || expandedWorkspaceDirectories.has(node.path);
+  const disclosure = document.createElement('span');
+  disclosure.className = 'file-tree-disclosure';
+  disclosure.textContent = node.type === 'directory' ? (open ? '▾' : '▸') : '·';
+  const icon = document.createElement('span');
+  icon.className = 'file-tree-icon';
+  icon.textContent = node.type === 'directory' ? '□' : '–';
+  const name = document.createElement('span');
+  name.className = 'file-tree-name';
+  name.textContent = node.name;
+  const meta = document.createElement('span');
+  meta.className = 'file-tree-meta';
+  meta.textContent = node.type === 'directory' ? `${node.children.size} item${node.children.size === 1 ? '' : 's'}` : formatBytes(node.size);
+  row.append(disclosure, icon, name, meta);
+  item.append(row);
+
+  if (node.type === 'directory') {
+    row.setAttribute('aria-expanded', String(open));
+    row.addEventListener('click', () => {
+      if (expandedWorkspaceDirectories.has(node.path)) expandedWorkspaceDirectories.delete(node.path);
+      else expandedWorkspaceDirectories.add(node.path);
+      renderWorkspaceNavigator();
+    });
+    if (open) {
+      const group = document.createElement('div');
+      group.className = 'file-tree-group';
+      group.setAttribute('role', 'group');
+      for (const child of sortedWorkspaceChildren(node)) {
+        if (workspaceNodeMatches(child, query)) group.append(renderWorkspaceNode(child, depth + 1, query));
+      }
+      item.append(group);
+    }
+  }
+  return item;
+}
+
+function renderWorkspaceNavigator() {
+  ui.fileList.replaceChildren();
+  const query = ui.workspaceSearch.value.trim().toLowerCase();
+  const visible = workspaceTree ? sortedWorkspaceChildren(workspaceTree).filter((node) => workspaceNodeMatches(node, query)) : [];
+  if (!visible.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = workspaceEntries.length ? 'No files match this filter.' : 'No artifacts yet.';
+    ui.fileList.append(empty);
+  } else {
+    for (const node of visible) ui.fileList.append(renderWorkspaceNode(node, 0, query));
+  }
+  const count = `${workspaceEntries.length} item${workspaceEntries.length === 1 ? '' : 's'}`;
+  ui.workspaceListMessage.textContent = workspaceTruncated
+    ? `${count} shown · listing limit reached`
+    : count;
+}
+
+function setAllWorkspaceDirectories(expanded) {
+  expandedWorkspaceDirectories.clear();
+  if (expanded && workspaceTree) {
+    const visit = (node) => {
+      for (const child of node.children.values()) {
+        if (child.type === 'directory') {
+          expandedWorkspaceDirectories.add(child.path);
+          visit(child);
+        }
+      }
+    };
+    visit(workspaceTree);
+  }
+  renderWorkspaceNavigator();
+}
+
 async function refreshWorkspace() {
   if (!currentAgent) return;
   try {
     const { workspace } = await api(agentApi('workspace'));
-    const entries = workspace?.entries ?? [];
-    ui.fileList.replaceChildren();
-    if (!entries.length) {
-      const empty = document.createElement('p');
-      empty.className = 'empty';
-      empty.textContent = 'No artifacts yet.';
-      ui.fileList.append(empty);
-      return;
+    const configuredWorkingDirectory = agentAttachments.find((attachment) => attachment.purpose === 'working-directory')?.target;
+    const root = configuredWorkingDirectory ?? workspace?.root ?? currentAgent?.runtime?.workingDirectory ?? '/workspace';
+    renderWorkspaceSummary(root);
+    if (currentWorkspaceRoot !== root) {
+      currentWorkspaceRoot = root;
+      expandedWorkspaceDirectories.clear();
+      ui.workspaceSearch.value = '';
     }
-    for (const entry of entries) {
-      const row = document.createElement('div');
-      row.className = 'file';
-      const kind = document.createElement('span');
-      kind.className = 'kind';
-      kind.textContent = entry.type === 'directory' ? '▸' : '·';
-      const name = document.createElement('span');
-      name.textContent = entry.path;
-      const size = document.createElement('span');
-      size.className = 'size';
-      size.textContent = entry.type === 'file' ? formatBytes(entry.size) : '';
-      row.append(kind, name, size);
-      ui.fileList.append(row);
-    }
+    workspaceEntries = Array.isArray(workspace?.entries) ? workspace.entries : [];
+    workspaceTruncated = workspace?.truncated === true;
+    workspaceTree = buildWorkspaceTree(workspaceEntries);
+    renderWorkspaceNavigator();
   } catch {
+    workspaceEntries = [];
+    workspaceTree = null;
+    workspaceTruncated = false;
     ui.fileList.innerHTML = '<p class="empty">Workspace unavailable until a runtime is attached.</p>';
+    ui.workspaceListMessage.textContent = '';
   }
 }
 
@@ -2061,7 +2531,7 @@ async function runTask() {
   ui.workerState.className = 'pill busy';
   ui.runMessage.textContent = 'Opening event stream…';
   try {
-    const response = await fetch(agentApi('tasks'), {
+    const response = await authenticatedFetch(agentApi('tasks'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ prompt })
@@ -2160,6 +2630,23 @@ $('#apply-mcp').addEventListener('click', applyMcp);
 $('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
 $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
+ui.attachmentRoot.addEventListener('change', () => {
+  folderBrowserPath = '.';
+  ui.attachmentPath.value = '.';
+  syncAttachmentRootPolicy();
+  syncAttachmentPolicy();
+  if (!ui.hostFolderBrowser.classList.contains('hidden')) void browseHostFolder('.');
+});
+ui.browseAttachment.addEventListener('click', openHostFolderBrowser);
+$('#close-folder-browser').addEventListener('click', closeHostFolderBrowser);
+ui.chooseFolder.addEventListener('click', chooseHostFolder);
+ui.attachmentForm.addEventListener('submit', saveAttachment);
+ui.attachmentAccess.addEventListener('change', syncAttachmentPolicy);
+ui.attachmentPurpose.addEventListener('change', syncAttachmentPolicy);
+$('#new-attachment').addEventListener('click', () => openAttachmentDialog());
+$('#close-attachment-dialog').addEventListener('click', () => ui.attachmentDialog.close());
+$('#cancel-attachment').addEventListener('click', () => ui.attachmentDialog.close());
+ui.detachDataSource.addEventListener('click', detachDataSource);
 ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
 });
@@ -2177,6 +2664,9 @@ ui.accessPolicyButton.addEventListener('click', () => ui.accessPolicyDialog.show
 $('#close-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
 $('#dismiss-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());
 $('#refresh-files').addEventListener('click', refreshWorkspace);
+ui.workspaceSearch.addEventListener('input', renderWorkspaceNavigator);
+$('#expand-workspace').addEventListener('click', () => setAllWorkspaceDirectories(true));
+$('#collapse-workspace').addEventListener('click', () => setAllWorkspaceDirectories(false));
 $('#clear-output').addEventListener('click', () => {
   ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';
   ui.rawOutput.textContent = '';

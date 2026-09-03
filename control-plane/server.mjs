@@ -6,6 +6,15 @@ import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createAuthService } from './auth.mjs';
 import { createControlMcp } from './control-mcp.mjs';
+import {
+  assertWriteLease,
+  normalizeAttachment,
+  normalizeDataSource,
+  parseAttachmentRoots,
+  publicAttachment,
+  publicAttachmentRoots,
+  publicDataSource
+} from './data-attachments.mjs';
 import { createDelegationService } from './delegation-service.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
@@ -77,7 +86,9 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
       managed: false,
       state: 'unprovisioned',
       credentials: 'none',
-      storage: { auth: 'none', binary: 'none', telemetry: 'none', workspace: 'none' }
+      storage: { auth: 'none', binary: 'none', telemetry: 'none', workspace: 'none', attachments: 0 },
+      workingDirectory: null,
+      lastError: null
     };
   }
   const resolvedBinding = binding
@@ -96,8 +107,10 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
       auth: isolated ? 'isolated' : 'shared',
       binary: isolated ? 'isolated' : 'shared',
       telemetry: isolated ? 'isolated' : 'shared',
-      workspace: isolated ? 'isolated' : 'shared'
+      workspace: isolated ? 'isolated' : 'shared',
+      attachments: runtime.appliedAttachmentIds?.length ?? 0
     },
+    workingDirectory: runtime.workingDirectory ?? '/workspace',
     attachmentCount,
     // The image tag this runtime is actually running, so drift from the
     // configured image is visible rather than silent. A local tag, not a secret.
@@ -105,6 +118,9 @@ function publicRuntime(runtime, binding = null, attachmentCount = 0) {
     // True when the configured image has been rebuilt since this container was
     // created, null when either side is unknown. Refreshing clears it.
     outdated: runtime.outdated ?? null,
+    // Runtime-level recovery failures must remain visible after the mutating
+    // request completes. This never contains connector credential values.
+    lastError: runtime.lastError ? String(runtime.lastError).slice(0, 4_000) : null,
     createdAt: runtime.createdAt ?? null,
     updatedAt: runtime.updatedAt ?? null
   };
@@ -208,10 +224,11 @@ function normalizeRuntimeRequest(value, defaultMode) {
 export function createControlPlane(options = {}) {
   const primaryWorkerToken = options.workerToken ?? process.env.WORKER_TOKEN ?? '';
   const dataPath = options.dataPath === null ? null : (options.dataPath ?? process.env.CONTROL_PLANE_DATA_PATH ?? null);
+  const attachmentRoots = parseAttachmentRoots(options.attachmentRoots ?? process.env.ATTACHMENT_ROOTS_JSON ?? {});
   const runtimeManager = options.runtimeManager !== undefined
     ? options.runtimeManager
     : process.env.RUNTIME_PROVISIONER === 'docker'
-      ? createDockerRuntimeManager()
+      ? createDockerRuntimeManager({ attachmentRoots })
       : null;
   const config = {
     workerUrl: (options.workerUrl ?? process.env.WORKER_URL ?? 'http://127.0.0.1:7777').replace(/\/$/, ''),
@@ -262,8 +279,13 @@ export function createControlPlane(options = {}) {
   const runtimes = new Map();
   const mcpServers = new Map();
   const mcpBindings = new Map();
+  const dataSources = new Map();
+  const dataAttachments = new Map();
   const credentialRecords = new Map();
   let persistQueue = Promise.resolve();
+  let storageMutationQueue = Promise.resolve();
+  const pendingAttachmentSets = new Map();
+  const activeAgentOperations = new Map();
   const defaultAgent = () => {
     const preferred = agents.get(config.defaultAgentId);
     if (preferred && !deletingAgents.has(preferred.id)) return preferred;
@@ -280,17 +302,86 @@ export function createControlPlane(options = {}) {
       runtimes: [...runtimes.values()],
       mcpServers: [...mcpServers.values()],
       mcpBindings: [...mcpBindings.values()],
+      dataSources: [...dataSources.values()],
+      dataAttachments: [...dataAttachments.values()],
       // Sealed envelopes only. Without the wrapping key these are inert, which is
       // the whole and only thing encryption at rest buys in this deployment.
       credentials: [...credentialRecords.values()]
     };
-    persistQueue = persistQueue.then(async () => {
+    // A failed write must reject its caller without poisoning every later
+    // registry transaction, including the rollback that caller may attempt.
+    persistQueue = persistQueue.catch(() => {}).then(async () => {
       await mkdir(dirname(config.dataPath), { recursive: true });
       const temporary = `${config.dataPath}.${process.pid}.${randomUUID()}.tmp`;
       await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
       await rename(temporary, config.dataPath);
     });
     return persistQueue;
+  }
+
+  function withStorageMutation(operation) {
+    const result = storageMutationQueue.then(operation, operation);
+    storageMutationQueue = result.catch(() => {});
+    return result;
+  }
+
+  const pendingSourceIds = () => new Set(
+    [...pendingAttachmentSets.values()].flatMap((claim) => [...claim.reservedSourceIds])
+  );
+
+  const sourceHasPendingMutation = (sourceId) => pendingSourceIds().has(sourceId);
+
+  function reserveAttachmentSet(agentId, nextAttachments, provisionalSources, removeSourceIds) {
+    const otherClaims = [...pendingAttachmentSets.entries()]
+      .filter(([otherAgentId]) => otherAgentId !== agentId)
+      .map(([, claim]) => claim);
+    const requestedSourceIds = new Set(nextAttachments.map((attachment) => attachment.dataSourceId));
+    for (const claim of otherClaims) {
+      if ([...requestedSourceIds].some((sourceId) => claim.removeSourceIds.has(sourceId))) {
+        throw Object.assign(new Error('A referenced data source is being removed; retry after the current storage change finishes'), { status: 409 });
+      }
+      if ([...removeSourceIds].some((sourceId) => claim.reservedSourceIds.has(sourceId))) {
+        throw Object.assign(new Error('A data source is being attached; retry after the current storage change finishes'), { status: 409 });
+      }
+    }
+
+    const leaseSources = new Map(dataSources);
+    for (const claim of otherClaims) {
+      for (const [sourceId, source] of claim.provisionalSources) leaseSources.set(sourceId, source);
+    }
+    for (const [sourceId, source] of provisionalSources) leaseSources.set(sourceId, source);
+    const competing = [
+      ...[...dataAttachments.values()].filter((attachment) => attachment.agentId !== agentId),
+      ...otherClaims.flatMap((claim) => claim.attachments)
+    ];
+    const accepted = [];
+    for (const attachment of nextAttachments) {
+      assertWriteLease(attachment, [...competing, ...accepted], leaseSources, attachmentRoots);
+      accepted.push(attachment);
+    }
+
+    const claim = {
+      attachments: [...nextAttachments],
+      provisionalSources: new Map(provisionalSources),
+      removeSourceIds: new Set(removeSourceIds),
+      reservedSourceIds: new Set([...requestedSourceIds, ...removeSourceIds])
+    };
+    pendingAttachmentSets.set(agentId, claim);
+    return () => {
+      if (pendingAttachmentSets.get(agentId) === claim) pendingAttachmentSets.delete(agentId);
+    };
+  }
+
+  function claimAgentOperation(agentId, operation) {
+    const active = activeAgentOperations.get(agentId);
+    if (active) {
+      throw Object.assign(new Error(`Agent is busy with ${active.label}; wait for it to finish`), { status: 409 });
+    }
+    const claim = { label: operation };
+    activeAgentOperations.set(agentId, claim);
+    return () => {
+      if (activeAgentOperations.get(agentId) === claim) activeAgentOperations.delete(agentId);
+    };
   }
 
   function addLegacyRuntime(adapter, source = {}) {
@@ -374,6 +465,32 @@ export function createControlPlane(options = {}) {
                 createdAt: binding.createdAt ?? new Date().toISOString(),
                 updatedAt: binding.updatedAt ?? new Date().toISOString()
               });
+            }
+            if (stored.schemaVersion >= 4) {
+              for (const source of stored.dataSources ?? []) {
+                if (!source?.id || !source?.name) continue;
+                const normalized = normalizeDataSource(source, {
+                  existingIds: new Set(dataSources.keys()),
+                  roots: attachmentRoots,
+                  defaults: source,
+                  allowUnconfiguredRoot: true
+                });
+                dataSources.set(normalized.id, normalized);
+              }
+              for (const attachment of stored.dataAttachments ?? []) {
+                const source = dataSources.get(attachment?.dataSourceId);
+                if (!attachment?.id || !attachment?.agentId || !agents.has(attachment.agentId) || !source) continue;
+                const normalized = normalizeAttachment(attachment, {
+                  agentId: attachment.agentId,
+                  source,
+                  existing: [...dataAttachments.values()].filter((item) => item.agentId === attachment.agentId),
+                  defaults: attachment
+                });
+                assertWriteLease(normalized, [...dataAttachments.values()], dataSources, attachmentRoots);
+                dataAttachments.set(normalized.id, normalized);
+              }
+            } else {
+              migrated = true;
             }
           } else {
             migrated = true;
@@ -484,6 +601,133 @@ export function createControlPlane(options = {}) {
     return value;
   }
 
+  const attachmentsForAgent = (agentId) => [...dataAttachments.values()].filter((attachment) => attachment.agentId === agentId);
+
+  function requireManagedRuntime(agent) {
+    if (!runtimeManager) throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
+    const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
+    // `dedicated` predates the explicit runtime kind and remains part of the
+    // injected runtime-manager contract. Accept it for older persisted runtimes
+    // and custom provisioners without weakening the isolation requirement.
+    const dedicated = runtime?.kind === 'managed-dedicated' || runtime?.dedicated === true;
+    if (!runtime?.managed || !dedicated) {
+      throw Object.assign(new Error('Data attachments require a managed dedicated runtime'), { status: 409 });
+    }
+    return runtime;
+  }
+
+  async function requireIdleRuntime(agent) {
+    const runtime = requireManagedRuntime(agent);
+    let idle = false;
+    let response;
+    try {
+      ({ response } = await workerFetch(agent, '/v1/status', { timeout: 5_000 }));
+    } catch {
+      // An unreachable worker cannot be streaming a task through this control
+      // plane and may need replacement precisely so it can recover.
+      idle = true;
+    }
+    if (response?.ok) {
+      try { idle = !((await response.json()).task?.active ?? null); }
+      catch { idle = false; }
+    }
+    if (!idle) {
+      throw Object.assign(
+        new Error('Runtime is busy or did not report a usable status; cancel any running task and retry'),
+        { status: 409 }
+      );
+    }
+    return runtime;
+  }
+
+  async function materializeAttachments(agent, attachments, sources = dataSources) {
+    if (!runtimeManager?.materializeAttachments) {
+      if (!attachments.length) return [];
+      throw Object.assign(new Error('The runtime provisioner does not support data attachments'), { status: 503 });
+    }
+    return runtimeManager.materializeAttachments({
+      adapter: agent.adapter,
+      attachments,
+      sources
+    });
+  }
+
+  async function applyAttachmentSet(agent, nextAttachments, { previousAttachments = null, sources = dataSources } = {}) {
+    const runtime = await requireIdleRuntime(agent);
+    const previousIds = new Set(runtime.appliedAttachmentIds ?? []);
+    const previous = previousAttachments
+      ?? attachmentsForAgent(agent.id).filter((attachment) => previousIds.has(attachment.id));
+    const [materialized, previousMaterialized] = await Promise.all([
+      materializeAttachments(agent, nextAttachments, sources),
+      materializeAttachments(agent, previous, sources)
+    ]);
+    try {
+      const replaced = await runtimeManager.recreate(runtime, {
+        agentId: agent.id,
+        attachments: materialized,
+        previousAttachments: previousMaterialized
+      });
+      Object.assign(runtime, replaced, {
+        appliedAttachmentIds: nextAttachments.map((attachment) => attachment.id),
+        workingDirectory: materialized.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace'
+      });
+    } catch (error) {
+      if (error.rollbackRuntime) Object.assign(runtime, error.rollbackRuntime);
+      throw error;
+    }
+  }
+
+  async function commitAttachmentSet(agent, nextAttachments, { provisionalSources = [], removeSourceIds = [] } = {}) {
+    const release = claimAgentOperation(agent.id, 'runtime storage reconfiguration');
+    const provisional = new Map(provisionalSources.map((source) => [source.id, source]));
+    const removals = new Set(removeSourceIds);
+    const sourceView = new Map(dataSources);
+    for (const [sourceId, source] of provisional) {
+      if (sourceView.has(sourceId)) {
+        release();
+        throw Object.assign(new Error(`Data source ${sourceId} already exists`), { status: 409 });
+      }
+      sourceView.set(sourceId, source);
+    }
+    let releaseReservation;
+    try {
+      releaseReservation = reserveAttachmentSet(agent.id, nextAttachments, provisional, removals);
+      const previous = attachmentsForAgent(agent.id);
+      await applyAttachmentSet(agent, nextAttachments, { previousAttachments: previous, sources: sourceView });
+      try {
+        await withStorageMutation(async () => {
+          for (const [sourceId, source] of provisional) dataSources.set(sourceId, source);
+          const removedSources = new Map();
+          for (const sourceId of removals) {
+            if (dataSources.has(sourceId)) removedSources.set(sourceId, dataSources.get(sourceId));
+            dataSources.delete(sourceId);
+          }
+          for (const attachment of previous) dataAttachments.delete(attachment.id);
+          for (const attachment of nextAttachments) dataAttachments.set(attachment.id, attachment);
+          try {
+            await persistAgents();
+          } catch (error) {
+            for (const attachment of nextAttachments) dataAttachments.delete(attachment.id);
+            for (const attachment of previous) dataAttachments.set(attachment.id, attachment);
+            for (const sourceId of provisional.keys()) dataSources.delete(sourceId);
+            for (const [sourceId, source] of removedSources) dataSources.set(sourceId, source);
+            throw error;
+          }
+        });
+      } catch (error) {
+        try {
+          await applyAttachmentSet(agent, previous, { previousAttachments: nextAttachments, sources: sourceView });
+        } catch (rollbackError) {
+          error.message = `${error.message}; restoring the previous attachment set also failed: ${rollbackError.message}`;
+        }
+        throw error;
+      }
+    } finally {
+      releaseReservation?.();
+      release();
+    }
+  }
+
   const credentials = createCredentialStore({
     records: credentialRecords,
     persist: persistAgents,
@@ -542,6 +786,8 @@ export function createControlPlane(options = {}) {
   }
 
   async function proxyTask(req, res, agent) {
+    const release = claimAgentOperation(agent.id, 'an active task');
+    try {
     const request = await readJson(req);
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
     if (!prompt) return json(res, 400, { error: 'prompt is required' });
@@ -567,6 +813,9 @@ export function createControlPlane(options = {}) {
       res.write(value);
     }
     res.end();
+    } finally {
+      release();
+    }
   }
 
   async function cancelKnownWorkerTask(agent, taskId) {
@@ -586,6 +835,14 @@ export function createControlPlane(options = {}) {
 
   async function dispatchAgentTask({ agentId, prompt, timeoutMs, onTaskId = null }) {
     const agent = requireAgent(agentId);
+    let release;
+    try {
+      release = claimAgentOperation(agent.id, 'an active task');
+    } catch (error) {
+      if (error.status === 409) return { status: 'skipped_busy', error: error.message };
+      throw error;
+    }
+    try {
     const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
     if (status.task?.active) {
       return { status: 'skipped_busy', error: `Agent is busy with task ${status.task.active.id ?? 'unknown'}` };
@@ -666,6 +923,9 @@ export function createControlPlane(options = {}) {
         await cancelKnownWorkerTask(agent, taskId).catch(() => {});
       }
       throw error;
+    }
+    } finally {
+      release();
     }
   }
 
@@ -846,6 +1106,12 @@ export function createControlPlane(options = {}) {
       if (delegation.hasActiveForAgent(id)) {
         throw Object.assign(new Error('Wait for delegated work assigned to this agent to finish before deleting it'), { status: 409 });
       }
+      if (attachmentsForAgent(id).length) {
+        throw Object.assign(new Error('Detach every data source before deleting this agent'), { status: 409 });
+      }
+      if (activeAgentOperations.has(id)) {
+        throw Object.assign(new Error(`Wait for ${activeAgentOperations.get(id).label} to finish before deleting this agent`), { status: 409 });
+      }
       deletingAgents.add(id);
       try {
         const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
@@ -969,6 +1235,216 @@ export function createControlPlane(options = {}) {
     return false;
   }
 
+  async function handleDataAttachments(req, res, url, { mutationLocked = false } = {}) {
+    const storagePath = url.pathname === '/api/v1/data-sources'
+      || /^\/api\/v1\/data-sources\/[^/]+$/.test(url.pathname);
+    if (!mutationLocked && storagePath && ['POST', 'PATCH', 'DELETE'].includes(req.method)) {
+      return withStorageMutation(() => handleDataAttachments(req, res, url, { mutationLocked: true }));
+    }
+    const rootBrowserMatch = url.pathname.match(/^\/api\/v1\/attachment-roots\/([^/]+)\/directories$/);
+    if (rootBrowserMatch) {
+      if (req.method !== 'GET') return false;
+      if (!runtimeManager?.listHostDirectories) {
+        throw Object.assign(new Error('Host folder browsing is unavailable'), { status: 503 });
+      }
+      const rootId = decodeURIComponent(rootBrowserMatch[1]);
+      const root = attachmentRoots.get(rootId);
+      if (!root) throw Object.assign(new Error('Attachment root not found'), { status: 404 });
+      const agentId = url.searchParams.get('agentId');
+      if (!agentId) throw Object.assign(new Error('agentId is required'), { status: 400 });
+      const agent = requireAgent(agentId);
+      requireManagedRuntime(agent);
+      const listing = await runtimeManager.listHostDirectories({
+        rootId,
+        relativePath: url.searchParams.get('path') ?? '.',
+        adapter: agent.adapter
+      });
+      return json(res, 200, {
+        root: { id: root.id, label: root.label, allowWrite: root.allowWrite },
+        ...listing
+      });
+    }
+    if (url.pathname === '/api/v1/attachment-roots') {
+      if (req.method === 'GET') return json(res, 200, { roots: publicAttachmentRoots(attachmentRoots) });
+      return false;
+    }
+
+    if (url.pathname === '/api/v1/data-sources') {
+      if (req.method === 'GET') {
+        return json(res, 200, {
+          dataSources: [...dataSources.values()]
+            .filter((source) => source.scope !== 'attachment')
+            .map((source) => publicDataSource(source, attachmentRoots))
+        });
+      }
+      if (req.method === 'POST') {
+        const body = await readJson(req);
+        const source = normalizeDataSource(body, {
+          existingIds: new Set([...dataSources.keys(), ...pendingSourceIds()]),
+          roots: attachmentRoots
+        });
+        if (source.kind === 'managed-volume') {
+          if (!runtimeManager?.createManagedDataVolume) {
+            throw Object.assign(new Error('Managed data volumes are unavailable'), { status: 503 });
+          }
+          source.volumeName = await runtimeManager.createManagedDataVolume(source.id);
+        }
+        dataSources.set(source.id, source);
+        try {
+          await persistAgents();
+        } catch (error) {
+          dataSources.delete(source.id);
+          if (source.volumeName) await runtimeManager.deleteManagedDataVolume?.(source.id, source.volumeName).catch(() => {});
+          throw error;
+        }
+        return json(res, 201, { dataSource: publicDataSource(source, attachmentRoots) });
+      }
+      return false;
+    }
+
+    const sourceMatch = url.pathname.match(/^\/api\/v1\/data-sources\/([^/]+)$/);
+    if (sourceMatch) {
+      const sourceId = decodeURIComponent(sourceMatch[1]);
+      const source = dataSources.get(sourceId);
+      if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
+      if (req.method === 'GET') return json(res, 200, { dataSource: publicDataSource(source, attachmentRoots) });
+      if (req.method === 'PATCH') {
+        const body = await readJson(req);
+        // Request bodies are caller-paced. Re-check only after the final await
+        // and keep the check-to-write section synchronous so an attachment
+        // reservation cannot appear between the guard and the registry update.
+        if (sourceHasPendingMutation(source.id)) {
+          throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
+        }
+        if (body.id !== undefined && body.id !== source.id) {
+          throw Object.assign(new Error('Data source id cannot be changed'), { status: 409 });
+        }
+        if (body.kind && body.kind !== source.kind) throw Object.assign(new Error('Data source kind cannot be changed'), { status: 409 });
+        const inUse = [...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id);
+        if (inUse && ((body.rootId && body.rootId !== source.rootId) || (body.relativePath && body.relativePath !== source.relativePath))) {
+          throw Object.assign(new Error('Detach this data source before changing its location'), { status: 409 });
+        }
+        const updated = normalizeDataSource({ ...source, ...body }, {
+          existingIds: new Set(dataSources.keys()),
+          roots: attachmentRoots,
+          defaults: source
+        });
+        dataSources.set(source.id, updated);
+        try {
+          await persistAgents();
+        } catch (error) {
+          dataSources.set(source.id, source);
+          throw error;
+        }
+        return json(res, 200, { dataSource: publicDataSource(updated, attachmentRoots) });
+      }
+      if (req.method === 'DELETE') {
+        const body = await readJson(req);
+        if (source.kind === 'managed-volume' && (body.confirmation !== source.id || body.deleteVolume !== true)) {
+          throw Object.assign(new Error('Deleting a managed volume requires deleteVolume=true and confirmation matching the data source id'), { status: 400 });
+        }
+        // Do not put an await between these guards and delete: attachment
+        // reservations are made synchronously on the same event loop.
+        if (sourceHasPendingMutation(source.id)) {
+          throw Object.assign(new Error('This data source is part of an in-flight attachment change'), { status: 409 });
+        }
+        if ([...dataAttachments.values()].some((attachment) => attachment.dataSourceId === source.id)) {
+          throw Object.assign(new Error('Detach this data source from every agent before deleting it'), { status: 409 });
+        }
+        dataSources.delete(source.id);
+        try {
+          await persistAgents();
+        } catch (error) {
+          dataSources.set(source.id, source);
+          throw error;
+        }
+        if (source.kind === 'managed-volume') {
+          try {
+            await runtimeManager.deleteManagedDataVolume(source.id, source.volumeName);
+          } catch (error) {
+            dataSources.set(source.id, source);
+            try { await persistAgents(); }
+            catch (restoreError) { error.message = `${error.message}; restoring the data-source registry also failed: ${restoreError.message}`; }
+            throw error;
+          }
+        }
+        res.writeHead(204, { 'cache-control': 'no-store' });
+        return res.end();
+      }
+      return false;
+    }
+
+    const attachmentMatch = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/attachments(?:\/([^/]+))?$/);
+    if (!attachmentMatch) return false;
+    const agent = requireAgent(decodeURIComponent(attachmentMatch[1]));
+    const attachmentId = attachmentMatch[2] ? decodeURIComponent(attachmentMatch[2]) : null;
+    const current = attachmentsForAgent(agent.id);
+    if (!attachmentId && req.method === 'GET') {
+      return json(res, 200, {
+        attachments: current.map((attachment) => publicAttachment(attachment, dataSources.get(attachment.dataSourceId), attachmentRoots)),
+        workingDirectory: runtimes.get(agent.runtimeId)?.workingDirectory ?? '/workspace'
+      });
+    }
+    if (!attachmentId && req.method === 'POST') {
+      const body = await readJson(req);
+      if (body.source && body.dataSourceId) {
+        throw Object.assign(new Error('Provide either source or dataSourceId, not both'), { status: 400 });
+      }
+      let source;
+      let attachmentScoped = false;
+      if (body.source) {
+        source = normalizeDataSource({
+          ...body.source,
+          id: `mapping-${randomUUID()}`,
+          kind: 'host-directory',
+          name: body.source.name ?? body.mountName ?? 'Mapped folder'
+        }, { existingIds: new Set([...dataSources.keys(), ...pendingSourceIds()]), roots: attachmentRoots });
+        source.scope = 'attachment';
+        attachmentScoped = true;
+      } else {
+        source = dataSources.get(body.dataSourceId);
+        if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
+      }
+      try {
+        const attachment = normalizeAttachment(body, { agentId: agent.id, source, existing: current });
+        await commitAttachmentSet(agent, [...current, attachment], {
+          provisionalSources: attachmentScoped ? [source] : []
+        });
+        return json(res, 201, { attachment: publicAttachment(attachment, source, attachmentRoots) });
+      } catch (error) {
+        throw error;
+      }
+    }
+    const existing = dataAttachments.get(attachmentId);
+    if (!existing || existing.agentId !== agent.id) throw Object.assign(new Error('Attachment not found'), { status: 404 });
+    if (req.method === 'PATCH') {
+      const body = await readJson(req);
+      const sourceId = body.dataSourceId ?? existing.dataSourceId;
+      const source = dataSources.get(sourceId);
+      if (!source) throw Object.assign(new Error('Data source not found'), { status: 404 });
+      const updated = normalizeAttachment({ ...existing, ...body }, {
+        agentId: agent.id,
+        source,
+        existing: current,
+        defaults: existing
+      });
+      await commitAttachmentSet(agent, current.map((attachment) => attachment.id === existing.id ? updated : attachment));
+      return json(res, 200, { attachment: publicAttachment(updated, source, attachmentRoots) });
+    }
+    if (req.method === 'DELETE') {
+      const source = dataSources.get(existing.dataSourceId);
+      const nextAttachments = current.filter((attachment) => attachment.id !== existing.id);
+      const removeSourceIds = source?.scope === 'attachment'
+        && ![...dataAttachments.values()].some((attachment) => attachment.id !== existing.id && attachment.dataSourceId === source.id)
+        ? [source.id]
+        : [];
+      await commitAttachmentSet(agent, nextAttachments, { removeSourceIds });
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
+    return false;
+  }
+
   // Replace a managed runtime's container with one built from the current image,
   // keeping its volumes so the agent stays authenticated. Without this the only
   // way to get new worker code onto an agent is to destroy its credentials.
@@ -988,61 +1464,57 @@ export function createControlPlane(options = {}) {
   }
 
   async function refreshAgentRuntime(req, res, agent) {
-    if (!runtimeManager) {
-      throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
-    }
-    const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
-    if (!runtime?.managed) {
-      throw Object.assign(new Error('Only a managed runtime can be refreshed'), { status: 409 });
-    }
-    // Replacing the container kills whatever it is running, so never do it
-    // underneath a task.
-    let idle = false;
+    const release = claimAgentOperation(agent.id, 'runtime image refresh');
     try {
-      const { response } = await workerFetch(agent, '/v1/status', { timeout: 5_000 });
-      if (response.ok) {
-        idle = !((await response.json()).task?.active ?? null);
+      const runtime = await requireIdleRuntime(agent);
+      const attachments = attachmentsForAgent(agent.id);
+      const materialized = await materializeAttachments(agent, attachments);
+      let replaced;
+      try {
+        replaced = await runtimeManager.recreate(runtime, {
+          agentId: agent.id,
+          attachments: materialized,
+          previousAttachments: materialized
+        });
+      } catch (error) {
+        if (error.rollbackRuntime) Object.assign(runtime, error.rollbackRuntime);
+        throw error;
       }
-      // A reachable worker that answers with an error or unparseable body tells
-      // us nothing about whether it is busy, so it stays not-idle and refuses.
-    } catch {
-      // Unreachable is different: that is the state a refresh exists to repair,
-      // and a worker that cannot be reached is not streaming a task either.
-      idle = true;
-    }
-    if (!idle) {
-      throw Object.assign(
-        new Error('Runtime is busy or did not report a usable status; cancel any running task and retry'),
-        { status: 409 }
-      );
-    }
-
-    const replaced = await runtimeManager.recreate(runtime, { agentId: agent.id });
-    Object.assign(runtime, replaced);
-    // outdated is computed during a fleet poll, so without this the response
-    // would still report the drift that was just resolved.
-    const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
-    runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
-    await persistAgents();
-    // The replacement process holds no delivered credentials, and MCP state on
-    // disk still names them. Re-applying restores the agent to the configuration
-    // the registry already claims it has — but the container has only just been
-    // started, so wait for it to answer before asking it to do anything.
-    let reapplied = null;
-    try {
-      await workerReady(agent);
-      await mcpService.applyAgent(agent.id);
-      reapplied = true;
-    } catch (error) {
-      reapplied = false;
-      runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+      Object.assign(runtime, replaced, {
+        appliedAttachmentIds: attachments.map((attachment) => attachment.id),
+        workingDirectory: materialized.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace'
+      });
+      // outdated is computed during a fleet poll, so without this the response
+      // would still report the drift that was just resolved.
+      const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
+      runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
       await persistAgents();
+      // The replacement process holds no delivered credentials, and MCP state on
+      // disk still names them. Re-applying restores the agent to the configuration
+      // the registry already claims it has — but the container has only just been
+      // started, so wait for it to answer before asking it to do anything.
+      let reapplied = null;
+      try {
+        await workerReady(agent);
+        await mcpService.applyAgent(agent.id);
+        reapplied = true;
+      } catch (error) {
+        reapplied = false;
+        runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+        await persistAgents();
+      }
+      if (reapplied && runtime.lastError) {
+        runtime.lastError = null;
+        await persistAgents();
+      }
+      return json(res, 200, {
+        runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
+        refreshed: true,
+        mcpReapplied: reapplied
+      });
+    } finally {
+      release();
     }
-    return json(res, 200, {
-      runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
-      refreshed: true,
-      mcpReapplied: reapplied
-    });
   }
 
   // Operator-facing credential management. A value goes in and never comes back;
@@ -1260,6 +1732,8 @@ export function createControlPlane(options = {}) {
 
       const scheduled = await handleSchedules(req, res, url);
       if (scheduled !== false) return scheduled;
+      const data = await handleDataAttachments(req, res, url);
+      if (data !== false) return data;
       const credential = await handleCredentials(req, res, url);
       if (credential !== false) return credential;
       const mcp = await handleMcp(req, res, url);

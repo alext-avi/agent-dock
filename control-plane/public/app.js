@@ -1,6 +1,12 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-import { buildMcpWorkshopPrompt, extractMcpWorkshopProposal } from './mcp-workshop.js';
+import {
+  buildMcpWorkshopPrompt,
+  createWorkshopRunState,
+  extractMcpWorkshopProposal,
+  observeWorkshopRunEvent,
+  requireSuccessfulWorkshopRun
+} from './mcp-workshop.js';
 
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
@@ -27,7 +33,7 @@ const ui = {
   registryCount: $('#registry-count'),
   registryMessage: $('#registry-message'),
   newRegistryMcp: $('#new-registry-mcp'),
-  credentialMessage: $('#credential-message'),
+  credentialListMessage: $('#credential-list-message'),
   workshop: $('#workshop'),
   workshopAgent: $('#workshop-agent'),
   workshopObjective: $('#workshop-objective'),
@@ -1397,7 +1403,7 @@ function openMcpDialog(server = null) {
   ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
-  ui.deleteMcpDefinition.classList.toggle('hidden', !server);
+  ui.deleteMcpDefinition.classList.toggle('hidden', !server || !currentAgent);
   ui.saveMcp.textContent = currentAgent ? (server ? 'Save and apply' : 'Save and attach') : 'Save connector';
   syncMcpTransportFields();
   void prepareWorkshop(server);
@@ -1447,28 +1453,56 @@ async function applyMcp() {
 // conversation, so "no, it uses a different endpoint" is a correction rather
 // than a fresh start.
 let workshopConversationId = null;
+let workshopConversationAgentId = null;
 let workshopRunning = false;
+// Bumped every time the dialog is prepared. A stream carrying an older token is
+// a run the operator has walked away from: it stops reading and writes nothing.
+let workshopRunToken = 0;
+let workshopAbort = null;
+let workshopTurns = 0;
+let workshopContinuity = true;
 
-function workshopNote(text, kind = '') {
-  if (!text) return;
+const WORKSHOP_LOG_LIMIT = 60;
+
+// Every line says who produced it. The operator's own words were being styled
+// with the class named for the model and rendered brighter than the model's
+// output, which makes a transcript impossible to read honestly.
+function workshopNote(speaker, text, kind = '', token = workshopRunToken) {
+  if (!text || token !== workshopRunToken) return;
   const line = document.createElement('p');
-  if (kind) line.className = kind;
-  line.textContent = text;
+  line.className = [kind, speaker === 'you' ? 'from-operator' : 'from-harness'].filter(Boolean).join(' ');
+  const who = document.createElement('span');
+  who.className = 'speaker';
+  who.textContent = speaker === 'you' ? 'you' : 'harness';
+  line.append(who, document.createTextNode(text));
   ui.workshopLog.classList.remove('hidden');
   ui.workshopLog.append(line);
+  // A runaway harness should not be able to grow the operator's tab until it dies.
+  while (ui.workshopLog.childElementCount > WORKSHOP_LOG_LIMIT) ui.workshopLog.firstElementChild.remove();
   ui.workshopLog.scrollTop = ui.workshopLog.scrollHeight;
 }
 
 async function prepareWorkshop(server) {
   workshopConversationId = null;
+  workshopConversationAgentId = null;
+  workshopTurns = 0;
+  workshopContinuity = true;
   workshopRunning = false;
   ui.workshopLog.replaceChildren();
   ui.workshopLog.classList.add('hidden');
   ui.workshopStatus.textContent = '';
   ui.workshopObjective.value = '';
+  // A run that threw outside the try used to leave this disabled for the life of
+  // the page, so the button silently did nothing ever again.
+  ui.workshopRun.disabled = false;
+  workshopRunToken += 1;
+  workshopAbort?.abort();
+  workshopAbort = null;
   // Only offered when defining something new. Editing an existing connector is
   // a deliberate act on a known shape, not a question for a harness.
-  ui.workshop.classList.toggle('hidden', Boolean(server));
+  // Hidden until the harness list is known: it used to appear at once with
+  // "No agents available" as its only option, then either fill in or vanish.
+  ui.workshop.classList.add('hidden');
   if (server) return;
   try {
     const { agents } = await api(`${API_ROOT}/agents`);
@@ -1484,7 +1518,11 @@ async function prepareWorkshop(server) {
       option.textContent = agent.name ?? agent.id;
       ui.workshopAgent.append(option);
     }
-    if (currentAgent) ui.workshopAgent.value = currentAgent.id;
+    // Only when that agent is in the list; otherwise this blanks the picker.
+    if (currentAgent && usable.some((agent) => agent.id === currentAgent.id)) {
+      ui.workshopAgent.value = currentAgent.id;
+    }
+    ui.workshop.classList.remove('hidden');
   } catch {
     // The dialog still works as a plain form.
     ui.workshop.classList.add('hidden');
@@ -1518,30 +1556,53 @@ async function runWorkshop() {
   workshopRunning = true;
   ui.workshopRun.disabled = true;
   ui.workshopStatus.textContent = 'Asking…';
-  workshopNote(objective, 'harness');
+  workshopNote('you', objective);
 
-  // The first ask carries the full instructions; later ones are corrections
-  // inside the same conversation, so the harness still has everything it learned.
-  const first = !workshopConversationId;
-  if (first) workshopConversationId = `workshop-${crypto.randomUUID()}`;
-  const prompt = first ? buildMcpWorkshopPrompt(objective) : objective;
+  const token = workshopRunToken;
+  const mine = () => token === workshopRunToken;
+  workshopAbort?.abort();
+  const abort = new AbortController();
+  workshopAbort = abort;
 
-  let output = '';
   try {
-    const response = await fetch(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/tasks`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt, conversationId: workshopConversationId })
-    });
+    // Continuity has to start at the first ask, or a correction reaches a harness
+    // that never saw the objective. The conversation is keyed to the agent that
+    // answered, because switching harnesses mid-exchange would send a bare
+    // correction to one with no context.
+    const sameAgent = workshopConversationAgentId === agentId;
+    if (!sameAgent) {
+      workshopConversationId = `workshop-${workshopId()}`;
+      workshopConversationAgentId = agentId;
+      workshopContinuity = true;
+    }
+    const continuing = sameAgent && workshopTurns > 0 && workshopContinuity;
+    const prompt = continuing ? objective : buildMcpWorkshopPrompt(objective);
+
+    let response = await workshopDispatch(agentId, prompt, workshopContinuity ? workshopConversationId : null, abort);
+    // An un-refreshed runtime cannot continue a conversation and says so with a
+    // 409. Losing follow-up corrections is worth far more than losing the
+    // feature, so ask again without one and tell the operator what they lost.
+    if (response.status === 409 && workshopContinuity) {
+      const failure = await response.clone().json().catch(() => ({}));
+      if (/cannot continue a conversation/i.test(failure.error ?? '')) {
+        workshopContinuity = false;
+        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'failed');
+        response = await workshopDispatch(agentId, buildMcpWorkshopPrompt(objective), null, abort);
+      }
+    }
     if (!response.ok || !response.body) {
       const failure = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
       throw new Error(failure.error ?? `HTTP ${response.status}`);
     }
+
+    const runState = createWorkshopRunState();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let output = '';
     while (true) {
       const { done, value } = await reader.read();
+      if (!mine()) return;
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -1549,31 +1610,95 @@ async function runWorkshop() {
         if (!line.trim()) continue;
         let event;
         try { event = JSON.parse(line); } catch { continue; }
+        observeWorkshopRunEvent(runState, event);
         if (event.type === 'message.completed' && event.data?.text) {
           output += `${event.data.text}\n`;
-          workshopNote(event.data.text);
+          workshopNote('harness', event.data.text);
         }
         if (event.type === 'activity.started' && event.data?.name) {
           ui.workshopStatus.textContent = `Working — ${event.data.name}`;
         }
-        if (event.type === 'error' && event.data?.message) workshopNote(event.data.message, 'failed');
+        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'failed');
       }
-      if (done) break;
+      if (done) {
+        if (!buffer.trim()) break;
+        try {
+          const event = JSON.parse(buffer);
+          observeWorkshopRunEvent(runState, event);
+          if (event.type === 'message.completed' && event.data?.text) {
+            output += `${event.data.text}\n`;
+            workshopNote('harness', event.data.text, '', token);
+          }
+        } catch { /* a partial final line is not an event */ }
+        break;
+      }
     }
 
+    // Only a run that started, ended on its own task, and reported success may
+    // put anything in the form. Without this a harness could emit a proposal and
+    // then fail, and the operator would be shown a filled form and told to review
+    // it as though the run had worked.
+    if (!mine()) return;
+    requireSuccessfulWorkshopRun(runState);
     const { proposal, warnings } = extractMcpWorkshopProposal(output);
     applyProposalToForm(proposal);
-    for (const warning of warnings) workshopNote(warning, 'failed');
-    ui.workshopStatus.textContent = 'Filled in below — review before saving.';
+    for (const warning of warnings) workshopNote('harness', warning, 'failed');
+
+    workshopTurns += 1;
+
+    // A proposal is model-generated. Ask the harness's own adapter whether the
+    // shape is even valid for it before implying the operator is reviewing
+    // something checked. This proves payload and adapter policy compatibility —
+    // not that the connector works, and not that its credentials are right.
+    ui.workshopStatus.textContent = 'Checking the proposal against this harness…';
+    const checked = await checkProposal(agentId, proposal);
+    if (mine()) ui.workshopStatus.textContent = checked;
   } catch (error) {
-    // Deliberately not fatal: the exchange stays open and the conversation is
-    // kept, so the next ask is a correction rather than a fresh start.
-    workshopNote(error.message, 'failed');
-    ui.workshopStatus.textContent = 'Tell it what was wrong and ask again.';
+    if (!mine() || error.name === 'AbortError') return;
+    // Not fatal: the exchange stays open so the next ask is a correction.
+    workshopNote('harness', error.message, 'failed');
+    ui.workshopStatus.textContent = 'Nothing was filled in. Tell it what was wrong and ask again.';
   } finally {
-    workshopRunning = false;
-    ui.workshopRun.disabled = false;
-    ui.workshopObjective.value = '';
+    if (mine()) {
+      workshopRunning = false;
+      ui.workshopRun.disabled = false;
+      ui.workshopObjective.value = '';
+    }
+  }
+}
+
+// crypto.randomUUID is secure-context only, and this page is reachable over plain
+// http on a LAN address. Falling back keeps the feature working there instead of
+// throwing inside the click handler.
+function workshopId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  (globalThis.crypto?.getRandomValues ?? ((array) => array.forEach((_, index) => { array[index] = Math.floor(Math.random() * 256); })))(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function workshopDispatch(agentId, prompt, conversationId, abort) {
+  const body = conversationId ? { prompt, conversationId } : { prompt };
+  return fetch(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: abort.signal
+  });
+}
+
+async function checkProposal(agentId, proposal) {
+  try {
+    const result = await api(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/mcp/validate`, {
+      method: 'POST',
+      body: JSON.stringify({ server: proposal })
+    });
+    const warnings = result.mcp?.validation?.warnings?.length ?? 0;
+    return `Filled in below. Valid for this harness${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
+  } catch (error) {
+    // Worth filling in anyway: the operator can fix it in the form. But say so.
+    workshopNote('harness', error.message, 'failed');
+    return 'Filled in below, but this harness rejected the shape. Review and correct before saving.';
   }
 }
 
@@ -2317,6 +2442,15 @@ $('#attach-mcp').addEventListener('click', attachExistingMcp);
 $('#apply-mcp').addEventListener('click', applyMcp);
 $('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
 $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
+// Closing the dialog abandons any run it started, however it was closed —
+// button, Escape, or form submit. Otherwise the stream keeps going and writes
+// into whatever the dialog is showing next.
+ui.mcpDialog.addEventListener('close', () => {
+  workshopRunToken += 1;
+  workshopAbort?.abort();
+  workshopAbort = null;
+  workshopRunning = false;
+});
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
 ui.modelSelect.addEventListener('change', () => {
   ui.saveMessage.textContent = 'Unsaved model policy';
@@ -2351,6 +2485,7 @@ window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { 
 
 let storedCredentials = [];
 let registryServers = [];
+let credentialsLoaded = false;
 
 function credentialRow(credential) {
   const row = document.createElement('article');
@@ -2418,6 +2553,7 @@ async function loadRegistry() {
   try {
     const { servers } = await api(`${API_ROOT}/mcp/servers`);
     registryServers = servers ?? [];
+    ui.registryMessage.textContent = '';
     renderRegistry();
     ui.registryCount.textContent = `${registryServers.length} defined`;
     setConnection('online', 'Control plane online');
@@ -2481,9 +2617,13 @@ function registryMeta(server) {
   if (refs.length) return `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
   if (server.credentialId) {
     const credential = storedCredentials.find((item) => item.id === server.credentialId);
-    return credential
-      ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
-      : `Credential ${server.credentialId} · no longer stored`;
+    if (credential) return `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`;
+    // Unknown is not the same as gone. Saying "no longer stored" before the keys
+    // have loaded, or when loading them failed, states a negative we cannot know —
+    // and both halves of this page load concurrently, so it happened every time.
+    return credentialsLoaded
+      ? `Credential ${server.credentialId} · no longer stored`
+      : `Credential ${server.credentialId} · checking`;
   }
   return `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
 }
@@ -2504,6 +2644,7 @@ async function loadCredentials() {
   try {
     const result = await api(`${API_ROOT}/credentials`);
     storedCredentials = result.credentials ?? [];
+    credentialsLoaded = true;
     renderCredentialStorage(result.storage ?? {});
     renderCredentials();
     ui.credentialsRefreshed.textContent = `${storedCredentials.length} stored`;
@@ -2511,7 +2652,7 @@ async function loadCredentials() {
     // keys are known.
     if (registryServers.length) renderRegistry();
   } catch (error) {
-    ui.credentialMessage.textContent = error.message;
+    ui.credentialListMessage.textContent = error.message;
     ui.credentialList.innerHTML = '<p class="usage-error">Could not load credentials.</p>';
   }
 }
@@ -2561,12 +2702,12 @@ async function deleteCredential(credential) {
   if (!window.confirm(`Delete ${credential.name}? Any connector still using it must be changed first.`)) return;
   try {
     await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}?confirmation=${encodeURIComponent(credential.name)}`, { method: 'DELETE' });
-    ui.credentialMessage.textContent = '';
+    ui.credentialListMessage.textContent = '';
     await loadCredentials();
   } catch (error) {
     // Next to the credential being deleted. This used to overwrite the topbar
     // connection status, which reads as the control plane having gone offline.
-    ui.credentialMessage.textContent = error.message;
+    ui.credentialListMessage.textContent = error.message;
   }
 }
 

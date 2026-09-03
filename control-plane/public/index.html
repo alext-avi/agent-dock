@@ -63,7 +63,6 @@
             <p class="hero-copy">Connectors are defined once and attached to any compatible agent. The keys they authenticate with live here too, because that is the only thing they are for.</p>
           </div>
           <div class="jobs-header-actions">
-            <span id="credential-storage" class="pill neutral">checking storage</span>
             <button id="new-registry-mcp" class="button primary" type="button">New connector <span>＋</span></button>
           </div>
         </section>
@@ -81,6 +80,7 @@
           <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
           <div class="fleet-heading-actions">
             <span id="credentials-refreshed" class="hint">Loading credentials…</span>
+            <span id="credential-storage" class="pill neutral">checking storage</span>
             <button id="new-credential" class="button primary" type="button">New credential <span>＋</span></button>
           </div>
         </section>
@@ -88,7 +88,7 @@
           <p id="credential-storage-detail"></p>
         </section>
         <section id="credential-list" class="mcp-list" aria-live="polite"><p class="empty">Loading credentials…</p></section>
-        <p id="credential-message" class="run-message" role="status"></p>
+        <p id="credential-list-message" class="run-message" role="status"></p>
       </div>
 
       <div id="jobs-view" class="view hidden">
@@ -424,7 +424,7 @@
             <div><p class="kicker">ASK A HARNESS</p><small>Describe the connector and let an agent work out its shape. You review everything before it is saved.</small></div>
             <select id="workshop-agent" aria-label="Harness to ask"><option value="">No agents available</option></select>
           </div>
-          <textarea id="workshop-objective" rows="3" maxlength="12000" placeholder="The GitHub MCP server, for reading issues and pull requests."></textarea>
+          <label class="field" for="workshop-objective">What should it connect to?<textarea id="workshop-objective" rows="3" maxlength="12000" placeholder="The GitHub MCP server, for reading issues and pull requests."></textarea></label>
           <div class="workshop-actions">
             <button id="run-workshop" class="button secondary" type="button">Ask</button>
             <span id="workshop-status" class="run-message" role="status"></span>

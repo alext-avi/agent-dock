@@ -693,11 +693,28 @@ test('a refused delete is reported beside the list, not as the control plane goi
   page.on('dialog', (dialog) => dialog.accept());
   await credentialRow.locator('.text-button', { hasText: 'Delete' }).click();
 
-  await page.waitForFunction(() => document.querySelector('#credential-message')?.textContent?.includes('still used by'));
+  // Assert it is *visible*, not merely present. The first version of this test
+  // checked textContent and passed while the paragraph was display:none behind a
+  // duplicate id, so the fix it was written to defend did not actually work.
+  const refusal = page.locator('#credential-list-message');
+  await refusal.waitFor({ state: 'visible' });
+  assert.match(await refusal.textContent(), /still used by/);
   // The topbar reports the control plane's health and must not be repurposed for
   // an ordinary refusal — that reads as the whole thing having gone down.
   assert.doesNotMatch(await page.locator('#connection-label').textContent(), /still used by/);
   assert.equal(await credentialRow.count(), 1, 'the credential was deleted despite being in use');
+
+  // A failed save must report inside the dialog, not on the page behind it.
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'in-use-key');
+  await page.fill('#credential-header', 'X-Api-Key');
+  await page.fill('#credential-hosts', 'inuse.example.com');
+  await page.fill('#credential-value', 'sk-duplicate-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  const dialogMessage = page.locator('#credential-message');
+  await dialogMessage.waitFor({ state: 'visible' });
+  assert.match(await dialogMessage.textContent(), /already exists/);
+  assert.equal(await page.locator('#credential-dialog').evaluate((node) => node.open), true);
 });
 
 test('the workshop fills the connector form in place and keeps its conversation across corrections', async (t) => {
@@ -707,8 +724,9 @@ test('the workshop fills the connector form in place and keeps its conversation 
 
   await page.click('#new-registry-mcp');
   await page.waitForSelector('#mcp-dialog[open]');
-  // Asking is offered when defining something new, inside the dialog it fills.
-  assert.ok(await page.locator('#workshop').isVisible());
+  // Asking is offered when defining something new, inside the dialog it fills —
+  // and only once the harness list has loaded, so it never appears empty.
+  await page.locator('#workshop').waitFor({ state: 'visible' });
 
   // Pick the harness explicitly rather than relying on which one sorts first.
   await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
@@ -755,4 +773,75 @@ test('editing an existing connector does not offer to ask a harness', async (t) 
   await page.waitForSelector('#mcp-dialog[open]');
   // Editing a known shape is a deliberate act, not a question for a harness.
   assert.equal(await page.locator('#workshop').isVisible(), false);
+});
+
+test('a proposal from a task that failed is refused rather than filled in', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness can emit a perfectly good proposal and then fail. Accepting it
+  // would tell the operator to review something the wrapper reported as broken.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'doomed' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'doomed', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"should-not-appear","transport":"http","url":"https://nope.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'doomed', data: { status: 'failed' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'something that will fail');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('Nothing was filled in'));
+  assert.equal(await page.inputValue('#mcp-name'), '', 'a failed run filled the form');
+  assert.equal(await page.inputValue('#mcp-url'), '');
+});
+
+test('a runtime that cannot carry a conversation still gets a proposal, and says what was lost', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // An un-refreshed runtime refuses a conversationId. Losing follow-up
+  // corrections is worth far less than losing the feature, so the ask is retried
+  // without one — but the operator has to be told, or they will wonder why a
+  // correction is ignored later.
+  const dispatched = [];
+  await page.route('**/api/v1/agents/*/tasks', async (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    dispatched.push(Boolean(body.conversationId));
+    if (body.conversationId) {
+      return route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'This runtime cannot continue a conversation, and would answer without the earlier turns.' })
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'legacy' }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'legacy', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"legacy-runtime","transport":"http","url":"https://legacy.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'legacy', data: { status: 'succeeded' } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector on an old runtime');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'legacy-runtime');
+  assert.deepEqual(dispatched, [true, false], 'the retry did not drop the conversation');
+  const log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /cannot carry a conversation/i);
 });

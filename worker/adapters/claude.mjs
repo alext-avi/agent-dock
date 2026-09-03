@@ -7,7 +7,7 @@ export const claudeAdapterManifest = Object.freeze({
   displayName: 'Claude Code',
   capabilities: {
     authentication: { methods: ['browser_oauth'], refresh: false },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     mcp: claudeMcpCapabilities,
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
     workspace: { list: true }
@@ -73,4 +73,19 @@ export function normalizeClaudeEvent(event = {}) {
   }
 
   return { type: 'provider.event', data: { name: event.type || 'unknown' } };
+}
+
+
+// Claude Code is the one harness that accepts an id we choose, but it still
+// announces the session it actually opened:
+//   {"type":"system","subtype":"init","session_id":"b95e3a83-...","cwd":...}
+// Observed from a real `claude -p --output-format stream-json` run. Recording it
+// on announcement rather than before spawning matters: the id is only worth
+// keeping once the harness has accepted it, and a conversation that recorded a
+// session Claude never opened would report itself resumable and then fail every
+// later turn with no way back.
+export function observeClaudeSessionId(event = {}) {
+  if (event.type !== 'system') return null;
+  const id = event.session_id;
+  return typeof id === 'string' && id ? id : null;
 }

@@ -479,6 +479,15 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   footer { gap: 12px; flex-direction: column; }
 }
 
+.credential-note { padding: 14px 16px; border-left: 2px solid #6a5626; }
+.credential-note p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.credential-row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1.6fr) auto; gap: 14px; align-items: center; padding: 13px 15px; border: 1px solid var(--line); background: #0d110f; }
+.credential-row + .credential-row { border-top: 0; }
+.credential-row strong { font-size: 13px; }
+.credential-row small { display: block; margin-top: 3px; color: var(--faint); font: 9px ui-monospace, monospace; }
+.credential-hosts { color: var(--muted); font: 10px ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
+.credential-hint { color: var(--aqua); font: 11px ui-monospace, monospace; }
+.credential-actions { display: flex; gap: 8px; }
 @media (max-width: 540px) {
   .topbar { padding: 0 14px; }
   .brand { gap: 8px; }

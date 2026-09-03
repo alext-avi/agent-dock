@@ -18,6 +18,7 @@ import {
 import { createDelegationService } from './delegation-service.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
+import { createCredentialStore, environmentKeyProvider } from './credentials.mjs';
 import { createScheduler } from './scheduler.mjs';
 import { createWorkloadToken, workloadScopeForRequest } from './workload-token.mjs';
 
@@ -276,6 +277,7 @@ export function createControlPlane(options = {}) {
   const mcpBindings = new Map();
   const dataSources = new Map();
   const dataAttachments = new Map();
+  const credentialRecords = new Map();
   let persistQueue = Promise.resolve();
   let storageMutationQueue = Promise.resolve();
   const pendingAttachmentSets = new Map();
@@ -297,7 +299,10 @@ export function createControlPlane(options = {}) {
       mcpServers: [...mcpServers.values()],
       mcpBindings: [...mcpBindings.values()],
       dataSources: [...dataSources.values()],
-      dataAttachments: [...dataAttachments.values()]
+      dataAttachments: [...dataAttachments.values()],
+      // Sealed envelopes only. Without the wrapping key these are inert, which is
+      // the whole and only thing encryption at rest buys in this deployment.
+      credentials: [...credentialRecords.values()]
     };
     // A failed write must reject its caller without poisoning every later
     // registry transaction, including the rollback that caller may attempt.
@@ -432,6 +437,11 @@ export function createControlPlane(options = {}) {
           }
           for (const agent of stored.agents) {
             if (agent?.id && agent?.name) agents.set(agent.id, normalizeStoredAgent(agent));
+          }
+          if (stored.schemaVersion >= 4) {
+            for (const record of stored.credentials ?? []) {
+              if (record?.id && record?.name && record?.sealed) credentialRecords.set(record.id, record);
+            }
           }
           if (stored.schemaVersion >= 3) {
             for (const server of stored.mcpServers ?? []) {
@@ -592,7 +602,11 @@ export function createControlPlane(options = {}) {
   function requireManagedRuntime(agent) {
     if (!runtimeManager) throw Object.assign(new Error('Runtime provisioning is unavailable'), { status: 503 });
     const runtime = agent.runtimeId ? runtimes.get(agent.runtimeId) : null;
-    if (!runtime?.managed || runtime.kind !== 'managed-dedicated') {
+    // `dedicated` predates the explicit runtime kind and remains part of the
+    // injected runtime-manager contract. Accept it for older persisted runtimes
+    // and custom provisioners without weakening the isolation requirement.
+    const dedicated = runtime?.kind === 'managed-dedicated' || runtime?.dedicated === true;
+    if (!runtime?.managed || !dedicated) {
       throw Object.assign(new Error('Data attachments require a managed dedicated runtime'), { status: 409 });
     }
     return runtime;
@@ -710,12 +724,19 @@ export function createControlPlane(options = {}) {
     }
   }
 
+  const credentials = createCredentialStore({
+    records: credentialRecords,
+    persist: persistAgents,
+    keyProvider: options.credentialKeyProvider ?? environmentKeyProvider()
+  });
+
   const mcpService = createMcpService({
     servers: mcpServers,
     bindings: mcpBindings,
     agents,
     persist: persistAgents,
-    workerRequest
+    workerRequest,
+    credentials
   });
 
   async function proxyJson(req, res, agent, pathname, timeout = 15_000) {
@@ -736,12 +757,39 @@ export function createControlPlane(options = {}) {
     res.end(text);
   }
 
+  // A conversation is only forwarded to a runtime that has said it can continue
+  // one. An older worker ignores the field, runs a context-free task, and reports
+  // success — which a caller reads as an agent that quietly stopped listening.
+  // Same reason the delivered-credential and cancel-by-task-id fields are gated.
+  async function requireConversationSupport(agent) {
+    let supported = false;
+    try {
+      const status = await workerRequest(agent, 'GET', '/v1/status', undefined, 15_000);
+      supported = status?.capabilities?.tasks?.conversations === true;
+    } catch (error) {
+      throw Object.assign(
+        new Error(`Could not confirm this runtime can continue a conversation: ${error.message}`),
+        { status: 502 }
+      );
+    }
+    if (!supported) {
+      throw Object.assign(
+        new Error('This runtime cannot continue a conversation, and would answer without the earlier turns. '
+          + 'Refresh the runtime onto the current image, then try again.'),
+        { status: 409 }
+      );
+    }
+  }
+
   async function proxyTask(req, res, agent) {
     const release = claimAgentOperation(agent.id, 'an active task');
     try {
     const request = await readJson(req);
     const prompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
     if (!prompt) return json(res, 400, { error: 'prompt is required' });
+    if (request.conversationId !== undefined && request.conversationId !== null) {
+      await requireConversationSupport(agent);
+    }
     const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt, modelPolicy: agent.modelPolicy });
     const { response: upstream } = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
     if (!upstream.ok || !upstream.body) {
@@ -1391,6 +1439,21 @@ export function createControlPlane(options = {}) {
   // Replace a managed runtime's container with one built from the current image,
   // keeping its volumes so the agent stays authenticated. Without this the only
   // way to get new worker code onto an agent is to destroy its credentials.
+  // A recreated container is running before its worker is listening. Poll health
+  // rather than sleeping on a guess, and give up rather than hold the request open.
+  async function workerReady(agent, { attempts = 30, intervalMs = 500 } = {}) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const { response } = await workerFetch(agent, '/v1/health', { timeout: 2_000 });
+        if (response.ok) return true;
+      } catch {
+        // Not listening yet.
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw Object.assign(new Error('The replacement runtime did not become reachable'), { status: 504 });
+  }
+
   async function refreshAgentRuntime(req, res, agent) {
     const release = claimAgentOperation(agent.id, 'runtime image refresh');
     try {
@@ -1417,16 +1480,82 @@ export function createControlPlane(options = {}) {
       const current = await runtimeManager.currentImageId?.(runtime.adapter) ?? null;
       runtime.outdated = current && runtime.imageId ? current !== runtime.imageId : null;
       await persistAgents();
+      // The replacement process holds no delivered credentials, and MCP state on
+      // disk still names them. Re-applying restores the agent to the configuration
+      // the registry already claims it has — but the container has only just been
+      // started, so wait for it to answer before asking it to do anything.
+      let reapplied = null;
+      try {
+        await workerReady(agent);
+        await mcpService.applyAgent(agent.id);
+        reapplied = true;
+      } catch (error) {
+        reapplied = false;
+        runtime.lastError = `MCP configuration could not be re-applied after refresh: ${error.message}`;
+        await persistAgents();
+      }
       return json(res, 200, {
         runtime: publicRuntime(runtime, null, attachmentCount(runtime.id)),
-        refreshed: true
+        refreshed: true,
+        mcpReapplied: reapplied
       });
     } finally {
       release();
     }
   }
 
+  // Operator-facing credential management. A value goes in and never comes back;
+  // resolution for a worker happens elsewhere and is never reachable from here.
+  async function handleCredentials(req, res, url) {
+    if (url.pathname === '/api/v1/credentials') {
+      if (req.method === 'GET') {
+        return json(res, 200, { credentials: credentials.list(), storage: credentials.keyProviderStatus() });
+      }
+      if (req.method === 'POST') return json(res, 201, { credential: await credentials.create(await readJson(req)) });
+      return false;
+    }
+
+    const match = url.pathname.match(/^\/api\/v1\/credentials\/([^/]+)$/);
+    if (!match) return false;
+    const id = decodeURIComponent(match[1]);
+    if (req.method === 'GET') return json(res, 200, { credential: credentials.get(id) });
+    if (req.method === 'PATCH') return json(res, 200, { credential: await credentials.update(id, await readJson(req)) });
+    if (req.method === 'DELETE') {
+      const record = credentials.get(id);
+      // Report the recoverable objection first: being told to confirm a deletion
+      // that would have been refused anyway is a worse error than being told why.
+      const inUse = [...mcpServers.values()].filter((server) => server.credentialId === id).map((server) => server.name);
+      if (inUse.length) {
+        throw Object.assign(
+          new Error(`Credential is still used by ${inUse.join(', ')}; detach it from those connectors first`),
+          { status: 409 }
+        );
+      }
+      // Unrecoverable: the value exists nowhere else in Agent Dock, so deleting
+      // takes the same exact-name confirmation as destroying a runtime.
+      if (url.searchParams.get('confirmation') !== record.name) {
+        throw Object.assign(
+          new Error(`Deleting a credential is unrecoverable: its value exists nowhere else. Confirm with ?confirmation=${record.name}`),
+          { status: 400 }
+        );
+      }
+      await credentials.remove(id);
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
+    return false;
+  }
+
   async function handleAgentOperation(req, res, url) {
+    const conversation = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/conversations(?:\/([^/]+))?$/);
+    if (conversation) {
+      const agent = requireAgent(decodeURIComponent(conversation[1]));
+      const id = conversation[2] ? decodeURIComponent(conversation[2]) : null;
+      if (req.method === 'GET' && !id) return proxyJson(req, res, agent, '/v1/conversations');
+      if (req.method === 'GET') return proxyJson(req, res, agent, `/v1/conversations/${encodeURIComponent(id)}`);
+      if (req.method === 'DELETE' && id) return proxyJson(req, res, agent, `/v1/conversations/${encodeURIComponent(id)}`);
+      return false;
+    }
     const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
@@ -1592,6 +1721,8 @@ export function createControlPlane(options = {}) {
       if (scheduled !== false) return scheduled;
       const data = await handleDataAttachments(req, res, url);
       if (data !== false) return data;
+      const credential = await handleCredentials(req, res, url);
+      if (credential !== false) return credential;
       const mcp = await handleMcp(req, res, url);
       if (mcp !== false) return mcp;
       const crud = await handleAgentCrud(req, res, url);

@@ -22,6 +22,9 @@ export const openCodeMcpCapabilities = Object.freeze({
   remoteOAuth: true,
   configDialect: 'opencode-v1',
   secretDelivery: 'worker-resolved-environment',
+  // Advertised so the control plane can refuse to send a credentialId
+  // definition to a worker that would apply it with no header at all.
+  credentialDelivery: true,
   localCommandPolicy: 'allowlist'
 });
 

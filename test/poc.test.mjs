@@ -1276,6 +1276,95 @@ test('a runtime refresh is refused while a task is running and for unmanaged run
 // place where a silent omission changes every runtime the system creates. The
 // FakeRuntimeManager cannot catch that — it fabricates its own shape — so this
 // exercises the real manager with the network pinned so it needs no Docker.
+// A module added to the control plane and left out of its Dockerfile is not a
+// build failure. The image starts, dies on the first import, and the whole
+// stack is down — which is how this was found, after the tests were green.
+// A form control's `pattern` is compiled as a unicode-sets regular expression,
+// where an unescaped `-` inside a character class is a syntax error. The browser
+// reports it somewhere no test watches and then drops the constraint, so the
+// field silently validates nothing while looking entirely normal. Compiling them
+// the way the browser does is the only cheap way to see it.
+// The wrapping key unwraps every stored credential, including ones belonging to
+// agents on other runtimes. A container that runs an agent is a container a
+// prompt injection can read `env` from, so the key crossing that boundary would
+// turn "protects a copied backup" into protecting nothing.
+test('the credential wrapping key is never given to a container that runs an agent', async () => {
+  const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  // Split on the characters Compose actually allows in a service key. A narrower
+  // pattern silently absorbs an unmatched service into the chunk before it, and
+  // since control-plane is first in the file, a service declared after it lands
+  // inside the one chunk this loop skips — so the key would go unseen.
+  const services = compose.split(/\n  (?=[A-Za-z0-9][A-Za-z0-9_.-]*:\n)/);
+  for (const service of services) {
+    const name = service.trimStart().split(':')[0];
+    if (name === 'services' || name === 'control-plane') continue;
+    assert.ok(
+      !service.includes('CREDENTIAL_ENCRYPTION_KEY'),
+      `${name} is given CREDENTIAL_ENCRYPTION_KEY; only the control plane may hold it`
+    );
+  }
+  assert.ok(compose.includes('CREDENTIAL_ENCRYPTION_KEY'), 'the control plane is no longer given the key at all');
+});
+
+test('every form pattern compiles the way a browser compiles it', async () => {
+  const markup = await readFile(new URL('../control-plane/public/index.html', import.meta.url), 'utf8');
+  const patterns = [...markup.matchAll(/pattern="([^"]+)"/g)].map(([, value]) => value);
+  assert.ok(patterns.length > 0, 'no pattern attributes found; this test has stopped covering anything');
+  for (const pattern of patterns) {
+    assert.doesNotThrow(() => new RegExp(pattern, 'v'), `pattern ${pattern} does not compile with the v flag`);
+  }
+});
+
+// Covers every image, not just the control plane's: the same omission in the
+// three worker Dockerfiles took down the whole fleet after the control-plane
+// case had already been fixed and tested.
+for (const [label, directory, dockerfile] of [
+  ['control plane', '../control-plane/', 'Dockerfile'],
+  ['codex worker', '../worker/', 'Dockerfile'],
+  ['claude worker', '../worker/', 'Dockerfile.claude'],
+  ['opencode worker', '../worker/', 'Dockerfile.opencode']
+]) {
+  test(`the ${label} image ships every module its entrypoint imports`, async () => {
+    const root = new URL(directory, import.meta.url);
+    const recipe = await readFile(new URL(dockerfile, root), 'utf8');
+    const copied = recipe
+      .split('\n')
+      .filter((line) => line.startsWith('COPY '))
+      .flatMap((line) => line.slice(5).trim().split(/\s+/).filter((entry) => !entry.startsWith('--')).slice(0, -1));
+
+    // Resolve each specifier against the file that imports it, not against the
+    // image root — nested modules reach siblings with ../ and would otherwise
+    // resolve to paths that do not exist.
+    const seen = new Set();
+    const pending = [new URL('server.mjs', root)];
+    while (pending.length) {
+      const moduleUrl = pending.pop();
+      const name = decodeURIComponent(moduleUrl.href.slice(root.href.length));
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const source = await readFile(moduleUrl, 'utf8');
+      for (const [, specifier] of source.matchAll(/from '(\.[^']+)'/g)) {
+        pending.push(new URL(specifier, moduleUrl));
+      }
+    }
+
+    for (const name of seen) {
+      const topLevel = name.includes('/') ? name.split('/')[0] : null;
+      // An entry may be root-relative once a build context is the repository
+      // root, so compare on the basename of the glob as well as the literal
+      // entry, and let a copied directory cover the modules inside it.
+      const shipped = copied.some((entry) => {
+        const tail = entry.split('/').pop();
+        if (entry === name || tail === name) return true;
+        if (tail === '*.mjs' && name.endsWith('.mjs') && !name.includes('/')) return true;
+        if (topLevel && (entry === topLevel || tail === topLevel)) return true;
+        return false;
+      });
+      assert.ok(shipped, `${name} is imported by the ${label} but never copied into its image`);
+    }
+  });
+}
+
 test('the shared container spec carries every setting a worker needs', async () => {
   const manager = new DockerRuntimeManager({
     network: 'test-net',

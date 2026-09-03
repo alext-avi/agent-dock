@@ -20,6 +20,26 @@ let usageThrottled = false;
 const ui = {
   dashboardView: $('#dashboard-view'),
   jobsView: $('#jobs-view'),
+  credentialsView: $('#credentials-view'),
+  credentialList: $('#credential-list'),
+  credentialStorage: $('#credential-storage'),
+  credentialStorageNote: $('#credential-storage-note'),
+  credentialStorageDetail: $('#credential-storage-detail'),
+  credentialsRefreshed: $('#credentials-refreshed'),
+  newCredential: $('#new-credential'),
+  credentialDialog: $('#credential-dialog'),
+  credentialForm: $('#credential-form'),
+  credentialDialogTitle: $('#credential-dialog-title'),
+  credentialId: $('#credential-id'),
+  credentialName: $('#credential-name'),
+  credentialHeader: $('#credential-header'),
+  credentialHosts: $('#credential-hosts'),
+  credentialValue: $('#credential-value'),
+  credentialValueHint: $('#credential-value-hint'),
+  credentialMessage: $('#credential-message'),
+  cancelCredential: $('#cancel-credential'),
+  closeCredentialDialog: $('#close-credential-dialog'),
+  mcpCredential: $('#mcp-credential'),
   agentView: $('#agent-view'),
   connectionDot: $('#connection-dot'),
   connectionLabel: $('#connection-label'),
@@ -1320,9 +1340,21 @@ function renderMcp(result, definitions) {
     const refs = mcpSecretReferences(server);
     const meta = document.createElement('p');
     meta.className = 'mcp-meta';
-    meta.textContent = refs.length
-      ? `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`
-      : `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+    // A stored credential is not a connector-secret reference, and saying "no
+    // credential references" on a connector that plainly has one reads as a bug
+    // in the thing the operator just configured.
+    const credential = server.credentialId
+      ? storedCredentials.find((item) => item.id === server.credentialId)
+      : null;
+    if (refs.length) {
+      meta.textContent = `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
+    } else if (server.credentialId) {
+      meta.textContent = credential
+        ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
+        : `Credential ${server.credentialId} · no longer stored`;
+    } else {
+      meta.textContent = `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+    }
     const actions = document.createElement('div');
     actions.className = 'mcp-row-actions';
     const validate = document.createElement('button');
@@ -1358,10 +1390,14 @@ async function refreshMcp() {
   if (!currentAgent || mcpRefreshInFlight) return;
   mcpRefreshInFlight = true;
   try {
-    const [agentMcp, library] = await Promise.all([
+    const [agentMcp, library, credentials] = await Promise.all([
       api(agentApi('mcp')),
-      api(`${API_ROOT}/mcp/servers`)
+      api(`${API_ROOT}/mcp/servers`),
+      // A row names the credential it uses, so the panel needs them before it
+      // renders rather than only when the dialog opens.
+      api(`${API_ROOT}/credentials`).catch(() => null)
     ]);
+    if (credentials) storedCredentials = credentials.credentials;
     renderMcp(agentMcp, library.servers ?? []);
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
@@ -1392,6 +1428,7 @@ function openMcpDialog(server = null) {
   ui.mcpTimeout.value = String(Math.round((server?.timeoutMs ?? 30_000) / 1000));
   const bearer = Object.entries(server?.secretHeaders ?? {}).find(([header, value]) => header.toLowerCase() === 'authorization' && value.prefix === 'Bearer ');
   ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
+  syncCredentialOptions(server?.credentialId ?? '');
   const environment = Object.entries(server?.secretEnvironment ?? {})[0];
   ui.mcpSecretTarget.value = environment?.[0] ?? '';
   ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
@@ -1409,6 +1446,9 @@ function mcpFormPayload() {
   const targetEnv = ui.mcpSecretTarget.value.trim();
   if ((sourceEnv && !targetEnv) || (!sourceEnv && targetEnv)) throw new Error('Both stdio secret variable fields are required when either is set.');
   const bearer = ui.mcpBearerEnv.value.trim();
+  const credentialId = ui.mcpCredential.value || null;
+  // The server refuses both, so say so here rather than letting it 400.
+  if (credentialId && bearer) throw new Error('Choose a stored credential or a legacy secret reference, not both.');
   return {
     name: ui.mcpName.value.trim(),
     transport,
@@ -1420,6 +1460,7 @@ function mcpFormPayload() {
     secretEnvironment: transport === 'stdio' && sourceEnv ? { [targetEnv]: { sourceEnv } } : {},
     headers: {},
     secretHeaders: transport === 'http' && bearer ? { Authorization: { sourceEnv: bearer, prefix: 'Bearer ' } } : {},
+    credentialId: transport === 'http' ? credentialId : null,
     timeoutMs: Number(ui.mcpTimeout.value) * 1000
   };
 }
@@ -2630,9 +2671,161 @@ ui.testAgentButton.addEventListener('click', () => {
 });
 window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 
+let storedCredentials = [];
+
+function credentialRow(credential) {
+  const row = document.createElement('article');
+  row.className = 'credential-row';
+  row.dataset.credentialId = credential.id;
+  row.innerHTML = `
+    <div><strong></strong><small></small></div>
+    <div class="credential-hint"></div>
+    <div class="credential-hosts"></div>
+    <div class="credential-actions">
+      <button class="text-button credential-edit" type="button">Edit</button>
+      <button class="text-button danger-text credential-delete" type="button">Delete</button>
+    </div>`;
+  row.querySelector('strong').textContent = credential.name;
+  row.querySelector('small').textContent = `${credential.type} · header ${credential.header}`;
+  row.querySelector('.credential-hint').textContent = credential.hint ?? '…';
+  // The hosts are the point of the record, so they are on the row rather than
+  // hidden behind an edit dialog.
+  const hosts = credential.hosts ?? [];
+  const hostList = row.querySelector('.credential-hosts');
+  hostList.textContent = hosts.join(', ');
+  hostList.title = hosts.join('\n');
+  row.querySelector('.credential-edit').addEventListener('click', () => openCredentialDialog(credential));
+  row.querySelector('.credential-delete').addEventListener('click', () => deleteCredential(credential));
+  return row;
+}
+
+function renderCredentials() {
+  ui.credentialList.replaceChildren();
+  if (!storedCredentials.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = 'No credentials yet. Add one, then choose it on a connector instead of naming an environment variable.';
+    ui.credentialList.append(empty);
+    return;
+  }
+  for (const credential of storedCredentials) ui.credentialList.append(credentialRow(credential));
+}
+
+function renderCredentialStorage(storage = {}) {
+  const available = storage.available !== false;
+  ui.credentialStorage.textContent = available ? `storage: ${storage.name ?? 'unknown'}` : 'storage unavailable';
+  ui.credentialStorage.className = `pill ${available ? 'neutral' : 'error'}`;
+  ui.newCredential.disabled = !available;
+  // Whichever mode is in force, say what it actually protects rather than
+  // letting "encrypted at rest" imply more than it does.
+  ui.credentialStorageDetail.textContent = available
+    ? `Values are encrypted at rest, and with the ${storage.name} key provider that protects ${storage.protects}. Anyone able to read this host can read them.`
+    : 'Set CREDENTIAL_ENCRYPTION_KEY to 32 base64 bytes where the control plane runs. A key is not generated automatically, because one written beside the data it protects would imply protection that does not exist.';
+  ui.credentialStorageNote.classList.remove('hidden');
+}
+
+async function loadCredentials() {
+  ui.credentialsView.classList.remove('hidden');
+  ui.dashboardView.classList.add('hidden');
+  ui.agentView.classList.add('hidden');
+  ui.jobsView.classList.add('hidden');
+  document.title = 'Credentials — Agent Dock';
+  try {
+    const result = await api(`${API_ROOT}/credentials`);
+    storedCredentials = result.credentials ?? [];
+    renderCredentialStorage(result.storage ?? {});
+    renderCredentials();
+    ui.credentialsRefreshed.textContent = `${storedCredentials.length} stored`;
+    setConnection('online', 'Credential store online');
+  } catch (error) {
+    setConnection('offline', error.message);
+    ui.credentialList.innerHTML = '<p class="usage-error">Could not load credentials.</p>';
+  }
+}
+
+function openCredentialDialog(credential = null) {
+  ui.credentialForm.reset();
+  ui.credentialMessage.classList.add('hidden');
+  ui.credentialId.value = credential?.id ?? '';
+  ui.credentialDialogTitle.textContent = credential ? `Edit ${credential.name}` : 'New credential';
+  ui.credentialName.value = credential?.name ?? '';
+  ui.credentialHeader.value = credential?.header ?? 'X-Api-Key';
+  ui.credentialHosts.value = (credential?.hosts ?? []).join('\n');
+  // Editing cannot show the value, so the field means "replace it" rather than
+  // "here is what it is".
+  ui.credentialValue.required = !credential;
+  ui.credentialValueHint.textContent = credential
+    ? `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`
+    : 'pasted once, never shown again';
+  ui.credentialDialog.showModal();
+}
+
+async function saveCredential(event) {
+  event.preventDefault();
+  const id = ui.credentialId.value;
+  const hosts = ui.credentialHosts.value.split('\n').map((line) => line.trim()).filter(Boolean);
+  const body = {
+    name: ui.credentialName.value.trim(),
+    type: 'api-key',
+    header: ui.credentialHeader.value.trim(),
+    hosts
+  };
+  if (ui.credentialValue.value) body.value = ui.credentialValue.value;
+  try {
+    if (id) await api(`${API_ROOT}/credentials/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) });
+    else await api(`${API_ROOT}/credentials`, { method: 'POST', body: JSON.stringify(body) });
+    ui.credentialDialog.close();
+    ui.credentialValue.value = '';
+    await loadCredentials();
+  } catch (error) {
+    ui.credentialMessage.textContent = error.message;
+    ui.credentialMessage.classList.remove('hidden');
+  }
+}
+
+async function deleteCredential(credential) {
+  if (!window.confirm(`Delete ${credential.name}? Any connector still using it must be changed first.`)) return;
+  try {
+    await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}?confirmation=${encodeURIComponent(credential.name)}`, { method: 'DELETE' });
+    await loadCredentials();
+  } catch (error) {
+    setConnection('offline', error.message);
+  }
+}
+
+// The connector dialog offers stored credentials rather than asking for a
+// variable name, so the legacy field is only for definitions that already use it.
+async function syncCredentialOptions(selectedId = '') {
+  try {
+    const { credentials } = await api(`${API_ROOT}/credentials`);
+    storedCredentials = credentials;
+    ui.mcpCredential.replaceChildren();
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = credentials.length ? 'None' : 'None stored yet';
+    ui.mcpCredential.append(none);
+    for (const credential of credentials) {
+      const option = document.createElement('option');
+      option.value = credential.id;
+      option.textContent = `${credential.name} · ${credential.header} · ${credential.hosts.join(', ')}`;
+      ui.mcpCredential.append(option);
+    }
+    ui.mcpCredential.value = selectedId ?? '';
+  } catch {
+    // A connector can still be defined without one.
+  }
+}
+
+ui.newCredential.addEventListener('click', () => openCredentialDialog());
+ui.credentialForm.addEventListener('submit', saveCredential);
+ui.cancelCredential.addEventListener('click', () => ui.credentialDialog.close());
+ui.closeCredentialDialog.addEventListener('click', () => ui.credentialDialog.close());
+
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 const jobsRoute = /^\/(?:jobs|schedules)\/?$/.test(window.location.pathname);
+const credentialsRoute = /^\/credentials\/?$/.test(window.location.pathname);
 void loadPlatformSession();
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
 else if (jobsRoute) loadJobs();
+else if (credentialsRoute) loadCredentials();
 else loadDashboard();

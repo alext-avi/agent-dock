@@ -113,6 +113,14 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
   const secretEnvironment = secretEnvironmentMap(input.secretEnvironment);
   const headers = stringMap(input.headers, 'headers');
   const secretHeaders = secretHeaderMap(input.secretHeaders);
+  const credentialId = text(input.credentialId, 'credentialId', { max: 80 });
+  if (credentialId && !ID_PATTERN.test(credentialId)) throw failure('credentialId must contain lowercase letters, numbers, and hyphens only');
+  if (credentialId && transport !== 'http') throw failure('credentialId is only valid for an HTTP MCP server');
+  // Both would mean two mechanisms deciding the same header, with no rule for
+  // which wins. Pick one.
+  if (credentialId && Object.keys(secretHeaders).length) {
+    throw failure('a definition uses either credentialId or secretHeaders, not both');
+  }
   const now = new Date().toISOString();
   return {
     id,
@@ -126,6 +134,7 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
     secretEnvironment,
     headers: transport === 'http' ? headers : {},
     secretHeaders: transport === 'http' ? secretHeaders : {},
+    credentialId: transport === 'http' ? credentialId ?? null : null,
     timeoutMs,
     createdAt: input.createdAt ?? now,
     updatedAt: now
@@ -142,7 +151,18 @@ export function normalizeStoredMcpDefinition(server) {
   return normalized;
 }
 
-export function createMcpService({ servers, bindings, agents, persist, workerRequest }) {
+export function createMcpService({ servers, bindings, agents, persist, workerRequest, credentials = null }) {
+  // A reference to a credential that does not exist must fail when it is written,
+  // not silently at apply time in front of whoever is running a task.
+  function requireCredential(server) {
+    if (!server.credentialId || !credentials) return;
+    try {
+      credentials.get(server.credentialId);
+    } catch {
+      throw failure(`Credential ${server.credentialId} does not exist`, 400);
+    }
+  }
+
   const requireAgent = (agentId) => {
     const agent = agents.get(agentId);
     if (!agent) throw failure('Agent not found', 404);
@@ -168,6 +188,7 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
       existingIds: new Set(servers.keys()),
       existingNames: new Set([...servers.values()].map((item) => item.name.toLowerCase()))
     });
+    requireCredential(server);
     servers.set(server.id, server);
     await persist();
     return publicMcpDefinition(server);
@@ -179,6 +200,7 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
       currentId: serverId,
       existingNames: new Set([...servers.values()].filter((item) => item.id !== serverId).map((item) => item.name.toLowerCase()))
     });
+    requireCredential(server);
     servers.set(serverId, server);
     const now = new Date().toISOString();
     for (const binding of bindings.values()) {
@@ -213,12 +235,54 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     return { agentId, bindings: desired, runtime };
   }
 
+  function resolveCredentials(selected) {
+    if (!credentials) return {};
+    const resolved = {};
+    for (const server of selected) {
+      if (!server.credentialId) continue;
+      // Throws when the destination is outside the credential's host list, so a
+      // definition cannot redirect a credential by editing its url.
+      resolved[server.credentialId] = credentials.resolveForHost(server.credentialId, server.url);
+    }
+    return resolved;
+  }
+
+  // An older worker ignores an unknown `credentials` field and applies the
+  // definition with no header at all, reporting success. "No secretHeaders" used
+  // to mean "unauthenticated by design"; it must not now silently also mean
+  // "authenticated by a mechanism this worker cannot speak".
+  async function requireCredentialDelivery(agent, selected) {
+    if (!selected.some((server) => server.credentialId)) return;
+    let supported = false;
+    try {
+      const inspected = await workerRequest(agent, 'GET', '/v1/mcp');
+      supported = inspected?.mcp?.capabilities?.credentialDelivery === true;
+    } catch (error) {
+      throw failure(`Could not confirm this runtime supports delivered credentials: ${error.message}`, 502);
+    }
+    if (!supported) {
+      throw failure(
+        'This runtime does not support control-plane delivered credentials, and would apply the connector '
+        + 'with no credential at all. Refresh the runtime onto the current image, then apply again.',
+        409
+      );
+    }
+  }
+
   async function applyAgent(agentId) {
     const agent = requireAgent(agentId);
     const selected = desiredServers(agentId);
     const now = new Date().toISOString();
     try {
-      const result = await workerRequest(agent, 'PUT', '/v1/mcp', { servers: selected });
+      // Resolve before contacting the worker at all: a destination outside a
+      // credential's host list has to fail without a round trip, and the failure
+      // has to mark the bindings like any other apply failure.
+      const resolved = resolveCredentials(selected);
+      await requireCredentialDelivery(agent, selected);
+      const result = await workerRequest(agent, 'PUT', '/v1/mcp', {
+        servers: selected,
+        credentials: resolved
+      });
       for (const binding of bindings.values()) {
         if (binding.agentId === agentId) Object.assign(binding, { state: binding.enabled ? 'applied' : 'disabled', error: null, appliedAt: now, updatedAt: now });
       }

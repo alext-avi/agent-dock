@@ -214,9 +214,34 @@ test('a harness that ignores the instruction and returns a key cannot smuggle it
   assert.ok(warnings.some((warning) => /environment values were removed/i.test(warning)));
 });
 
-test('the prompt tells the harness that keys are not its to invent', () => {
+// The instructions have to teach the syntax, or a harness will keep proposing
+// the mapping fields that no longer exist. Placeholders are also how it says a
+// secret is needed at all, so the two halves belong in one assertion.
+test('the prompt teaches the placeholder syntax and leaves the binding to the operator', () => {
   const prompt = buildMcpWorkshopPrompt('the GitHub MCP server');
-  assert.match(prompt, /Agent Dock stores API keys itself/);
-  assert.match(prompt, /leave secretHeaders and secretEnvironment empty/);
+  assert.ok(prompt.includes('${NAME}'), 'the syntax is not shown');
+  assert.ok(prompt.includes('${ACCESS_TOKEN}'), 'no worked example of a placeholder');
+  assert.match(prompt, /Do not decide what fills it/);
+  assert.match(prompt, /operator binds each placeholder/);
+  assert.match(prompt, /Never put a token, cookie, password or key value/);
+  // Headers cannot be reviewed in the dialog, so it must not propose them.
+  assert.match(prompt, /Put placeholders only in args or url/);
   assert.match(prompt, /the GitHub MCP server/);
+});
+
+test('a placeholder in a proposal survives extraction intact', () => {
+  const { proposal } = extractMcpWorkshopProposal(`
+    <agent-dock-mcp-proposal>
+    {
+      "name": "with-placeholder",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@example/mcp-server", "--token", "\${ACCESS_TOKEN}"],
+      "timeoutMs": 30000
+    }
+    </agent-dock-mcp-proposal>
+  `);
+  // The placeholder is the point: it reaches the form so the operator is asked
+  // what fills it. Mangling or dropping it would silently lose the question.
+  assert.deepEqual(proposal.args, ['-y', '@example/mcp-server', '--token', '${ACCESS_TOKEN}']);
 });

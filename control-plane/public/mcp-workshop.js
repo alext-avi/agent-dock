@@ -44,27 +44,30 @@ Investigate the connector using the tools and outbound network available inside 
 
 Determine the correct transport, endpoint or executable, arguments, and timeout.
 
-Do not attempt to configure authentication. Agent Dock stores API keys itself, and the operator attaches one to this connector after reviewing your proposal, so a credential is not yours to name or invent. Say in your reply which header or environment variable the service expects a key in, so the operator knows what to attach — but leave secretHeaders and secretEnvironment empty, and never include a token, cookie, password, or key value anywhere in the proposal.
+Where the connector needs a secret, write a placeholder in the form \${NAME} at the exact position the value belongs — in an argument, or in the url. Use a descriptive upper-case name, for example \${ACCESS_TOKEN}. Agent Dock fills a placeholder in at the moment the connector starts, so it goes exactly where the real value would go — an argument list of "--token" then "\${ACCESS_TOKEN}" — not a separate mapping.
+
+Do not decide what fills it. The operator binds each placeholder to a key Agent Dock stores or to a secret provisioned inside the agent's container, and that choice is theirs. Never put a token, cookie, password or key value anywhere in the proposal — a placeholder is how you say a secret is needed. If the connector needs no secret, use no placeholders and say so.
+
+Put placeholders only in args or url. Leave headers, environment, secretHeaders and secretEnvironment empty: the operator's interface does not edit headers, so a header you propose cannot be reviewed and will be discarded.
 
 End your response with exactly one proposal between these tags:
 <agent-dock-mcp-proposal>
 {
   "name": "lowercase_connector_name",
-  "transport": "http",
-  "command": null,
-  "args": [],
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "@example/mcp-server", "--token", "\${ACCESS_TOKEN}"],
   "cwd": null,
-  "url": "https://example.com/mcp",
+  "url": null,
   "environment": {},
   "secretEnvironment": {},
   "headers": {},
-  "secretHeaders": {
-  },
+  "secretHeaders": {},
   "timeoutMs": 30000
 }
 </agent-dock-mcp-proposal>
 
-If details remain uncertain, explain them before the proposal and choose conservative placeholders that make the uncertainty obvious. Never put a token, cookie, password, or API key value in the proposal.
+If details remain uncertain, explain them before the proposal and choose conservative values that make the uncertainty obvious. Never put a token, cookie, password, or API key value in the proposal.
 
 Operator objective:
 ${objective}`;

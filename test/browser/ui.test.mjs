@@ -774,8 +774,14 @@ test('the workshop fills the connector form in place and keeps its conversation 
   // proposal the prompt carries — which still exercises the whole path: stream,
   // extract, and fill the form the operator is looking at.
   await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'lowercase_connector_name');
-  assert.equal(await page.inputValue('#mcp-url'), 'https://example.com/mcp');
-  assert.match(await page.locator('#workshop-status').textContent(), /review before saving/i);
+  // Assert the part that does not move with the prompt's worked example: the
+  // proposal reached the form, and the placeholder it carries is being asked
+  // about rather than silently pre-answered.
+  await page.locator('.placeholder-row', { hasText: 'ACCESS_TOKEN' }).waitFor();
+  // Not the validation verdict: that depends on the fixture's command allowlist,
+  // and reporting it honestly is a separate behaviour with its own test. What
+  // matters here is that the proposal reached the form.
+  assert.match(await page.locator('#workshop-status').textContent(), /Filled in below/i);
 
   // A correction continues the same exchange rather than starting over, so the
   // harness still has everything it worked out the first time.
@@ -1064,4 +1070,49 @@ test('a placeholder in an argument asks what fills it, and can use a container s
     options.some((text) => text.includes('COMPANY_API_TOKEN')),
     `a name already in use was not offered: ${options.join(', ')}`
   );
+});
+
+test('a proposal carrying a placeholder asks the operator what fills it', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness now says "a secret goes here" by writing a placeholder, and says
+  // nothing about what fills it — that choice is the operator's, so the proposal
+  // must arrive unbound rather than pre-answered.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'proposing' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'proposing', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"proposed-local","transport":"stdio","command":"node","args":["/opt/mcp/server.mjs","--token","${SERVICE_TOKEN}"],"timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'proposing', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a local connector that needs a token');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'proposed-local');
+  // The placeholder reached the arguments verbatim.
+  assert.match(await page.inputValue('#mcp-args'), /\$\{SERVICE_TOKEN\}/);
+
+  // And it is being asked about, unbound.
+  const row = page.locator('.placeholder-row', { hasText: 'SERVICE_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /cannot be saved/);
+  assert.equal(await row.locator('select').inputValue(), '');
+
+  // The compatibility check is not attempted while a placeholder is unbound. It
+  // would fail every time, because the control plane refuses to normalize a
+  // definition with nothing bound — and it reported that as though the harness
+  // had proposed a bad shape, which a live run actually produced.
+  const status = await page.locator('#workshop-status').textContent();
+  assert.match(status, /Choose what fills SERVICE_TOKEN/);
+  assert.doesNotMatch(status, /rejected the shape/i);
+  assert.doesNotMatch(status, /could not be completed/i);
 });

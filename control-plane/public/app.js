@@ -1797,10 +1797,23 @@ async function runWorkshop() {
 
     workshopTurns += 1;
 
-    // A proposal is model-generated. Ask the harness's own adapter whether the
-    // shape is even valid for it before implying the operator is reviewing
+    // A proposal is model-generated, so ask the harness's own adapter whether the
+    // shape is valid for it rather than implying the operator is reviewing
     // something checked. This proves payload and adapter policy compatibility —
     // not that the connector works, and not that its credentials are right.
+    //
+    // But a proposal that needs a secret arrives with its placeholders unbound,
+    // on purpose, and the control plane refuses to normalize a definition with an
+    // unbound placeholder. Validating now would therefore fail every time and
+    // report it as though the shape were wrong, which is what a live harness
+    // proposing ${GITHUB_TOKEN} actually produced.
+    const pending = [...placeholdersInForm().keys()].filter((name) => !placeholderBindings.has(name));
+    if (pending.length) {
+      if (mine()) {
+        ui.workshopStatus.textContent = `Filled in below. Choose what fills ${pending.join(', ')}; the shape is checked when you save.`;
+      }
+      return;
+    }
     ui.workshopStatus.textContent = 'Checking the proposal against this harness…';
     const checked = await checkProposal(agentId, proposal, token, abort.signal);
     if (mine()) ui.workshopStatus.textContent = checked;

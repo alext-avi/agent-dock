@@ -437,37 +437,20 @@
         </div>
         <section id="mcp-http-fields" class="mcp-transport-fields">
           <label class="field">Server URL<input id="mcp-url" type="url" placeholder="https://mcp.example.com/mcp"></label>
-          <fieldset class="auth-block">
-            <legend>Authentication</legend>
-            <label class="field">Use a stored key<select id="mcp-credential"><option value="">None — this connector needs no key</option></select></label>
-            <p id="mcp-http-effect" class="field-effect"></p>
-            <details id="mcp-bearer-details">
-              <summary>Use a worker environment variable instead</summary>
-              <label class="field">Connector secret name <span>sent as <code>Authorization: Bearer &lt;value&gt;</code></span><input id="mcp-bearer-env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_MCP_TOKEN"></label>
-            </details>
-          </fieldset>
+          <p class="field-note">Put <code>${NAME}</code> anywhere a secret belongs — in the URL, or in a header. You will be asked what fills it.</p>
         </section>
         <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
           <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
-          <p id="mcp-args-variables" class="field-note hidden"></p>
-          <fieldset class="auth-block">
-            <legend>Authentication</legend>
-            <div class="mapping-row">
-              <span>The server reads</span>
-              <input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="ACCESS_TOKEN" aria-label="Environment variable the server reads">
-              <span>from its environment, filled from</span>
-              <select id="mcp-secret-source-choice" aria-label="Connector secret the value comes from">
-                <option value="">nothing</option>
-                <option value="__new">a new name…</option>
-              </select>
-              <input id="mcp-secret-source" class="hidden" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN" aria-label="New connector secret name">
-            </div>
-            <p id="mcp-stdio-effect" class="field-effect"></p>
-          </fieldset>
+          <p class="field-note">Put <code>${NAME}</code> anywhere a secret belongs — usually an argument. You will be asked what fills it.</p>
         </section>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>
         <p id="mcp-form-message" class="usage-error hidden"></p>
+        <fieldset id="mcp-placeholders" class="auth-block hidden">
+          <legend>Values to bind</legend>
+          <div id="mcp-placeholder-rows" class="placeholder-rows"></div>
+        </fieldset>
+
         <div class="actions dialog-actions"><button id="delete-mcp-definition" class="button danger hidden" type="button">Delete definition</button><span class="dialog-spacer"></span><button id="cancel-mcp" class="button secondary" type="button">Cancel</button><button id="save-mcp" class="button primary" type="submit">Save and attach</button></div>
       </form>
     </dialog>

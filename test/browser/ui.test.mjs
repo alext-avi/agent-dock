@@ -562,8 +562,8 @@ test('a credential can be added from the UI and its value never comes back', asy
   assert.equal(await page.inputValue('#credential-hosts'), 'mcp.example.com');
 });
 
-test('a connector offers stored credentials instead of asking for a variable name', async (t) => {
-  const page = await openPage('/credentials');
+test('a placeholder is what asks for a key, and binds to a stored one', async (t) => {
+  const page = await openPage('/connectors');
   t.after(() => page.close());
   await page.waitForSelector('#new-credential');
 
@@ -573,35 +573,61 @@ test('a connector offers stored credentials instead of asking for a variable nam
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-picker-000011112222');
   await page.click('#credential-form button[type="submit"]');
-  await page.waitForFunction(() => document.querySelectorAll('.credential-row').length >= 1);
+  await page.locator('.credential-row', { hasText: 'picker-key' }).waitFor();
 
-  const agentPage = await browser.newPage();
-  t.after(() => agentPage.close());
-  await agentPage.goto(`${app.url}/agents/${app.agents['claude-code'].id}#tools`);
-  await agentPage.waitForSelector('#new-mcp');
-  await agentPage.click('#new-mcp');
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
 
-  // The picker lists the stored credential with the hosts it is limited to, so
-  // the operator can see where it would be sent before choosing it.
-  await agentPage.waitForFunction(() => [...document.querySelectorAll('#mcp-credential option')].some((o) => o.textContent.includes('picker-key')));
-  const option = await agentPage.locator('#mcp-credential option', { hasText: 'picker-key' }).textContent();
-  assert.match(option, /X-Api-Key/);
-  assert.match(option, /mcp\.example\.com/);
+  // Nothing asks about a key while the definition needs none.
+  assert.equal(await page.locator('#mcp-placeholders').isVisible(), false);
 
-  // Once attached, the row has to say which credential it uses. It read "no
-  // credential references" on a connector that plainly had one, which reads as a
-  // bug in the thing the operator just configured.
-  await agentPage.fill('#mcp-name', 'picker-connector');
-  await agentPage.fill('#mcp-url', 'https://mcp.example.com/mcp');
-  await agentPage.selectOption('#mcp-credential', { label: option.trim() });
-  await agentPage.click('#mcp-form button[type="submit"]');
-  await agentPage.waitForFunction(() => document.querySelectorAll('.mcp-row').length >= 1);
+  await page.fill('#mcp-name', 'bound-connector');
+  await page.fill('#mcp-url', 'https://mcp.example.com/mcp?key=${TOKEN}');
 
-  const meta = await agentPage.locator('.mcp-row .mcp-meta').first().textContent();
-  assert.match(meta, /picker-key/);
-  assert.doesNotMatch(meta, /no credential references/);
-  // Still never the value itself.
-  assert.doesNotMatch(await agentPage.content(), /sk-picker-000011112222/);
+  // Writing the placeholder is what raises the question.
+  const rows = page.locator('.placeholder-row');
+  await rows.first().waitFor();
+  assert.equal(await rows.count(), 1);
+  assert.match(await rows.first().textContent(), /TOKEN/);
+  assert.match(await rows.first().textContent(), /used in the URL/);
+  assert.match(await rows.first().textContent(), /cannot be saved/);
+
+  const choice = rows.first().locator('select');
+  const option = await choice.locator('option', { hasText: 'picker-key' }).textContent();
+  await choice.selectOption({ label: option.trim() });
+  assert.match(await rows.first().textContent(), /Uses the stored key/);
+
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'bound-connector' });
+  await row.waitFor();
+  // The row says what fills the placeholder, by name.
+  assert.match(await row.textContent(), /TOKEN ← stored key picker-key/);
+
+  // The definition keeps the placeholder, never a value.
+  const stored = await page.evaluate(async () => (await (await fetch('/api/v1/mcp/servers')).json()).servers);
+  const definition = stored.find((item) => item.name === 'bound-connector');
+  assert.match(definition.url, /\$\{TOKEN\}/);
+  assert.equal(definition.placeholders.TOKEN.source, 'credential');
+  assert.doesNotMatch(JSON.stringify(stored), /sk-picker-000011112222/);
+});
+
+test('a connector cannot be saved while a placeholder has nothing filling it', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'half-configured');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${UNFILLED}');
+  await page.locator('.placeholder-row').first().waitFor();
+  await page.click('#mcp-form button[type="submit"]');
+
+  // Named, rather than a generic refusal, and the dialog stays open.
+  const message = page.locator('#mcp-form-message');
+  await message.waitFor({ state: 'visible' });
+  assert.match(await message.textContent(), /UNFILLED/);
+  assert.equal(await page.locator('#mcp-dialog').evaluate((node) => node.open), true);
 });
 
 test('every page opens its dialogs without a browser error', async (t) => {
@@ -680,13 +706,15 @@ test('a refused delete is reported beside the list, not as the control plane goi
   const credentialRow = page.locator('.credential-row', { hasText: 'in-use-key' });
   await credentialRow.waitFor();
 
-  // Attach it to a connector so the deletion has to be refused.
+  // Bind it into a connector through a placeholder, so the deletion is refused.
   await page.click('#new-registry-mcp');
   await page.waitForSelector('#mcp-dialog[open]');
   await page.fill('#mcp-name', 'uses-the-key');
-  await page.fill('#mcp-url', 'https://inuse.example.com/mcp');
-  const option = await page.locator('#mcp-credential option', { hasText: 'in-use-key' }).textContent();
-  await page.selectOption('#mcp-credential', { label: option.trim() });
+  await page.fill('#mcp-url', 'https://inuse.example.com/mcp?key=${INUSE}');
+  const row = page.locator('.placeholder-row').first();
+  await row.waitFor();
+  const option = await row.locator('option', { hasText: 'in-use-key' }).textContent();
+  await row.locator('select').selectOption({ label: option.trim() });
   await page.click('#mcp-form button[type="submit"]');
   await page.locator('#registry-list .mcp-row', { hasText: 'uses-the-key' }).waitFor();
 
@@ -995,62 +1023,45 @@ test('an advisory line is not painted as a failure, and a real failure is', asyn
   assert.ok(!classes.some((cls) => cls.includes('failed')), 'a successful run painted a line as a failure');
 });
 
-test('a variable in the arguments is named, and says it is not substituted', async (t) => {
+test('a placeholder in an argument asks what fills it, and can use a container secret', async (t) => {
   const page = await openPage('/connectors');
   t.after(() => page.close());
   await page.waitForSelector('#new-registry-mcp');
 
   await page.click('#new-registry-mcp');
   await page.waitForSelector('#mcp-dialog[open]');
-  await page.selectOption('#mcp-transport', 'stdio');
-  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${COMPANY_TOKEN}');
-
-  // Arguments reach the server verbatim; only the environment mapping is
-  // resolved. Leaving that implicit is what made the relationship unclear.
-  const note = page.locator('#mcp-args-variables');
-  await note.waitFor({ state: 'visible' });
-  const text = await note.textContent();
-  assert.match(text, /COMPANY_TOKEN/);
-  assert.match(text, /passed to the server as written/i);
-
-  // And it offers to close the loop, which is the part that was invisible: the
-  // argument variable and the mapped environment name are the same idea.
-  await note.locator('button', { hasText: 'use COMPANY_TOKEN' }).click();
-  assert.equal(await page.inputValue('#mcp-secret-target'), 'COMPANY_TOKEN');
-  assert.match(await note.textContent(), /the variable mapped below/i);
-
-  await page.fill('#mcp-args', '/opt/mcp/server.mjs');
-  await note.waitFor({ state: 'hidden' });
-});
-
-test('a connector secret is chosen from names already in use, or added by name', async (t) => {
-  const page = await openPage('/connectors');
-  t.after(() => page.close());
-  await page.waitForSelector('#new-registry-mcp');
-
-  // Define one connector that references a secret, so there is something to
-  // choose the second time rather than a name to remember and retype.
-  await page.click('#new-registry-mcp');
-  await page.waitForSelector('#mcp-dialog[open]');
-  await page.fill('#mcp-name', 'first-stdio');
+  await page.fill('#mcp-name', 'local-with-token');
   await page.selectOption('#mcp-transport', 'stdio');
   await page.fill('#mcp-command', 'node');
-  await page.fill('#mcp-args', '/opt/mcp/server.mjs');
-  await page.fill('#mcp-secret-target', 'API_TOKEN');
-  await page.selectOption('#mcp-secret-source-choice', '__new');
-  await page.fill('#mcp-secret-source', 'COMPANY_API_TOKEN');
-  await page.click('#mcp-form button[type="submit"]');
-  await page.locator('#registry-list .mcp-row', { hasText: 'first-stdio' }).waitFor();
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${ACCESS_TOKEN}');
 
+  // An argument is the case that used to be a dead end: the interface had to
+  // explain that a variable there could never be filled. Now it is just asked.
+  const row = page.locator('.placeholder-row').first();
+  await row.waitFor();
+  assert.match(await row.textContent(), /ACCESS_TOKEN/);
+  assert.match(await row.textContent(), /used in an argument/);
+
+  await row.locator('select').selectOption('__new');
+  await row.locator('input').fill('COMPANY_API_TOKEN');
+  assert.match(await row.textContent(), /MCP_SECRET_COMPANY_API_TOKEN/);
+  assert.match(await row.textContent(), /control plane never sees it/i);
+
+  await page.click('#mcp-form button[type="submit"]');
+  const listed = page.locator('#registry-list .mcp-row', { hasText: 'local-with-token' });
+  await listed.waitFor();
+  assert.match(await listed.textContent(), /ACCESS_TOKEN ← MCP_SECRET_COMPANY_API_TOKEN/);
+
+  // A second connector offers that name rather than asking for it again.
   await page.click('#new-registry-mcp');
   await page.waitForSelector('#mcp-dialog[open]');
   await page.selectOption('#mcp-transport', 'stdio');
-  const options = await page.locator('#mcp-secret-source-choice option').allTextContents();
-  assert.ok(options.includes('COMPANY_API_TOKEN'), `the known secret was not offered: ${options.join(', ')}`);
-  assert.ok(options.includes('Add a new name…'));
-
-  // The free-text field only appears when adding a name.
-  assert.equal(await page.locator('#mcp-secret-source').isVisible(), false);
-  await page.selectOption('#mcp-secret-source-choice', '__new');
-  await page.locator('#mcp-secret-source').waitFor({ state: 'visible' });
+  await page.fill('#mcp-args', '/opt/other.mjs\n--token\n${OTHER}');
+  const second = page.locator('.placeholder-row').first();
+  await second.waitFor();
+  const options = await second.locator('option').allTextContents();
+  assert.ok(
+    options.some((text) => text.includes('COMPANY_API_TOKEN')),
+    `a name already in use was not offered: ${options.join(', ')}`
+  );
 });

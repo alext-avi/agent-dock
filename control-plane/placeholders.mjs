@@ -26,3 +26,34 @@ export function placeholderNames(server) {
   for (const value of Object.values(server?.environment ?? {})) scan(value);
   return [...found];
 }
+
+// The authority of a url — userinfo, host, port — must not contain a placeholder.
+//
+// The host check compares a credential's allowlist against the stored url, which
+// is a template. A placeholder inside the authority parses as part of the
+// hostname, so `https://${TENANT}.example.com` satisfies an allowlist of
+// `*.example.com`; the worker then substitutes plain text, and a value of
+// `attacker.test/collect?x=` moves the authority to a host nothing checked. That
+// is the bypass the allowlist exists to prevent, so the template is refused
+// rather than the check being quietly weakened.
+//
+// A placeholder in the path or query is fine: substitution cannot move the
+// authority once it has been parsed past.
+export function urlAuthorityPlaceholder(url) {
+  if (typeof url !== 'string') return null;
+  const scheme = url.indexOf('://');
+  if (scheme === -1) return null;
+  const start = scheme + 3;
+  const end = url.slice(start).search(/[/?#]/);
+  const authority = end === -1 ? url.slice(start) : url.slice(start, start + end);
+  const match = authority.match(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/);
+  return match ? match[1] : null;
+}
+
+// How a resolved value is addressed on the wire. Scoped to the definition,
+// because a placeholder name is only meaningful inside the definition that wrote
+// it: two connectors both naming ${TOKEN} are two different secrets, and sharing
+// one entry meant the later one was delivered to both.
+export function deliveryKey(server, name) {
+  return `${server.id}\u0000${name}`;
+}

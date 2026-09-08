@@ -228,6 +228,10 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       const value = input.value === undefined || input.value === null || input.value === ''
         ? null
         : text(input.value, 'value', { required: true, max: 4096 });
+      // Without a key provider nothing can ever be sealed, so a record created
+      // now could never be completed. Refusing is the same answer the store
+      // gives a value, rather than accepting something permanently unusable.
+      if (value === null && !keyProvider.available) keyProvider.key();
       const record = {
         ...fields,
         id: makeId(fields.name, new Set(records.keys())),
@@ -259,7 +263,10 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       // an editor could simply move the allowlist to wherever they wanted the
       // credential sent, which is not a boundary at all.
       const hostsChanged = fields.hosts.join(',') !== record.hosts.join(',');
-      if (hostsChanged && value === undefined && record.sealed) {
+      // Keyed off whether a list existed to change, not off whether a value is
+      // present. A key with hosts and no value could otherwise be repointed and
+      // then completed, and the redirect was never proved.
+      if (hostsChanged && value === undefined && record.hosts.length) {
         throw failure(
           'Changing permitted hosts requires supplying the credential value again, '
           + 'because it changes where the credential may be sent',

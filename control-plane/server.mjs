@@ -353,7 +353,7 @@ export function createControlPlane(options = {}) {
           }
           if (stored.schemaVersion >= 4) {
             for (const record of stored.credentials ?? []) {
-              if (record?.id && record?.name && record?.sealed) credentialRecords.set(record.id, record);
+              if (record?.id && record?.name) credentialRecords.set(record.id, record);
             }
           }
           if (stored.schemaVersion >= 3) {

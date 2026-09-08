@@ -108,6 +108,13 @@ function applyDeliveredCredentials(resolved, server, delivered) {
 // table, so it is documented rather than glossed.
 export const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
+// Must match the control plane's deliveryKey. The two cannot share a module
+// without putting worker code above the wrapper, so test/placeholders.test.mjs
+// asserts they agree.
+export function deliveryKeyFor(server, name) {
+  return `${server.id}\u0000${name}`;
+}
+
 export function placeholderNames(server) {
   const found = new Set();
   const scan = (value) => {
@@ -141,7 +148,7 @@ function placeholderValues(server, environment, delivered) {
     const binding = server.placeholders?.[name];
     if (!binding) throw unboundPlaceholder(name);
     if (binding.source === 'credential') {
-      const credential = delivered?.[name];
+      const credential = delivered?.[deliveryKeyFor(server, name)];
       if (!credential) {
         const error = new Error(
           `The stored key for ${name} was not delivered with this configuration. `
@@ -310,10 +317,16 @@ export function createMcpManager(options) {
 
   let deliveredCredentials = {};
 
-  function pendingCredentials() {
-    return state.servers
-      .filter((server) => server.credentialId && !deliveredCredentials[server.credentialId])
-      .map((server) => server.name);
+    function pendingCredentials() {
+    // Either way of using a stored key counts. Checking only credentialId meant a
+    // placeholder-only definition was never reported after a restart, so the
+    // control plane's record of 'applied' stayed ahead of the runtime silently.
+    const waiting = (server) => {
+      if (server.credentialId && !deliveredCredentials[server.credentialId]) return true;
+      return Object.entries(server.placeholders ?? {}).some(([name, binding]) =>
+        binding.source === 'credential' && !deliveredCredentials[deliveryKeyFor(server, name)]);
+    };
+    return state.servers.filter(waiting).map((server) => server.name);
   }
 
   async function apply(servers, credentials = {}) {

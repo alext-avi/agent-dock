@@ -1423,7 +1423,7 @@ function bindingLabel(binding) {
         { code: credential.name },
         '. This connector\'s URL is checked against ',
         { code: credential.hosts.join(', ') },
-        ' when you save — that stops the URL being changed to redirect the key, not the agent from using it elsewhere.'
+        ' when this configuration is applied — that stops the URL being changed to redirect the key, not the agent from using it elsewhere.'
       ]
       : [
         'Uses the stored key ',
@@ -2914,7 +2914,9 @@ function openCredentialDialog(credential = null) {
   ui.credentialId.value = credential?.id ?? '';
   ui.credentialDialogTitle.textContent = credential ? `Edit ${credential.name}` : 'New credential';
   ui.credentialName.value = credential?.name ?? '';
-  ui.credentialHeader.value = credential?.header ?? 'X-Api-Key';
+  // Empty for a key that has none, rather than writing a default back into a
+  // field the dialog keeps folded away.
+  ui.credentialHeader.value = credential ? credential.header ?? '' : '';
   ui.credentialHosts.value = (credential?.hosts ?? []).join('\n');
   // Editing cannot show the value, so the field means "replace it" rather than
   // "here is what it is".
@@ -2935,7 +2937,7 @@ async function saveCredential(event) {
   const body = {
     name: ui.credentialName.value.trim(),
     type: 'api-key',
-    header: ui.credentialHeader.value.trim(),
+    header: ui.credentialHeader.value.trim() || null,
     hosts
   };
   if (ui.credentialValue.value) body.value = ui.credentialValue.value;

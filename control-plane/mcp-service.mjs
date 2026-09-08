@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { placeholderNames } from './placeholders.mjs';
+import { deliveryKey, placeholderNames, urlAuthorityPlaceholder } from './placeholders.mjs';
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,79}$/;
@@ -193,6 +193,15 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
   // can never run, and a binding with no placeholder is a leftover that has
   // quietly stopped meaning anything.
   reconcilePlaceholders(definition);
+  // A placeholder in the authority would make the host check validate a template
+  // and let substitution move the destination afterwards.
+  const inAuthority = urlAuthorityPlaceholder(definition.url);
+  if (inAuthority) {
+    throw failure(
+      `${inAuthority} cannot be used in the host part of a url: the value would decide where this connector points, `
+      + 'which is what a key\'s permitted hosts are checked against. Use it in the path or query instead.'
+    );
+  }
   return definition;
 }
 
@@ -210,11 +219,18 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
   // A reference to a credential that does not exist must fail when it is written,
   // not silently at apply time in front of whoever is running a task.
   function requireCredential(server) {
-    if (!server.credentialId || !credentials) return;
-    try {
-      credentials.get(server.credentialId);
-    } catch {
-      throw failure(`Credential ${server.credentialId} does not exist`, 400);
+    if (!credentials) return;
+    const referenced = new Set();
+    if (server.credentialId) referenced.add(server.credentialId);
+    for (const binding of Object.values(server.placeholders ?? {})) {
+      if (binding.source === 'credential') referenced.add(binding.credentialId);
+    }
+    for (const id of referenced) {
+      try {
+        credentials.get(id);
+      } catch {
+        throw failure(`Credential ${id} does not exist`, 400);
+      }
     }
   }
 
@@ -290,6 +306,8 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     return { agentId, bindings: desired, runtime };
   }
 
+  // The one place that decides how a delivered value is addressed. Both sides of
+  // the wrapper derive it the same way, from fields the definition already has.
   function resolveCredentials(selected) {
     if (!credentials) return {};
     const resolved = {};
@@ -301,10 +319,12 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
       }
       for (const [name, binding] of Object.entries(server.placeholders ?? {})) {
         if (binding.source !== 'credential') continue;
-        // Keyed by placeholder name, because that is what the worker substitutes.
-        // Two connectors may bind the same key to differently named placeholders
-        // and each worker only ever sees its own agent's definitions.
-        resolved[name] = server.transport === 'http'
+        // Scoped to the definition, not just prefixed. Two connectors naming the
+        // same placeholder collided in one entry, so the later one's key was
+        // delivered to both — past two host checks that each looked only at their
+        // own connector. The definition id also keeps this clear of credential
+        // ids, which share a character set with placeholder names.
+        resolved[deliveryKey(server, name)] = server.transport === 'http'
           ? credentials.resolveForHost(binding.credentialId, server.url)
           // A local process has no destination to check against, so the host list
           // cannot constrain this one. Stated in the contract rather than implied.

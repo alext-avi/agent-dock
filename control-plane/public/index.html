@@ -16,7 +16,7 @@
       <div class="topbar-right">
         <a class="nav-link" href="/">Fleet</a>
         <a class="nav-link" href="/jobs">Jobs</a>
-        <a class="nav-link" href="/credentials">Credentials</a>
+        <a class="nav-link" href="/connectors">MCP</a>
         <div class="connection"><span id="connection-dot" class="dot pending"></span><span id="connection-label">Connecting</span></div>
         <div id="operator-account" class="operator-account" aria-label="Signed-in operator">
           <button id="access-policy-button" class="operator-access" type="button" aria-haspopup="dialog" title="View access policy">
@@ -55,29 +55,40 @@
         </section>
       </div>
 
-      <div id="credentials-view" class="view hidden">
+      <div id="mcp-view" class="view hidden">
         <section class="jobs-header">
           <div>
-            <p class="eyebrow">CONTROL PLANE · CONNECTOR CREDENTIALS</p>
-            <h1>Keys you can <em>take back.</em></h1>
-            <p class="hero-copy">An API key is stored once, sent only to the hosts you name, and delivered only to the agents whose connectors use it. A value is never shown again after saving.</p>
+            <p class="eyebrow">CONTROL PLANE · MCP</p>
+            <h1>Prove once. <em>Reuse deliberately.</em></h1>
+            <p class="hero-copy">Connectors are defined once and attached to any compatible agent. The keys they authenticate with live here too, because that is the only thing they are for.</p>
           </div>
           <div class="jobs-header-actions">
+            <button id="new-registry-mcp" class="button primary" type="button">New connector <span>＋</span></button>
+          </div>
+        </section>
+
+        <section class="fleet-heading" id="connectors">
+          <div><p class="kicker">REUSABLE CONNECTIONS</p><h2>Connectors</h2></div>
+          <span id="registry-count" class="hint">Loading connectors…</span>
+        </section>
+        <p class="capability-copy">A definition carries the connection shape and which stored key it uses — never a key's value. Attaching and applying happen on an individual agent.</p>
+        <section id="registry-list" class="mcp-list" aria-live="polite"><p class="empty">Loading connectors…</p></section>
+        <p id="registry-message" class="run-message" role="status"></p>
+
+        <hr class="section-rule">
+        <section class="fleet-heading" id="credentials">
+          <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
+          <div class="fleet-heading-actions">
+            <span id="credentials-refreshed" class="hint">Loading credentials…</span>
             <span id="credential-storage" class="pill neutral">checking storage</span>
             <button id="new-credential" class="button primary" type="button">New credential <span>＋</span></button>
           </div>
         </section>
-
         <section id="credential-storage-note" class="panel credential-note hidden">
           <p id="credential-storage-detail"></p>
         </section>
-
-        <section class="fleet-heading">
-          <div><p class="kicker">CREDENTIALS</p><h2>Stored keys</h2></div>
-          <span id="credentials-refreshed" class="hint">Loading credentials…</span>
-        </section>
-
         <section id="credential-list" class="mcp-list" aria-live="polite"><p class="empty">Loading credentials…</p></section>
+        <p id="credential-list-message" class="run-message" role="status"></p>
       </div>
 
       <div id="jobs-view" class="view hidden">
@@ -397,9 +408,8 @@
         <input id="credential-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">CONNECTOR CREDENTIAL</p><h2 id="credential-dialog-title">New credential</h2></div><button id="close-credential-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">The value is write-only. Once saved it is never displayed or returned again — only the last four characters, so you can recognise a key you already hold.</p>
-        <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company-docs"></label>
-        <label class="field">Header <span>the request header this key is sent in</span><input id="credential-header" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="X-Api-Key"></label>
-        <label class="field">Permitted hosts <span>one per line; a credential is only ever sent to these</span><textarea id="credential-hosts" rows="3" required placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
+        <label class="field">Name <span>a descriptive label; an internal ID is generated automatically</span><input id="credential-name" required maxlength="64" placeholder="GitHub personal token"></label>
+        <label class="field">Permitted hosts <span>optional; one per line. Checked against a connector's URL when it is saved — not egress control, and not consulted for a local process. Hostnames resolve inside the agent's container, so a proxy elsewhere is its container name or <code>host.docker.internal</code>, never <code>127.0.0.1</code>.</span><textarea id="credential-hosts" rows="3" placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
         <label class="field">Value <span id="credential-value-hint">pasted once, never shown again</span><input id="credential-value" type="password" autocomplete="off" maxlength="4096" placeholder="paste the key"></label>
         <p id="credential-message" class="usage-error hidden"></p>
         <div class="dialog-actions">
@@ -414,25 +424,49 @@
         <input id="mcp-definition-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">WORKER CONNECTION</p><h2 id="mcp-dialog-title">New MCP server</h2></div><button id="close-mcp-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">This canonical definition is stored by the control plane and rendered into the selected agent harness only inside its container.</p>
+
+        <section id="workshop" class="workshop hidden">
+          <div class="workshop-head">
+            <div><p class="kicker">ASK A HARNESS</p><small>Describe the connector and let an agent work out its shape. It may install and run software inside the selected agent container while investigating; you review everything before it is saved.</small></div>
+            <select id="workshop-agent" aria-label="Harness to ask"><option value="">No agents available</option></select>
+          </div>
+          <label class="field" for="workshop-objective">What should it connect to?<textarea id="workshop-objective" rows="3" maxlength="12000" placeholder="The GitHub MCP server, for reading issues and pull requests."></textarea></label>
+          <div class="workshop-actions">
+            <button id="run-workshop" class="button secondary" type="button">Ask</button>
+            <span id="workshop-status" class="run-message" role="status"></span>
+          </div>
+          <div id="workshop-log" class="workshop-log hidden" aria-live="polite"></div>
+        </section>
         <div class="form-grid">
           <label class="field">Name<input id="mcp-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company_docs"></label>
           <label class="field">Transport<select id="mcp-transport"><option value="http">Remote HTTP</option><option value="stdio">Local stdio process</option></select></label>
         </div>
         <section id="mcp-http-fields" class="mcp-transport-fields">
           <label class="field">Server URL<input id="mcp-url" type="url" placeholder="https://mcp.example.com/mcp"></label>
-          <label class="field">Credential <span>a stored key, sent only to its permitted hosts</span><select id="mcp-credential"><option value="">None</option></select></label>
-          <label class="field">Bearer token connector secret <span>legacy; a worker environment reference</span><input id="mcp-bearer-env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_MCP_TOKEN"></label>
+          <p class="field-note">Put <code>${NAME}</code> anywhere a secret belongs — in the URL, or in a header. You will be asked what fills it.</p>
         </section>
         <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
           <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
-          <div class="form-grid">
-            <label class="field">Secret target variable <span>optional</span><input id="mcp-secret-target" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="API_TOKEN"></label>
-            <label class="field">Connector secret name <span>optional</span><input id="mcp-secret-source" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMPANY_API_TOKEN"></label>
-          </div>
+          <p class="field-note">Put <code>${NAME}</code> where the command actually consumes a secret. Environment-based secrets are summarized under Values to bind.</p>
         </section>
+        <details id="mcp-advanced" class="mcp-advanced">
+          <summary>Advanced connection settings</summary>
+          <div id="mcp-http-advanced" class="mcp-advanced-fields">
+            <label class="field">Headers <span>one per line as Name: value; placeholders are supported</span><textarea id="mcp-headers" rows="3" placeholder="Authorization: Bearer ${ACCESS_TOKEN}"></textarea></label>
+          </div>
+          <div id="mcp-stdio-advanced" class="mcp-advanced-fields hidden">
+            <label class="field">Working directory <span>must be inside /workspace; placeholders are supported</span><input id="mcp-cwd" placeholder="/workspace/project"></label>
+            <label class="field">Environment <span>one per line as NAME=value; placeholders are supported</span><textarea id="mcp-environment" rows="3" placeholder="SERVICE_TOKEN=${ACCESS_TOKEN}"></textarea></label>
+          </div>
+        </details>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>
         <p id="mcp-form-message" class="usage-error hidden"></p>
+        <fieldset id="mcp-placeholders" class="auth-block hidden">
+          <legend>Values to bind</legend>
+          <div id="mcp-placeholder-rows" class="placeholder-rows"></div>
+        </fieldset>
+
         <div class="actions dialog-actions"><button id="delete-mcp-definition" class="button danger hidden" type="button">Delete definition</button><span class="dialog-spacer"></span><button id="cancel-mcp" class="button secondary" type="button">Cancel</button><button id="save-mcp" class="button primary" type="submit">Save and attach</button></div>
       </form>
     </dialog>

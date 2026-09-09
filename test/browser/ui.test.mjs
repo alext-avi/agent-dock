@@ -661,7 +661,7 @@ test('no connection detail reaches the browser', async (t) => {
 });
 
 
-test('a credential can be added from the UI and its value never comes back', async (t) => {
+test('a credential can use a human-readable label and its value never comes back', async (t) => {
   const page = await openPage('/credentials');
   t.after(() => page.close());
   await page.waitForFunction(() => document.querySelector('#credential-list')?.textContent?.includes('No credentials yet'));
@@ -672,15 +672,14 @@ test('a credential can be added from the UI and its value never comes back', asy
   assert.match(note, /Anyone able to read this host can read them/);
 
   await page.click('#new-credential');
-  await page.fill('#credential-name', 'company-docs');
-  await page.fill('#credential-header', 'X-Api-Key');
+  await page.fill('#credential-name', 'Company docs key');
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-browser-secret-9999');
   await page.click('#credential-form button[type="submit"]');
 
   await page.waitForFunction(() => document.querySelectorAll('.credential-row').length === 1);
   const row = page.locator('.credential-row').first();
-  assert.match(await row.textContent(), /company-docs/);
+  assert.match(await row.textContent(), /Company docs key/);
   assert.match(await row.textContent(), /…9999/);
 
   // Nothing on the page carries the value, including after a save.
@@ -693,46 +692,71 @@ test('a credential can be added from the UI and its value never comes back', asy
   assert.equal(await page.inputValue('#credential-hosts'), 'mcp.example.com');
 });
 
-test('a connector offers stored credentials instead of asking for a variable name', async (t) => {
-  const page = await openPage('/credentials');
+test('a placeholder is what asks for a key, and binds to a stored one', async (t) => {
+  const page = await openPage('/connectors');
   t.after(() => page.close());
   await page.waitForSelector('#new-credential');
 
   await page.click('#new-credential');
   await page.fill('#credential-name', 'picker-key');
-  await page.fill('#credential-header', 'X-Api-Key');
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-picker-000011112222');
   await page.click('#credential-form button[type="submit"]');
-  await page.waitForFunction(() => document.querySelectorAll('.credential-row').length >= 1);
+  await page.locator('.credential-row', { hasText: 'picker-key' }).waitFor();
 
-  const agentPage = await browser.newPage();
-  t.after(() => agentPage.close());
-  await agentPage.goto(`${app.url}/agents/${app.agents['claude-code'].id}#tools`);
-  await agentPage.waitForSelector('#new-mcp');
-  await agentPage.click('#new-mcp');
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
 
-  // The picker lists the stored credential with the hosts it is limited to, so
-  // the operator can see where it would be sent before choosing it.
-  await agentPage.waitForFunction(() => [...document.querySelectorAll('#mcp-credential option')].some((o) => o.textContent.includes('picker-key')));
-  const option = await agentPage.locator('#mcp-credential option', { hasText: 'picker-key' }).textContent();
-  assert.match(option, /X-Api-Key/);
-  assert.match(option, /mcp\.example\.com/);
+  // Nothing asks about a key while the definition needs none.
+  assert.equal(await page.locator('#mcp-placeholders').isVisible(), false);
 
-  // Once attached, the row has to say which credential it uses. It read "no
-  // credential references" on a connector that plainly had one, which reads as a
-  // bug in the thing the operator just configured.
-  await agentPage.fill('#mcp-name', 'picker-connector');
-  await agentPage.fill('#mcp-url', 'https://mcp.example.com/mcp');
-  await agentPage.selectOption('#mcp-credential', { label: option.trim() });
-  await agentPage.click('#mcp-form button[type="submit"]');
-  await agentPage.waitForFunction(() => document.querySelectorAll('.mcp-row').length >= 1);
+  await page.fill('#mcp-name', 'bound-connector');
+  await page.fill('#mcp-url', 'https://mcp.example.com/mcp?key=${TOKEN}');
 
-  const meta = await agentPage.locator('.mcp-row .mcp-meta').first().textContent();
-  assert.match(meta, /picker-key/);
-  assert.doesNotMatch(meta, /no credential references/);
-  // Still never the value itself.
-  assert.doesNotMatch(await agentPage.content(), /sk-picker-000011112222/);
+  // Writing the placeholder is what raises the question.
+  const rows = page.locator('.placeholder-row');
+  await rows.first().waitFor();
+  assert.equal(await rows.count(), 1);
+  assert.match(await rows.first().textContent(), /TOKEN/);
+  assert.match(await rows.first().textContent(), /used in the URL/);
+  assert.match(await rows.first().textContent(), /cannot be saved/);
+
+  const choice = rows.first().locator('select');
+  const option = await choice.locator('option', { hasText: 'picker-key' }).textContent();
+  await choice.selectOption({ label: option.trim() });
+  assert.match(await rows.first().textContent(), /Uses the stored key/);
+
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'bound-connector' });
+  await row.waitFor();
+  // The row says what fills the placeholder, by name.
+  assert.match(await row.textContent(), /TOKEN ← stored key picker-key/);
+
+  // The definition keeps the placeholder, never a value.
+  const stored = await page.evaluate(async () => (await (await fetch('/api/v1/mcp/servers')).json()).servers);
+  const definition = stored.find((item) => item.name === 'bound-connector');
+  assert.match(definition.url, /\$\{TOKEN\}/);
+  assert.equal(definition.placeholders.TOKEN.source, 'credential');
+  assert.doesNotMatch(JSON.stringify(stored), /sk-picker-000011112222/);
+});
+
+test('a connector cannot be saved while a placeholder has nothing filling it', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'half-configured');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${UNFILLED}');
+  await page.locator('.placeholder-row').first().waitFor();
+  await page.click('#mcp-form button[type="submit"]');
+
+  // Named, rather than a generic refusal, and the dialog stays open.
+  const message = page.locator('#mcp-form-message');
+  await message.waitFor({ state: 'visible' });
+  assert.match(await message.textContent(), /UNFILLED/);
+  assert.equal(await page.locator('#mcp-dialog').evaluate((node) => node.open), true);
 });
 
 test('every page opens its dialogs without a browser error', async (t) => {
@@ -757,4 +781,744 @@ test('every page opens its dialogs without a browser error', async (t) => {
   await page.evaluate(() => document.querySelector('#mcp-form').checkValidity());
 
   assert.deepEqual(errors, [], `the browser reported errors: ${errors.join(' | ')}`);
+});
+
+// These share one control plane with every other test in this file, so each
+// asserts on names it created rather than on the first row or an empty list.
+test('credentials live inside the MCP page, not beside it in the nav', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#mcp-view:not(.hidden)');
+
+  // Credentials only ever serve connectors, so they are a section of this page
+  // rather than a peer of Fleet and Jobs.
+  const nav = await page.locator('.nav-link').allTextContents();
+  assert.deepEqual(nav.map((item) => item.trim()), ['Fleet', 'Jobs', 'MCP']);
+  assert.ok(await page.locator('#connectors').isVisible());
+  assert.ok(await page.locator('#credentials').isVisible());
+
+  // The old address still resolves, so existing links and bookmarks survive.
+  await page.goto(`${app.url}/credentials`);
+  await page.waitForSelector('#mcp-view:not(.hidden)');
+  assert.ok(await page.locator('#credentials').isVisible());
+});
+
+test('a connector defined from the MCP page is stored without being attached to anything', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  // With no agent in context the dialog defines only; it has nothing to attach to.
+  assert.equal((await page.locator('#save-mcp').textContent()).trim(), 'Save connector');
+  await page.fill('#mcp-name', 'registry-only');
+  await page.fill('#mcp-url', 'https://registry-only.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'registry-only' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /remote HTTP/);
+});
+
+test('a refused delete is reported beside the list, not as the control plane going offline', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#credential-list');
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'in-use-key');
+  await page.fill('#credential-hosts', 'inuse.example.com');
+  await page.fill('#credential-value', 'sk-inuse-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  const credentialRow = page.locator('.credential-row', { hasText: 'in-use-key' });
+  await credentialRow.waitFor();
+
+  // Bind it into a connector through a placeholder, so the deletion is refused.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'uses-the-key');
+  await page.fill('#mcp-url', 'https://inuse.example.com/mcp?key=${INUSE}');
+  const row = page.locator('.placeholder-row').first();
+  await row.waitFor();
+  const option = await row.locator('option', { hasText: 'in-use-key' }).textContent();
+  await row.locator('select').selectOption({ label: option.trim() });
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#registry-list .mcp-row', { hasText: 'uses-the-key' }).waitFor();
+
+  page.on('dialog', (dialog) => dialog.accept());
+  await credentialRow.locator('.text-button', { hasText: 'Delete' }).click();
+
+  // Assert it is *visible*, not merely present. The first version of this test
+  // checked textContent and passed while the paragraph was display:none behind a
+  // duplicate id, so the fix it was written to defend did not actually work.
+  const refusal = page.locator('#credential-list-message');
+  await refusal.waitFor({ state: 'visible' });
+  assert.match(await refusal.textContent(), /still used by/);
+  // The topbar reports the control plane's health and must not be repurposed for
+  // an ordinary refusal — that reads as the whole thing having gone down.
+  assert.doesNotMatch(await page.locator('#connection-label').textContent(), /still used by/);
+  assert.equal(await credentialRow.count(), 1, 'the credential was deleted despite being in use');
+
+  // A failed save must report inside the dialog, not on the page behind it.
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'in-use-key');
+  await page.fill('#credential-hosts', 'inuse.example.com');
+  await page.fill('#credential-value', 'sk-duplicate-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  const dialogMessage = page.locator('#credential-message');
+  await dialogMessage.waitFor({ state: 'visible' });
+  assert.match(await dialogMessage.textContent(), /already exists/);
+  assert.equal(await page.locator('#credential-dialog').evaluate((node) => node.open), true);
+});
+
+test('the workshop fills the connector form in place and keeps its conversation across corrections', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  // Asking is offered when defining something new, inside the dialog it fills —
+  // and only once the harness list has loaded, so it never appears empty.
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+
+  // Capture the conversation this run uses, so the assertion does not depend on
+  // what any other test in this shared control plane has already created.
+  const conversationIds = new Set();
+  await page.route('**/api/v1/agents/*/tasks', async (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    if (body.conversationId) conversationIds.add(body.conversationId);
+    await route.continue();
+  });
+
+  // Pick the harness explicitly rather than relying on which one sorts first.
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a documentation connector');
+  await page.click('#run-workshop');
+
+  // The demo worker echoes the prompt back, so what returns is the example
+  // proposal the prompt carries — which still exercises the whole path: stream,
+  // extract, and fill the form the operator is looking at.
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'lowercase_connector_name');
+  // Assert the part that does not move with the prompt's worked example: the
+  // proposal reached the form, and the placeholder it carries is being asked
+  // about rather than silently pre-answered.
+  await page.locator('.placeholder-row', { hasText: 'ACCESS_TOKEN' }).waitFor();
+  // Not the validation verdict: that depends on the fixture's command allowlist,
+  // and reporting it honestly is a separate behaviour with its own test. What
+  // matters here is that the proposal reached the form.
+  assert.match(await page.locator('#workshop-status').textContent(), /Filled in below/i);
+
+  // A correction continues the same exchange rather than starting over, so the
+  // harness still has everything it worked out the first time.
+  await page.fill('#workshop-objective', 'no, it is the other endpoint');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelectorAll('#workshop-log p').length >= 4);
+
+  assert.equal(conversationIds.size, 1, 'a correction started a new conversation instead of continuing one');
+  const [conversationId] = [...conversationIds];
+  const agentId = app.agents['claude-code'].id;
+  const conversations = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/agents/${id}/conversations`);
+    return response.json();
+  }, agentId);
+  const mine = (conversations.conversations ?? []).find((item) => item.id === conversationId);
+  assert.ok(mine, 'the worker did not record the conversation this run used');
+  assert.equal(mine.turns, 2);
+});
+
+test('workshop validation shows warning text and distinguishes a harness rejection', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  let run = 0;
+  await page.route('**/api/v1/agents/*/tasks', (route) => {
+    run += 1;
+    const name = run === 1 ? 'warned-shape' : 'rejected-shape';
+    const taskId = 'validation-' + run;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId }),
+        JSON.stringify({
+          apiVersion: 'agent-wrapper/v1',
+          type: 'message.completed',
+          taskId,
+          data: {
+            role: 'assistant',
+            text: '<agent-dock-mcp-proposal>{"name":"' + name + '","transport":"http","url":"https://slightly-off.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>'
+          }
+        }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId, data: { status: 'succeeded' } })
+      ].join('\n') + '\n'
+    });
+  });
+  await page.route('**/api/v1/agents/*/mcp/validate', (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    if (body.server?.name === 'warned-shape') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          mcp: {
+            validation: {
+              warnings: [
+                { message: 'First concrete adapter warning.' },
+                { message: 'Second concrete adapter warning.' }
+              ]
+            }
+          }
+        })
+      });
+    }
+    return route.fulfill({
+      status: 400,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'This header combination is unsupported.' })
+    });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector with adapter warnings');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('with 2 warnings'));
+
+  let log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /First concrete adapter warning/);
+  assert.match(log ?? '', /Second concrete adapter warning/);
+
+  await page.fill('#workshop-objective', 'try the rejected shape instead');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('rejected the shape'));
+  log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /This header combination is unsupported/);
+});
+
+test('editing an existing connector does not offer to ask a harness', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'already-known');
+  await page.fill('#mcp-url', 'https://already-known.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'already-known' });
+  await row.waitFor();
+
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  // Editing a known shape is a deliberate act, not a question for a harness.
+  assert.equal(await page.locator('#workshop').isVisible(), false);
+});
+
+test('editing preserves every canonical connector field represented by the advanced form', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  const created = await page.evaluate(async () => {
+    const create = async (body) => (await (await fetch('/api/v1/mcp/servers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-agent-dock-csrf': '1' },
+      body: JSON.stringify(body)
+    })).json()).server;
+    return Promise.all([
+      create({
+        name: 'preserve-http-fields',
+        transport: 'http',
+        url: 'https://preserve-http.example.test/mcp',
+        headers: { 'X-Tenant': 'acme' },
+        timeoutMs: 30_000
+      }),
+      create({
+        name: 'preserve-stdio-fields',
+        transport: 'stdio',
+        command: 'node',
+        args: ['/workspace/server.mjs'],
+        cwd: '/workspace/project',
+        environment: { LOG_LEVEL: 'warn' },
+        timeoutMs: 30_000
+      })
+    ]);
+  });
+  await page.reload();
+
+  let row = page.locator('#registry-list .mcp-row', { hasText: 'preserve-http-fields' });
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.locator('#mcp-advanced').evaluate((node) => node.open), true);
+  assert.equal(await page.inputValue('#mcp-headers'), 'X-Tenant: acme');
+  await page.fill('#mcp-timeout', '45');
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#mcp-dialog').waitFor({ state: 'hidden' });
+  await row.waitFor();
+
+  row = page.locator('#registry-list .mcp-row', { hasText: 'preserve-stdio-fields' });
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.inputValue('#mcp-cwd'), '/workspace/project');
+  assert.equal(await page.inputValue('#mcp-environment'), 'LOG_LEVEL=warn');
+  await page.fill('#mcp-timeout', '45');
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#mcp-dialog').waitFor({ state: 'hidden' });
+
+  const stored = await page.evaluate(async () => (await (await fetch('/api/v1/mcp/servers')).json()).servers);
+  const http = stored.find((server) => server.id === created[0].id);
+  const stdio = stored.find((server) => server.id === created[1].id);
+  assert.deepEqual(http.headers, { 'X-Tenant': 'acme' });
+  assert.equal(http.timeoutMs, 45_000);
+  assert.equal(stdio.cwd, '/workspace/project');
+  assert.deepEqual(stdio.environment, { LOG_LEVEL: 'warn' });
+  assert.equal(stdio.timeoutMs, 45_000);
+});
+
+test('a proposal from a task that failed is refused rather than filled in', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness can emit a perfectly good proposal and then fail. Accepting it
+  // would tell the operator to review something the wrapper reported as broken.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'doomed' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'doomed', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"should-not-appear","transport":"http","url":"https://nope.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'doomed', data: { status: 'failed' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'something that will fail');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('Nothing was filled in'));
+  assert.equal(await page.inputValue('#mcp-name'), '', 'a failed run filled the form');
+  assert.equal(await page.inputValue('#mcp-url'), '');
+});
+
+test('a runtime that cannot carry a conversation still gets a proposal, and says what was lost', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // An un-refreshed runtime refuses a conversationId. Losing follow-up
+  // corrections is worth far less than losing the feature, so the ask is retried
+  // without one — but the operator has to be told, or they will wonder why a
+  // correction is ignored later.
+  const dispatched = [];
+  await page.route('**/api/v1/agents/*/tasks', async (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    // Record what was actually asked, not merely whether a conversation id was
+    // attached. The first version of this test asserted booleans only, so it
+    // passed even when the retry sent a bare objective with no instructions —
+    // which is the entire reason the retry is worth having.
+    dispatched.push({ conversation: Boolean(body.conversationId), instructed: /agent-dock-mcp-proposal/.test(body.prompt ?? '') });
+    if (body.conversationId) {
+      return route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'This runtime cannot continue a conversation, and would answer without the earlier turns.' })
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'legacy' }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'legacy', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"legacy-runtime","transport":"http","url":"https://legacy.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'legacy', data: { status: 'succeeded' } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector on an old runtime');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'legacy-runtime');
+  assert.deepEqual(dispatched, [
+    { conversation: true, instructed: true },
+    { conversation: false, instructed: true }
+  ], 'the retry must drop the conversation and keep the instructions');
+  const log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /cannot carry a conversation/i);
+});
+
+test('a slow harness list cannot reveal the workshop inside an edit dialog', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // Define something to edit.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'existing-shape');
+  await page.fill('#mcp-url', 'https://existing-shape.example.test/mcp');
+  await page.click('#mcp-form button[type="submit"]');
+  const row = page.locator('#registry-list .mcp-row', { hasText: 'existing-shape' });
+  await row.waitFor();
+
+  // Now make the harness list slow. Opening New starts that fetch; switching to
+  // Edit before it resolves used to let the reveal land in the edit dialog — and
+  // a run from there rewrites a saved connector into the model's proposed shape,
+  // because the definition id is populated and Save becomes a PATCH.
+  await page.route('**/api/v1/agents', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await route.continue();
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.click('#cancel-mcp');
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.inputValue('#mcp-name'), 'existing-shape');
+
+  // Long enough for the earlier list request to have resolved.
+  await page.waitForTimeout(4000);
+  assert.equal(
+    await page.locator('#workshop').isVisible(),
+    false,
+    'the workshop was revealed while editing a saved connector'
+  );
+});
+
+test('switching harness starts a fresh exchange rather than a correction', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  const proposal = (name) => [
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: name }),
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: name, data: { role: 'assistant', text: `<agent-dock-mcp-proposal>{"name":"${name}","transport":"http","url":"https://${name}.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>` } }),
+    JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: name, data: { status: 'succeeded' } })
+  ].join('\n') + '\n';
+
+  // The second harness fails its first ask, so no conversation is ever created
+  // on it. The ask after that must carry the full instructions: a turn count
+  // inherited from the first harness would send a bare correction into a
+  // conversation this runtime has never seen, and the operator would be told
+  // only that no proposal came back.
+  const asks = [];
+  let failNext = false;
+  await page.route('**/api/v1/agents/*/tasks', (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    const agent = decodeURIComponent(route.request().url().split('/agents/')[1].split('/')[0]);
+    asks.push({ agent, instructed: /agent-dock-mcp-proposal/.test(body.prompt ?? '') });
+    if (failNext) {
+      failNext = false;
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'the harness fell over' }) });
+    }
+    return route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: proposal('ok-' + asks.length) });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+
+  const first = app.agents['claude-code'].id;
+  const second = app.agents['codex-cli'].id;
+
+  await page.selectOption('#workshop-agent', first);
+  await page.fill('#workshop-objective', 'a connector on the first harness');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value?.startsWith('ok-'));
+
+  failNext = true;
+  await page.selectOption('#workshop-agent', second);
+  await page.fill('#workshop-objective', 'now try the second harness');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('Nothing was filled in'));
+
+  await page.fill('#workshop-objective', 'no, the other endpoint');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelectorAll('#workshop-log p').length >= 5);
+
+  assert.deepEqual(asks.map((ask) => ask.agent), [first, second, second]);
+  assert.deepEqual(
+    asks.map((ask) => ask.instructed),
+    [true, true, true],
+    'an ask after switching harness was sent as a bare correction'
+  );
+});
+
+test('an advisory line is not painted as a failure, and a real failure is', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness probing an endpoint reports a 401 as an error and then carries on
+  // to succeed. Painting that red made a working run look broken.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'noisy' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'error', taskId: 'noisy', data: { source: 'provider', message: 'probe returned 401 Unauthorized' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'noisy', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"noisy-but-fine","transport":"http","url":"https://noisy.example.test/mcp","headers":{"X-Api-Key":"sk-should-be-stripped"},"timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'noisy', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector whose probe returns 401');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'noisy-but-fine');
+
+  const classes = await page.locator('#workshop-log p').evaluateAll((nodes) => nodes.map((node) => node.className));
+  // The probe error and the stripped-header warning are advisory; the run worked.
+  assert.ok(classes.some((cls) => cls.includes('warn')), 'an advisory line was not marked as advisory');
+  assert.ok(!classes.some((cls) => cls.includes('failed')), 'a successful run painted a line as a failure');
+});
+
+test('a placeholder in an argument asks what fills it, and can use a container secret', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'local-with-token');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-command', 'node');
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${ACCESS_TOKEN}');
+
+  // An argument is the case that used to be a dead end: the interface had to
+  // explain that a variable there could never be filled. Now it is just asked.
+  const row = page.locator('.placeholder-row').first();
+  await row.waitFor();
+  assert.match(await row.textContent(), /ACCESS_TOKEN/);
+  assert.match(await row.textContent(), /used in the arguments/);
+
+  await row.locator('select').selectOption('__new');
+  await row.locator('input').fill('COMPANY_API_TOKEN');
+  assert.match(await row.textContent(), /MCP_SECRET_COMPANY_API_TOKEN/);
+  assert.match(await row.textContent(), /control plane never sees it/i);
+
+  await page.click('#mcp-form button[type="submit"]');
+  const listed = page.locator('#registry-list .mcp-row', { hasText: 'local-with-token' });
+  await listed.waitFor();
+  assert.match(await listed.textContent(), /ACCESS_TOKEN ← MCP_SECRET_COMPANY_API_TOKEN/);
+
+  // A second connector offers that name rather than asking for it again.
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-args', '/opt/other.mjs\n--token\n${OTHER}');
+  const second = page.locator('.placeholder-row').first();
+  await second.waitFor();
+  const options = await second.locator('option').allTextContents();
+  assert.ok(
+    options.some((text) => text.includes('COMPANY_API_TOKEN')),
+    `a name already in use was not offered: ${options.join(', ')}`
+  );
+});
+
+test('a proposal carrying a placeholder asks the operator what fills it', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  // A harness now says "a secret goes here" by writing a placeholder, and says
+  // nothing about what fills it — that choice is the operator's, so the proposal
+  // must arrive unbound rather than pre-answered.
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'proposing' }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'message.completed', taskId: 'proposing', data: { role: 'assistant', text: '<agent-dock-mcp-proposal>{"name":"proposed-local","transport":"stdio","command":"node","args":["/opt/mcp/server.mjs","--token","${SERVICE_TOKEN}"],"timeoutMs":30000}</agent-dock-mcp-proposal>' } }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'proposing', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a local connector that needs a token');
+  await page.click('#run-workshop');
+
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'proposed-local');
+  // The placeholder reached the arguments verbatim.
+  assert.match(await page.inputValue('#mcp-args'), /\$\{SERVICE_TOKEN\}/);
+
+  // And it is being asked about, unbound.
+  const row = page.locator('.placeholder-row', { hasText: 'SERVICE_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /cannot be saved/);
+  assert.equal(await row.locator('select').inputValue(), '');
+
+  // The compatibility check is not attempted while a placeholder is unbound. It
+  // would fail every time, because the control plane refuses to normalize a
+  // definition with nothing bound — and it reported that as though the harness
+  // had proposed a bad shape, which a live run actually produced.
+  const status = await page.locator('#workshop-status').textContent();
+  assert.match(status, /Choose what fills SERVICE_TOKEN/);
+  assert.doesNotMatch(status, /rejected the shape/i);
+  assert.doesNotMatch(status, /could not be completed/i);
+});
+
+test('ordinary environment secret forwarding stays concise and an unusable workshop command is not saved', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'docker-proposal' }),
+      JSON.stringify({
+        apiVersion: 'agent-wrapper/v1',
+        type: 'message.completed',
+        taskId: 'docker-proposal',
+        data: {
+          role: 'assistant',
+          text: '<agent-dock-mcp-proposal>{"name":"docker-proposal","transport":"stdio","command":"docker","args":["run","--rm","-i","-e","GITHUB_PERSONAL_ACCESS_TOKEN","example.invalid/mcp","stdio"],"cwd":null,"environment":{"GITHUB_PERSONAL_ACCESS_TOKEN":"${GITHUB_PERSONAL_ACCESS_TOKEN}"},"timeoutMs":30000}</agent-dock-mcp-proposal>'
+        }
+      }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'docker-proposal', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'the GitHub MCP server in Docker');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'docker-proposal');
+
+  assert.equal(await page.locator('#mcp-advanced').evaluate((node) => node.open), false);
+  const row = page.locator('.placeholder-row', { hasText: 'GITHUB_PERSONAL_ACCESS_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /passed to the connector as an environment variable/);
+
+  await row.locator('select').selectOption('__new');
+  await row.locator('input').fill('GITHUB_PERSONAL_ACCESS_TOKEN');
+  await page.click('#mcp-form button[type="submit"]');
+
+  const message = page.locator('#mcp-form-message');
+  await message.waitFor({ state: 'visible' });
+  assert.match(await message.textContent(), /not allowed/i);
+  assert.equal(await page.locator('#registry-list .mcp-row', { hasText: 'docker-proposal' }).count(), 0);
+});
+
+test('a key named after the placeholder is preselected', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-credential');
+
+  // A name and a value is all a key needs now.
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'MATCHING_TOKEN');
+  await page.fill('#credential-value', 'sk-matching-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.locator('.credential-row', { hasText: 'MATCHING_TOKEN' }).waitFor();
+  // No host list means no restriction, and the row says so rather than showing
+  // an empty cell.
+  assert.match(await page.locator('.credential-row', { hasText: 'MATCHING_TOKEN' }).textContent(), /any host/);
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${MATCHING_TOKEN}');
+
+  // The obvious answer is offered rather than looked up. A prefill, not a
+  // decision: the select still shows it and can still be changed.
+  const row = page.locator('.placeholder-row', { hasText: 'MATCHING_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.locator('select').inputValue(), /^credential:/);
+  assert.match(await row.textContent(), /Uses the stored key/);
+  // And it describes the mechanism rather than implying an enforcement that does
+  // not exist: an unrestricted key means nothing checks the destination at all.
+  assert.match(await row.textContent(), /names no hosts, so nothing checks where this connector points/);
+});
+
+test('a placeholder with no key can create one to complete', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.fill('#mcp-name', 'needs-a-new-key');
+  await page.fill('#mcp-url', 'https://example.test/mcp?key=${BRAND_NEW_TOKEN}');
+  const row = page.locator('.placeholder-row', { hasText: 'BRAND_NEW_TOKEN' });
+  await row.waitFor();
+
+  // Writing the placeholder is enough to bring the key into existence; the value
+  // is filled in afterwards, which is the point of letting it exist unfinished.
+  await row.locator('select').selectOption('__create');
+  await page.waitForFunction(() => {
+    const text = document.querySelector('.placeholder-row')?.textContent ?? '';
+    return text.includes('has no value yet');
+  });
+  assert.match(await row.textContent(), /Add its value under Stored keys/);
+
+  const created = page.locator('.credential-row', { hasText: 'BRAND_NEW_TOKEN' });
+  await created.waitFor();
+  assert.match(await created.textContent(), /needs a value/);
+
+  // The connector can still be saved: the binding is real, the value is simply
+  // outstanding, and the apply is what refuses until it is there.
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#registry-list .mcp-row', { hasText: 'needs-a-new-key' }).waitFor();
+
+  // Completing it is an ordinary edit, and the value is then required.
+  await created.locator('.credential-edit').click();
+  await page.waitForSelector('#credential-dialog[open]');
+  assert.match(await page.locator('#credential-value-hint').textContent(), /no value yet/);
+  assert.equal(await page.locator('#credential-value').evaluate((node) => node.required), true);
+  await page.fill('#credential-value', 'sk-completed-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('.credential-row')].find((node) => node.textContent.includes('BRAND_NEW_TOKEN'));
+    return row && !row.textContent.includes('needs a value');
+  });
+});
+
+test('a local process is not described as limited by a host list', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-credential');
+
+  await page.click('#new-credential');
+  await page.fill('#credential-name', 'SCOPED_KEY');
+  await page.fill('#credential-hosts', 'only.example.test');
+  await page.fill('#credential-value', 'sk-scoped-000011112222');
+  await page.click('#credential-form button[type="submit"]');
+  await page.locator('.credential-row', { hasText: 'SCOPED_KEY' }).waitFor();
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#mcp-transport', 'stdio');
+  await page.fill('#mcp-args', '/opt/mcp/server.mjs\n--token\n${SCOPED_KEY}');
+
+  // A stdio connector has no url, so the host list is never consulted. Saying it
+  // is "limited to only.example.test" here would describe a check that does not
+  // happen — the value is handed to a local process either way.
+  const row = page.locator('.placeholder-row', { hasText: 'SCOPED_KEY' });
+  await row.waitFor();
+  const text = await row.textContent();
+  assert.match(text, /no URL, so its host list is not consulted/);
+  assert.doesNotMatch(text, /limited to/i);
+  assert.doesNotMatch(text, /only\.example\.test/);
 });

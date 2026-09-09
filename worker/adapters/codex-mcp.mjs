@@ -1,5 +1,6 @@
 const SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 export const codexMcpCapabilities = Object.freeze({
   supported: true,
@@ -13,9 +14,12 @@ export const codexMcpCapabilities = Object.freeze({
   restartRequired: false,
   healthObservation: 'provider-inspection',
   secretDelivery: 'worker-resolved-environment',
-  // Advertised so the control plane can refuse to send a credentialId
-  // definition to a worker that would apply it with no header at all.
+  // Advertised so the control plane can refuse to send a stored-key placeholder
+  // to a worker that would apply it with the literal placeholder still present.
   credentialDelivery: true,
+  // A definition may carry ${NAME} in an argument, a url, a header or an
+  // environment value, and the worker fills it at the last moment.
+  placeholders: true,
   localCommandPolicy: 'allowlist'
 });
 
@@ -78,17 +82,16 @@ export function validateCodexMcpServers(servers, options = {}) {
       if (server.command || (server.args?.length ?? 0) || server.cwd || Object.keys(server.environment ?? {}).length) {
         errors.push(issue(index, server, 'transport', 'mixed_transport_fields', 'HTTP servers cannot include stdio fields'));
       }
-      const headers = Object.keys(server.headers ?? {});
-      const secretHeaders = Object.keys(server.secretHeaders ?? {});
-      const resolvedBearer = headers.length === 1 && headers[0].toLowerCase() === 'authorization' && secretHeaders.some((header) => header.toLowerCase() === 'authorization');
-      if (headers.length && !resolvedBearer) errors.push(issue(index, server, 'headers', 'unsupported_field', 'Codex managed HTTP servers do not yet support literal headers'));
-      for (const header of secretHeaders) {
-        const value = server.secretHeaders[header];
-        if (header.toLowerCase() !== 'authorization' || value.prefix !== 'Bearer ' || !ENV_NAME.test(value.sourceEnv ?? '')) {
-          errors.push(issue(index, server, `secretHeaders.${header}`, 'unsupported_auth', 'Codex supports a worker environment reference for an Authorization Bearer header'));
+      validateMap(server.headers, index, server, 'headers', errors, HEADER_NAME);
+      const headers = Object.entries(server.headers ?? {});
+      if (headers.length > 1) {
+        errors.push(issue(index, server, 'headers', 'unsupported_field', 'Codex supports at most one managed Authorization bearer header'));
+      } else if (headers.length === 1) {
+        const [header, value] = headers[0];
+        if (header.toLowerCase() !== 'authorization' || !/^Bearer\s+\S+$/i.test(value)) {
+          errors.push(issue(index, server, `headers.${header}`, 'unsupported_auth', 'Codex supports only an Authorization: Bearer <token> header'));
         }
       }
-      if (secretHeaders.length > 1) errors.push(issue(index, server, 'secretHeaders', 'unsupported_field', 'Codex supports one managed bearer credential'));
     }
   }
   return { valid: errors.length === 0, errors, warnings };
@@ -106,14 +109,39 @@ export class CodexMcpValidationError extends Error {
 function addArguments(server) {
   if (server.transport === 'http') {
     const args = ['mcp', 'add', server.name, '--url', server.url];
-    const bearer = Object.entries(server.secretHeaders ?? {}).find(([header, value]) => header.toLowerCase() === 'authorization' && value.prefix === 'Bearer ');
-    if (bearer) args.push('--bearer-token-env-var', bearer[1].sourceEnv);
+    const bearer = bearerHeader(server);
+    if (bearer) args.push('--bearer-token-env-var', codexBearerEnvironmentName(server));
     return args;
   }
   const args = ['mcp', 'add', server.name];
   for (const [name, value] of Object.entries(server.environment ?? {})) args.push('--env', `${name}=${value}`);
   args.push('--', server.command, ...(server.args ?? []));
   return args;
+}
+
+function bearerHeader(server) {
+  return Object.entries(server.headers ?? {}).find(([header, value]) => (
+    header.toLowerCase() === 'authorization' && /^Bearer\s+\S+$/i.test(value)
+  ));
+}
+
+export function codexBearerEnvironmentName(server) {
+  const identity = String(server.id ?? server.name ?? 'server').replace(/[^A-Za-z0-9_]/g, '_').toUpperCase();
+  return `AGENT_DOCK_MCP_BEARER_${identity}`;
+}
+
+function commandEnvironment(server, base = {}) {
+  const bearer = bearerHeader(server);
+  if (!bearer) return base;
+  const token = bearer[1].replace(/^Bearer\s+/i, '');
+  return { ...base, [codexBearerEnvironmentName(server)]: token };
+}
+
+// Codex stores the environment-variable name in its native MCP configuration
+// and reads the value when a task starts. Supplying it only to `codex mcp add`
+// creates a valid-looking configuration whose connector fails at runtime.
+export function codexMcpTaskEnvironment(base = {}, servers = []) {
+  return servers.reduce((environment, server) => commandEnvironment(server, environment), { ...base });
 }
 
 /** Reconcile only Agent Dock-managed names through the provider's native CLI. */
@@ -123,17 +151,17 @@ export async function applyCodexMcpServers(servers, options = {}) {
   if (options.demoMode) return { changed: true, provider: 'codex', warnings: validation.warnings };
   if (typeof options.run !== 'function') throw new TypeError('Codex MCP apply requires a run(command,args) function');
   const previous = Array.isArray(options.previousServers) ? options.previousServers : [];
-  const names = new Set([...previous, ...servers].map((server) => server.name));
+  const names = new Set([...(options.previousNames ?? []), ...previous.map((server) => server.name), ...servers.map((server) => server.name)]);
   for (const name of names) await options.run('codex', ['mcp', 'remove', name], { env: options.env });
   for (const server of servers) {
-    const result = await options.run('codex', addArguments(server), { env: options.env, timeout: 30_000 });
+    const result = await options.run('codex', addArguments(server), { env: commandEnvironment(server, options.env), timeout: 30_000 });
     if (result.code !== 0) {
       let rollbackFailed = false;
       for (const name of names) {
         await options.run('codex', ['mcp', 'remove', name], { env: options.env }).catch(() => { rollbackFailed = true; });
       }
       for (const previousServer of previous) {
-        const restored = await options.run('codex', addArguments(previousServer), { env: options.env, timeout: 30_000 }).catch(() => ({ code: -1 }));
+        const restored = await options.run('codex', addArguments(previousServer), { env: commandEnvironment(previousServer, options.env), timeout: 30_000 }).catch(() => ({ code: -1 }));
         if (restored.code !== 0) rollbackFailed = true;
       }
       const error = new Error(rollbackFailed

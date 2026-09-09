@@ -1,0 +1,201 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  buildMcpWorkshopPrompt,
+  createWorkshopRunState,
+  extractMcpWorkshopProposal,
+  observeWorkshopRunEvent,
+  requireSuccessfulWorkshopRun
+} from '../control-plane/public/mcp-workshop.js';
+
+test('workshop prompt preserves the operator objective and the approval boundary', () => {
+  const prompt = buildMcpWorkshopPrompt('Investigate the official GitHub MCP server.');
+
+  assert.match(prompt, /Investigate the official GitHub MCP server\./);
+  assert.match(prompt, /do not call the Agent Dock control-plane API/i);
+  assert.match(prompt, /do not .*include any credential value/i);
+  assert.match(prompt, /<agent-dock-mcp-proposal>/);
+  assert.throws(() => buildMcpWorkshopPrompt('   '), /Describe the connector/);
+});
+
+test('extracts a canonical HTTP proposal and drops literal secrets', () => {
+  const result = extractMcpWorkshopProposal(`Research notes.
+<agent-dock-mcp-proposal>
+{
+  "name": "github_tools",
+  "transport": "http",
+  "url": "https://example.test/mcp",
+  "environment": { "LEAK": "literal-secret" },
+  "headers": {
+    "Authorization": "Bearer \${GITHUB_TOKEN}",
+    "X-Token": "literal-secret"
+  },
+  "secretHeaders": {
+    "Authorization": { "sourceEnv": "GITHUB_TOKEN", "prefix": "Bearer " }
+  },
+  "timeoutMs": 45000
+}
+</agent-dock-mcp-proposal>`);
+
+  assert.deepEqual(result.proposal, {
+    name: 'github_tools',
+    transport: 'http',
+    command: null,
+    args: [],
+    cwd: null,
+    url: 'https://example.test/mcp',
+    environment: {},
+    headers: { Authorization: 'Bearer ${GITHUB_TOKEN}' },
+    timeoutMs: 45000
+  });
+  assert.deepEqual(result.warnings, [
+    'Environment values were removed because HTTP connectors do not use a process environment.',
+    'secretHeaders was removed because placeholder bindings are the only credential mechanism.',
+    'Literal header values were removed; use a ${PLACEHOLDER} instead.'
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /literal-secret/);
+});
+
+test('extracts a fenced stdio proposal and normalizes unsafe fields', () => {
+  const result = extractMcpWorkshopProposal(`\`\`\`json
+{
+  "name": "local_tools",
+  "transport": "stdio",
+  "command": "node",
+  "args": ["server.mjs", "--safe"],
+  "cwd": "/workspace/connectors",
+  "environment": {
+    "SERVICE_TOKEN": "\${WORKER_SERVICE_TOKEN}",
+    "bad-name": "\${NOT_VALID}",
+    "LOG_LEVEL": "debug"
+  },
+  "timeoutMs": 100
+}
+\`\`\``);
+
+  assert.equal(result.proposal.transport, 'stdio');
+  assert.equal(result.proposal.command, 'node');
+  assert.deepEqual(result.proposal.args, ['server.mjs', '--safe']);
+  assert.deepEqual(result.proposal.environment, { SERVICE_TOKEN: '${WORKER_SERVICE_TOKEN}' });
+  assert.equal(result.proposal.timeoutMs, 30000);
+  assert.match(result.warnings.join(' '), /invalid environment/i);
+  assert.match(result.warnings.join(' '), /literal environment/i);
+});
+
+test('rejects missing, malformed, and non-object proposals', () => {
+  assert.throws(() => extractMcpWorkshopProposal('No payload here.'), /did not contain/);
+  assert.throws(
+    () => extractMcpWorkshopProposal('<agent-dock-mcp-proposal>{nope}</agent-dock-mcp-proposal>'),
+    /not valid JSON/
+  );
+  assert.throws(
+    () => extractMcpWorkshopProposal('<agent-dock-mcp-proposal>[]</agent-dock-mcp-proposal>'),
+    /must be a JSON object/
+  );
+});
+
+// A harness investigating a service reports a 401 or a 404 as an error and then
+// carries on. Refusing on any error at all rejected perfectly good runs, so the
+// wrapper's terminal status is the authority — it implies a zero exit — and the
+// error count is kept only so the caller can say the run was not clean.
+test('an error the harness recovered from does not refuse a successful run', () => {
+  const state = createWorkshopRunState();
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(state, { type: 'error', taskId: 'task-1', data: { message: 'probe returned 401' } });
+  observeWorkshopRunEvent(state, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
+  assert.equal(state.errors, 1);
+  assert.doesNotThrow(() => requireSuccessfulWorkshopRun(state));
+});
+
+test('a stream describing two different tasks is refused', () => {
+  const state = createWorkshopRunState();
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-2' });
+  observeWorkshopRunEvent(state, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
+  assert.throws(() => requireSuccessfulWorkshopRun(state), /more than one task/);
+});
+
+test('workshop accepts proposals only from a matching successful task', () => {
+  const success = createWorkshopRunState();
+  observeWorkshopRunEvent(success, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(success, { type: 'task.completed', taskId: 'task-1', data: { status: 'succeeded' } });
+  assert.doesNotThrow(() => requireSuccessfulWorkshopRun(success));
+
+  for (const status of ['failed', 'cancelled']) {
+    const state = createWorkshopRunState();
+    observeWorkshopRunEvent(state, { type: 'task.started', taskId: 'task-1' });
+    observeWorkshopRunEvent(state, { type: 'task.completed', taskId: 'task-1', data: { status } });
+    assert.throws(() => requireSuccessfulWorkshopRun(state), new RegExp(status));
+  }
+
+  const mismatched = createWorkshopRunState();
+  observeWorkshopRunEvent(mismatched, { type: 'task.started', taskId: 'task-1' });
+  observeWorkshopRunEvent(mismatched, { type: 'task.completed', taskId: 'task-2', data: { status: 'succeeded' } });
+  assert.throws(() => requireSuccessfulWorkshopRun(mismatched), /matching terminal event/);
+
+  // An error the harness recovered from is covered above: it no longer refuses a
+  // run the wrapper reported as succeeded, because that rejected good work.
+});
+
+// The prompt now tells a harness that credentials are not its business, because
+// Agent Dock stores keys itself and the operator attaches one afterwards. The
+// extraction must not depend on that instruction being followed.
+test('a harness that ignores the instruction and returns a key cannot smuggle it into the form', () => {
+  const { proposal, warnings } = extractMcpWorkshopProposal(`
+    <agent-dock-mcp-proposal>
+    {
+      "name": "leaky",
+      "transport": "http",
+      "url": "https://leaky.example.test/mcp",
+      "headers": { "Authorization": "Bearer sk-live-LEAKED" },
+      "environment": { "TOKEN": "sk-live-ALSO-LEAKED" },
+      "timeoutMs": 30000
+    }
+    </agent-dock-mcp-proposal>
+  `);
+
+  assert.deepEqual(proposal.headers, {});
+  assert.deepEqual(proposal.environment, {});
+  assert.doesNotMatch(JSON.stringify(proposal), /sk-live/);
+  // And it says so, rather than discarding quietly.
+  assert.ok(warnings.some((warning) => /header values were removed/i.test(warning)));
+  assert.ok(warnings.some((warning) => /environment values were removed/i.test(warning)));
+});
+
+// The instructions have to teach the syntax, or a harness will keep proposing
+// the mapping fields that no longer exist. Placeholders are also how it says a
+// secret is needed at all, so the two halves belong in one assertion.
+test('the prompt teaches the placeholder syntax and leaves the binding to the operator', () => {
+  const prompt = buildMcpWorkshopPrompt('the GitHub MCP server');
+  assert.ok(prompt.includes('${NAME}'), 'the syntax is not shown');
+  assert.ok(prompt.includes('${ACCESS_TOKEN}'), 'no worked example of a placeholder');
+  assert.match(prompt, /Do not decide what fills it/);
+  assert.match(prompt, /operator binds each placeholder/);
+  assert.match(prompt, /Never put a token, cookie, password or key value/);
+  assert.match(prompt, /argument, URL, header, environment value, or working directory/);
+  assert.match(prompt, /confirm that its executable is installed/i);
+  assert.match(prompt, /Do not propose docker unless/i);
+  assert.match(prompt, /do not emit proposal tags/i);
+  assert.match(prompt, /never invent an environment entry/i);
+  assert.match(prompt, /docker run -e NAME/i);
+  assert.match(prompt, /Do not invent a working directory/i);
+  assert.match(prompt, /the GitHub MCP server/);
+});
+
+test('a placeholder in a proposal survives extraction intact', () => {
+  const { proposal } = extractMcpWorkshopProposal(`
+    <agent-dock-mcp-proposal>
+    {
+      "name": "with-placeholder",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@example/mcp-server", "--token", "\${ACCESS_TOKEN}"],
+      "timeoutMs": 30000
+    }
+    </agent-dock-mcp-proposal>
+  `);
+  // The placeholder is the point: it reaches the form so the operator is asked
+  // what fills it. Mangling or dropping it would silently lose the question.
+  assert.deepEqual(proposal.args, ['-y', '@example/mcp-server', '--token', '${ACCESS_TOKEN}']);
+});

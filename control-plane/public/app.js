@@ -1,5 +1,13 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+import {
+  buildMcpWorkshopPrompt,
+  createWorkshopRunState,
+  extractMcpWorkshopProposal,
+  observeWorkshopRunEvent,
+  requireSuccessfulWorkshopRun
+} from './mcp-workshop.js';
+
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
 let currentUsageCapability = { quotaWindows: false, accountActivity: false, source: null };
@@ -20,7 +28,18 @@ let usageThrottled = false;
 const ui = {
   dashboardView: $('#dashboard-view'),
   jobsView: $('#jobs-view'),
-  credentialsView: $('#credentials-view'),
+  mcpView: $('#mcp-view'),
+  registryList: $('#registry-list'),
+  registryCount: $('#registry-count'),
+  registryMessage: $('#registry-message'),
+  newRegistryMcp: $('#new-registry-mcp'),
+  credentialListMessage: $('#credential-list-message'),
+  workshop: $('#workshop'),
+  workshopAgent: $('#workshop-agent'),
+  workshopObjective: $('#workshop-objective'),
+  workshopRun: $('#run-workshop'),
+  workshopStatus: $('#workshop-status'),
+  workshopLog: $('#workshop-log'),
   credentialList: $('#credential-list'),
   credentialStorage: $('#credential-storage'),
   credentialStorageNote: $('#credential-storage-note'),
@@ -32,14 +51,12 @@ const ui = {
   credentialDialogTitle: $('#credential-dialog-title'),
   credentialId: $('#credential-id'),
   credentialName: $('#credential-name'),
-  credentialHeader: $('#credential-header'),
   credentialHosts: $('#credential-hosts'),
   credentialValue: $('#credential-value'),
   credentialValueHint: $('#credential-value-hint'),
   credentialMessage: $('#credential-message'),
   cancelCredential: $('#cancel-credential'),
   closeCredentialDialog: $('#close-credential-dialog'),
-  mcpCredential: $('#mcp-credential'),
   agentView: $('#agent-view'),
   connectionDot: $('#connection-dot'),
   connectionLabel: $('#connection-label'),
@@ -121,11 +138,16 @@ const ui = {
   mcpHttpFields: $('#mcp-http-fields'),
   mcpStdioFields: $('#mcp-stdio-fields'),
   mcpUrl: $('#mcp-url'),
-  mcpBearerEnv: $('#mcp-bearer-env'),
   mcpCommand: $('#mcp-command'),
   mcpArgs: $('#mcp-args'),
-  mcpSecretTarget: $('#mcp-secret-target'),
-  mcpSecretSource: $('#mcp-secret-source'),
+  mcpAdvanced: $('#mcp-advanced'),
+  mcpHttpAdvanced: $('#mcp-http-advanced'),
+  mcpStdioAdvanced: $('#mcp-stdio-advanced'),
+  mcpHeaders: $('#mcp-headers'),
+  mcpCwd: $('#mcp-cwd'),
+  mcpEnvironment: $('#mcp-environment'),
+  mcpPlaceholders: $('#mcp-placeholders'),
+  mcpPlaceholderRows: $('#mcp-placeholder-rows'),
   mcpTimeout: $('#mcp-timeout'),
   mcpFormMessage: $('#mcp-form-message'),
   saveMcp: $('#save-mcp'),
@@ -295,7 +317,12 @@ async function api(path, options = {}) {
   const response = await authenticatedFetch(path, options);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
-  if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error ?? `HTTP ${response.status}`);
+    error.status = response.status;
+    error.details = data;
+    throw error;
+  }
   return data;
 }
 
@@ -1281,13 +1308,6 @@ function mcpEndpoint(server) {
   return [server.command, ...(server.args ?? [])].filter(Boolean).join(' ');
 }
 
-function mcpSecretReferences(server) {
-  return [
-    ...Object.values(server.secretEnvironment ?? {}).map((value) => value.sourceEnv),
-    ...Object.values(server.secretHeaders ?? {}).map((value) => value.sourceEnv)
-  ].filter(Boolean);
-}
-
 function renderMcpLibrary() {
   const bound = new Set(mcpBindings.map((binding) => binding.serverId));
   const available = mcpDefinitions.filter((server) => !bound.has(server.id));
@@ -1346,24 +1366,15 @@ function renderMcp(result, definitions) {
     const endpoint = document.createElement('code');
     endpoint.className = 'mcp-endpoint';
     endpoint.textContent = mcpEndpoint(server);
-    const refs = mcpSecretReferences(server);
     const meta = document.createElement('p');
     meta.className = 'mcp-meta';
     // A stored credential is not a connector-secret reference, and saying "no
     // credential references" on a connector that plainly has one reads as a bug
     // in the thing the operator just configured.
-    const credential = server.credentialId
-      ? storedCredentials.find((item) => item.id === server.credentialId)
-      : null;
-    if (refs.length) {
-      meta.textContent = `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
-    } else if (server.credentialId) {
-      meta.textContent = credential
-        ? `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`
-        : `Credential ${server.credentialId} · no longer stored`;
-    } else {
-      meta.textContent = `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
-    }
+    // One description of a connector's credential, shared with the MCP page.
+    // Two copies is how this line came to say "no longer stored" here while the
+    // other said "checking".
+    meta.textContent = registryMeta(server);
     const actions = document.createElement('div');
     actions.className = 'mcp-row-actions';
     const validate = document.createElement('button');
@@ -1406,7 +1417,10 @@ async function refreshMcp() {
       // renders rather than only when the dialog opens.
       api(`${API_ROOT}/credentials`).catch(() => null)
     ]);
-    if (credentials) storedCredentials = credentials.credentials;
+    if (credentials) {
+      storedCredentials = credentials.credentials;
+      credentialsLoaded = true;
+    }
     renderMcp(agentMcp, library.servers ?? []);
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
@@ -1417,12 +1431,239 @@ async function refreshMcp() {
   }
 }
 
+const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
+
+// What the operator has typed, read the same way the control plane and the worker
+// read a stored definition. A placeholder is only ever found in a field they can
+// actually edit here, so scanning those is scanning all of them.
+function placeholdersInForm() {
+  const sources = ui.mcpTransport.value === 'stdio'
+    ? [
+        [ui.mcpArgs.value, 'the arguments'],
+        [ui.mcpCwd.value, 'the working directory'],
+        [ui.mcpEnvironment.value, 'the environment']
+      ]
+    : [
+        [ui.mcpUrl.value, 'the URL'],
+        [ui.mcpHeaders.value, 'the headers']
+      ];
+  const found = new Map();
+  for (const [value, where] of sources) {
+    for (const match of String(value ?? '').matchAll(PLACEHOLDER)) {
+      if (!found.has(match[1])) found.set(match[1], where);
+    }
+  }
+  return found;
+}
+
+// Bindings survive retyping: the row for a name keeps its choice while the
+// operator edits around it, and a name that disappears from the definition takes
+// its binding with it.
+let placeholderBindings = new Map();
+
+function bindingLabel(binding) {
+  if (!binding) return null;
+  if (binding.source === 'credential') {
+    const credential = storedCredentials.find((item) => item.id === binding.credentialId);
+    if (!credential) return ['That stored key is no longer available.'];
+    if (!credential.complete) {
+      return [
+        'The key ',
+        { code: credential.name },
+        ' exists but has no value yet. Add its value under Stored keys below, or this connector cannot start.'
+      ];
+    }
+    // A host list is checked against this connector's url when the definition is
+    // saved. It is not egress control: nothing stops the agent sending the value
+    // somewhere else once it holds it, and a local process has no url to check
+    // at all. Saying "limited to" implied an enforcement that does not exist.
+    if (ui.mcpTransport.value === 'stdio') {
+      return [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. A local process has no URL, so its host list is not consulted here.'
+      ];
+    }
+    return credential.restricted
+      ? [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. This connector\'s URL is checked against ',
+        { code: credential.hosts.join(', ') },
+        ' when this configuration is applied — that stops the URL being changed to redirect the key, not the agent from using it elsewhere.'
+      ]
+      : [
+        'Uses the stored key ',
+        { code: credential.name },
+        '. It names no hosts, so nothing checks where this connector points.'
+      ];
+  }
+  return [
+    'Read from ',
+    { code: `${CONNECTOR_SECRET_PREFIX}${binding.name}` },
+    ' inside the agent\'s own container. The control plane never sees it.'
+  ];
+}
+
+function renderPlaceholderRows() {
+  const found = placeholdersInForm();
+  // Drop bindings for names no longer written anywhere.
+  for (const name of [...placeholderBindings.keys()]) {
+    if (!found.has(name)) placeholderBindings.delete(name);
+  }
+  ui.mcpPlaceholders.classList.toggle('hidden', found.size === 0);
+  ui.mcpPlaceholderRows.replaceChildren();
+  if (!found.size) return;
+
+  const knownSecrets = new Set();
+  for (const server of [...registryServers, ...mcpDefinitions]) {
+    for (const binding of Object.values(server.placeholders ?? {})) {
+      if (binding.source === 'connector-secret') knownSecrets.add(binding.name);
+    }
+  }
+
+  for (const [name, where] of found) {
+    const row = document.createElement('div');
+    row.className = 'placeholder-row';
+
+    const head = document.createElement('div');
+    head.className = 'placeholder-row-head';
+    const code = document.createElement('code');
+    code.textContent = name;
+    const from = document.createElement('span');
+    from.textContent = 'is filled from';
+    const choice = document.createElement('select');
+    choice.setAttribute('aria-label', `What fills ${name}`);
+    const where_ = document.createElement('span');
+    where_.className = 'placeholder-where';
+    where_.textContent = where === 'the environment'
+      ? 'passed to the connector as an environment variable'
+      : `used in ${where}`;
+
+    const options = [['', 'choose…']];
+    for (const credential of storedCredentials) {
+      options.push([`credential:${credential.id}`, `stored key · ${credential.name}`]);
+    }
+    for (const secret of [...knownSecrets].sort()) {
+      options.push([`secret:${secret}`, `container secret · ${secret}`]);
+    }
+    options.push(['__new', 'a new container secret…']);
+    const matching = storedCredentials.find((item) => item.name.toLowerCase() === name.toLowerCase());
+    if (!matching) options.push(['__create', `create a key called ${name}…`]);
+    for (const [value, label] of options) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      choice.append(option);
+    }
+
+    const custom = document.createElement('input');
+    custom.className = 'hidden';
+    custom.pattern = '[A-Za-z_][A-Za-z0-9_]*';
+    custom.placeholder = 'COMPANY_API_TOKEN';
+    custom.setAttribute('aria-label', `New container secret name for ${name}`);
+
+    const effect = document.createElement('p');
+    effect.className = 'field-effect unset';
+    effect.textContent = 'Nothing fills this yet, so the connector cannot be saved.';
+
+    const existing = placeholderBindings.get(name);
+    // A key whose name matches the placeholder is the obvious answer, so it is
+    // preselected. Still visible and still changeable — it is a prefill, not a
+    // decision made on the operator's behalf.
+    if (!existing && matching) {
+      placeholderBindings.set(name, { source: 'credential', credentialId: matching.id });
+    }
+    const binding = placeholderBindings.get(name);
+    if (binding?.source === 'credential') choice.value = `credential:${binding.credentialId}`;
+    else if (binding?.source === 'connector-secret') {
+      if (knownSecrets.has(binding.name)) choice.value = `secret:${binding.name}`;
+      else { choice.value = '__new'; custom.value = binding.name; custom.classList.remove('hidden'); }
+    }
+
+    const settle = async () => {
+      const value = choice.value;
+      if (value === '__create') {
+        try {
+          const created = await api(`${API_ROOT}/credentials`, {
+            method: 'POST',
+            body: JSON.stringify({ name })
+          });
+          storedCredentials = [...storedCredentials, created.credential];
+          placeholderBindings.set(name, { source: 'credential', credentialId: created.credential.id });
+          renderPlaceholderRows();
+          void loadCredentials();
+          return;
+        } catch (error) {
+          effect.classList.remove('unset');
+          effect.textContent = error.message;
+          return;
+        }
+      }
+      let binding = null;
+      if (value.startsWith('credential:')) binding = { source: 'credential', credentialId: value.slice('credential:'.length) };
+      else if (value.startsWith('secret:')) binding = { source: 'connector-secret', name: value.slice('secret:'.length) };
+      else if (value === '__new' && custom.value.trim()) binding = { source: 'connector-secret', name: custom.value.trim() };
+      custom.classList.toggle('hidden', value !== '__new');
+      if (binding) placeholderBindings.set(name, binding);
+      else placeholderBindings.delete(name);
+      const described = bindingLabel(binding);
+      effect.classList.toggle('unset', !described);
+      if (!described) {
+        effect.textContent = 'Nothing fills this yet, so the connector cannot be saved.';
+        return;
+      }
+      effect.replaceChildren();
+      for (const part of described) {
+        if (typeof part === 'string') effect.append(document.createTextNode(part));
+        else {
+          const fragment = document.createElement('code');
+          fragment.textContent = part.code;
+          effect.append(fragment);
+        }
+      }
+    };
+    choice.addEventListener('change', settle);
+    custom.addEventListener('input', settle);
+    settle();
+
+    head.append(code, from, choice, custom, where_);
+    row.append(head, effect);
+    ui.mcpPlaceholderRows.append(row);
+  }
+}
+
 function syncMcpTransportFields() {
   const http = ui.mcpTransport.value === 'http';
   ui.mcpHttpFields.classList.toggle('hidden', !http);
   ui.mcpStdioFields.classList.toggle('hidden', http);
+  ui.mcpHttpAdvanced.classList.toggle('hidden', !http);
+  ui.mcpStdioAdvanced.classList.toggle('hidden', http);
   ui.mcpUrl.required = http;
   ui.mcpCommand.required = !http;
+  renderPlaceholderRows();
+}
+
+// A direct NAME=${NAME} entry is the ordinary, safe way to inject a bound value
+// into a connector process. The binding row already explains it in operator
+// language, so opening the raw advanced editor for it makes a normal setup look
+// like two unrelated credential mechanisms. More complex environment templates
+// remain expanded for review.
+function onlyDirectPlaceholderEnvironment(environment = {}) {
+  const entries = Object.entries(environment);
+  return entries.length > 0
+    && entries.every(([name, value]) => value === `\${${name}}`);
+}
+
+function needsAdvancedConnectionReview(definition = {}) {
+  definition ??= {};
+  const environment = definition.environment ?? {};
+  return Boolean(
+    Object.keys(definition.headers ?? {}).length
+    || definition.cwd
+    || (Object.keys(environment).length && !onlyDirectPlaceholderEnvironment(environment))
+  );
 }
 
 function openMcpDialog(server = null) {
@@ -1434,42 +1675,65 @@ function openMcpDialog(server = null) {
   ui.mcpUrl.value = server?.url ?? '';
   ui.mcpCommand.value = server?.command ?? '';
   ui.mcpArgs.value = (server?.args ?? []).join('\n');
+  ui.mcpHeaders.value = formatSettings(server?.headers, ': ');
+  ui.mcpCwd.value = server?.cwd ?? '';
+  ui.mcpEnvironment.value = formatSettings(server?.environment, '=');
+  ui.mcpAdvanced.open = needsAdvancedConnectionReview(server);
   ui.mcpTimeout.value = String(Math.round((server?.timeoutMs ?? 30_000) / 1000));
-  const bearer = Object.entries(server?.secretHeaders ?? {}).find(([header, value]) => header.toLowerCase() === 'authorization' && value.prefix === 'Bearer ');
-  ui.mcpBearerEnv.value = bearer?.[1]?.sourceEnv ?? '';
-  syncCredentialOptions(server?.credentialId ?? '');
-  const environment = Object.entries(server?.secretEnvironment ?? {})[0];
-  ui.mcpSecretTarget.value = environment?.[0] ?? '';
-  ui.mcpSecretSource.value = environment?.[1]?.sourceEnv ?? '';
+  // Bindings come from the definition, and the rows are drawn from whatever
+  // placeholders the definition actually contains.
+  placeholderBindings = new Map(Object.entries(server?.placeholders ?? {}));
+  renderPlaceholderRows();
   ui.mcpFormMessage.textContent = '';
   ui.mcpFormMessage.classList.add('hidden');
-  ui.deleteMcpDefinition.classList.toggle('hidden', !server);
-  ui.saveMcp.textContent = server ? 'Save and apply' : 'Save and attach';
+  ui.deleteMcpDefinition.classList.toggle('hidden', !server || !currentAgent);
+  ui.saveMcp.textContent = currentAgent ? (server ? 'Save and apply' : 'Save and attach') : 'Save connector';
   syncMcpTransportFields();
+  void prepareWorkshop(server);
   ui.mcpDialog.showModal();
+}
+
+function formatSettings(value, separator) {
+  return Object.entries(value ?? {}).map(([name, setting]) => `${name}${separator}${setting}`).join('\n');
+}
+
+function parseSettings(value, separator, label) {
+  const result = {};
+  for (const [index, raw] of String(value ?? '').split('\n').entries()) {
+    const line = raw.trim();
+    if (!line) continue;
+    const at = line.indexOf(separator);
+    if (at <= 0) throw new Error(`${label} line ${index + 1} must use ${separator === ':' ? 'Name: value' : 'NAME=value'}.`);
+    const name = line.slice(0, at).trim();
+    const setting = line.slice(at + separator.length).trim();
+    if (!name || !setting) throw new Error(`${label} line ${index + 1} must have both a name and a value.`);
+    if (Object.hasOwn(result, name)) throw new Error(`${label} contains ${name} more than once.`);
+    result[name] = setting;
+  }
+  return result;
 }
 
 function mcpFormPayload() {
   const transport = ui.mcpTransport.value;
-  const sourceEnv = ui.mcpSecretSource.value.trim();
-  const targetEnv = ui.mcpSecretTarget.value.trim();
-  if ((sourceEnv && !targetEnv) || (!sourceEnv && targetEnv)) throw new Error('Both stdio secret variable fields are required when either is set.');
-  const bearer = ui.mcpBearerEnv.value.trim();
-  const credentialId = ui.mcpCredential.value || null;
-  // The server refuses both, so say so here rather than letting it 400.
-  if (credentialId && bearer) throw new Error('Choose a stored credential or a legacy secret reference, not both.');
+  renderPlaceholderRows();
+  const found = placeholdersInForm();
+  const unbound = [...found.keys()].filter((name) => !placeholderBindings.has(name));
+  // The control plane refuses this too; saying it here names which one.
+  if (unbound.length) {
+    throw new Error(`Choose what fills ${unbound.join(', ')} before saving.`);
+  }
+  const placeholders = {};
+  for (const [name, binding] of placeholderBindings) placeholders[name] = binding;
   return {
     name: ui.mcpName.value.trim(),
     transport,
     command: transport === 'stdio' ? ui.mcpCommand.value.trim() : null,
     args: transport === 'stdio' ? ui.mcpArgs.value.split('\n').map((value) => value.trim()).filter(Boolean) : [],
-    cwd: null,
+    cwd: transport === 'stdio' ? ui.mcpCwd.value.trim() || null : null,
     url: transport === 'http' ? ui.mcpUrl.value.trim() : null,
-    environment: {},
-    secretEnvironment: transport === 'stdio' && sourceEnv ? { [targetEnv]: { sourceEnv } } : {},
-    headers: {},
-    secretHeaders: transport === 'http' && bearer ? { Authorization: { sourceEnv: bearer, prefix: 'Bearer ' } } : {},
-    credentialId: transport === 'http' ? credentialId : null,
+    environment: transport === 'stdio' ? parseSettings(ui.mcpEnvironment.value, '=', 'Environment') : {},
+    headers: transport === 'http' ? parseSettings(ui.mcpHeaders.value, ':', 'Headers') : {},
+    placeholders,
     timeoutMs: Number(ui.mcpTimeout.value) * 1000
   };
 }
@@ -1486,18 +1750,335 @@ async function applyMcp() {
   }
 }
 
+// The workshop lives inside the connector dialog. A successful run fills in the
+// form you were already looking at; a failed one leaves the exchange visible so
+// you can correct it and ask again. Every ask after the first continues the same
+// conversation, so "no, it uses a different endpoint" is a correction rather
+// than a fresh start.
+let workshopConversationId = null;
+let workshopConversationAgentId = null;
+let workshopRunning = false;
+// Bumped every time the dialog is prepared. A stream carrying an older token is
+// a run the operator has walked away from: it stops reading and writes nothing.
+let workshopRunToken = 0;
+let workshopAbort = null;
+let workshopTurns = 0;
+let workshopContinuity = true;
+
+const WORKSHOP_LOG_LIMIT = 60;
+
+// Every line says who produced it. The operator's own words were being styled
+// with the class named for the model and rendered brighter than the model's
+// output, which makes a transcript impossible to read honestly.
+function workshopNote(speaker, text, kind, token) {
+  // The token is required, not defaulted. Defaulting it to the current token
+  // made this comparison always false, which is the whole point of the check.
+  if (!text || token !== workshopRunToken) return;
+  const line = document.createElement('p');
+  line.className = [kind, speaker === 'you' ? 'from-operator' : 'from-harness'].filter(Boolean).join(' ');
+  const who = document.createElement('span');
+  who.className = 'speaker';
+  who.textContent = speaker === 'you' ? 'you' : 'harness';
+  line.append(who, document.createTextNode(text));
+  ui.workshopLog.classList.remove('hidden');
+  ui.workshopLog.append(line);
+  // A runaway harness should not be able to grow the operator's tab until it dies.
+  while (ui.workshopLog.childElementCount > WORKSHOP_LOG_LIMIT) ui.workshopLog.firstElementChild.remove();
+  ui.workshopLog.scrollTop = ui.workshopLog.scrollHeight;
+}
+
+async function prepareWorkshop(server) {
+  // Bump first, then capture, so the token this call owns is a fact rather than
+  // a prediction about a later line.
+  workshopRunToken += 1;
+  const token = workshopRunToken;
+  workshopAbort?.abort();
+  workshopAbort = null;
+  workshopConversationId = null;
+  workshopConversationAgentId = null;
+  workshopTurns = 0;
+  workshopContinuity = true;
+  workshopRunning = false;
+  ui.workshopLog.replaceChildren();
+  ui.workshopLog.classList.add('hidden');
+  ui.workshopStatus.textContent = '';
+  ui.workshopObjective.value = '';
+  // A run that threw outside the try used to leave this disabled for the life of
+  // the page, so the button silently did nothing ever again.
+  ui.workshopRun.disabled = false;
+  // Only offered when defining something new — editing a known shape is a
+  // deliberate act, not a question — and hidden until the harness list is known,
+  // because it used to appear at once with "No agents available" as its only
+  // option and then either fill in or vanish.
+  ui.workshop.classList.add('hidden');
+  if (server) return;
+  try {
+    const { agents } = await api(`${API_ROOT}/agents`);
+    // The dialog may have been closed and reopened for something else while
+    // this was in flight.
+    if (token !== workshopRunToken) return;
+    const usable = (agents ?? []).filter((agent) => agent.runtime);
+    ui.workshopAgent.replaceChildren();
+    if (!usable.length) {
+      ui.workshop.classList.add('hidden');
+      return;
+    }
+    for (const agent of usable) {
+      const option = document.createElement('option');
+      option.value = agent.id;
+      option.textContent = agent.name ?? agent.id;
+      ui.workshopAgent.append(option);
+    }
+    // Only when that agent is in the list; otherwise this blanks the picker.
+    if (currentAgent && usable.some((agent) => agent.id === currentAgent.id)) {
+      ui.workshopAgent.value = currentAgent.id;
+    }
+    ui.workshop.classList.remove('hidden');
+  } catch {
+    // The dialog still works as a plain form.
+    ui.workshop.classList.add('hidden');
+  }
+}
+
+function applyProposalToForm(proposal) {
+  ui.mcpName.value = proposal.name ?? '';
+  ui.mcpTransport.value = proposal.transport;
+  syncMcpTransportFields();
+  ui.mcpUrl.value = proposal.url ?? '';
+  ui.mcpCommand.value = proposal.command ?? '';
+  ui.mcpArgs.value = (proposal.args ?? []).join('\n');
+  ui.mcpHeaders.value = formatSettings(proposal.headers, ': ');
+  ui.mcpCwd.value = proposal.cwd ?? '';
+  ui.mcpEnvironment.value = formatSettings(proposal.environment, '=');
+  ui.mcpAdvanced.open = needsAdvancedConnectionReview(proposal);
+  ui.mcpTimeout.value = String(Math.round((proposal.timeoutMs ?? 30_000) / 1000));
+  // A proposal describes the shape; what fills a placeholder is the operator's
+  // to choose, so the rows appear unbound and the connector cannot be saved
+  // until they are answered.
+  placeholderBindings = new Map();
+  renderPlaceholderRows();
+}
+
+async function runWorkshop() {
+  if (workshopRunning) return;
+  const agentId = ui.workshopAgent.value;
+  const objective = ui.workshopObjective.value.trim();
+  if (!agentId || !objective) {
+    ui.workshopStatus.textContent = 'Choose a harness and describe the connector.';
+    return;
+  }
+  workshopRunning = true;
+  ui.workshopRun.disabled = true;
+  ui.workshopStatus.textContent = 'Asking…';
+
+  const token = workshopRunToken;
+  const mine = () => token === workshopRunToken;
+  workshopNote('you', objective, '', token);
+  workshopAbort?.abort();
+  const abort = new AbortController();
+  workshopAbort = abort;
+
+  try {
+    // Continuity has to start at the first ask, or a correction reaches a harness
+    // that never saw the objective. The conversation is keyed to the agent that
+    // answered, because switching harnesses mid-exchange would send a bare
+    // correction to one with no context.
+    const sameAgent = workshopConversationAgentId === agentId;
+    if (!sameAgent) {
+      workshopConversationId = `workshop-${workshopId()}`;
+      workshopConversationAgentId = agentId;
+      workshopContinuity = true;
+      // Without this the new harness inherits the old one's turn count and the
+      // next ask is sent as a correction into a conversation it never saw.
+      workshopTurns = 0;
+    }
+    const continuing = sameAgent && workshopTurns > 0 && workshopContinuity;
+    const prompt = continuing ? objective : buildMcpWorkshopPrompt(objective);
+
+    let response = await workshopDispatch(agentId, prompt, workshopContinuity ? workshopConversationId : null, abort);
+    // An un-refreshed runtime cannot continue a conversation and says so with a
+    // 409. Losing follow-up corrections is worth far more than losing the
+    // feature, so ask again without one and tell the operator what they lost.
+    if ((response.status === 409 || response.status === 502) && workshopContinuity) {
+      const failure = await response.clone().json().catch(() => ({}));
+      if (!mine()) return;
+      if (/continue a conversation/i.test(failure.error ?? '')) {
+        workshopContinuity = false;
+        workshopNote('harness', 'This runtime cannot carry a conversation, so each ask starts fresh. Refresh it onto the current image to correct by conversation.', 'warn', token);
+        response = await workshopDispatch(agentId, buildMcpWorkshopPrompt(objective), null, abort);
+      }
+    }
+    if (!response.ok || !response.body) {
+      const failure = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(failure.error ?? `HTTP ${response.status}`);
+    }
+
+    const runState = createWorkshopRunState();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let output = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (!mine()) return;
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        observeWorkshopRunEvent(runState, event);
+        if (event.type === 'message.completed' && event.data?.text) {
+          output += `${event.data.text}\n`;
+          workshopNote('harness', event.data.text, '', token);
+        }
+        if (event.type === 'activity.started' && event.data?.name) {
+          ui.workshopStatus.textContent = `Working — ${event.data.name}`;
+        }
+        // Advisory while the run continues: a harness probing an endpoint reports
+        // a 401 or a 404 as an error and then carries on. Only the outcome decides
+        // whether this run failed.
+        if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'warn', token);
+      }
+      if (done) {
+        if (!buffer.trim()) break;
+        try {
+          const event = JSON.parse(buffer);
+          observeWorkshopRunEvent(runState, event);
+          if (event.type === 'message.completed' && event.data?.text) {
+            output += `${event.data.text}\n`;
+            workshopNote('harness', event.data.text, '', token);
+          }
+          if (event.type === 'error' && event.data?.message) {
+            workshopNote('harness', event.data.message, 'warn', token);
+          }
+        } catch { /* a partial final line is not an event */ }
+        break;
+      }
+    }
+
+    // Only a run that started, ended on its own task, and reported success may
+    // put anything in the form. Without this a harness could emit a proposal and
+    // then fail, and the operator would be shown a filled form and told to review
+    // it as though the run had worked.
+    if (!mine()) return;
+    requireSuccessfulWorkshopRun(runState);
+    const { proposal, warnings } = extractMcpWorkshopProposal(output);
+    applyProposalToForm(proposal);
+    for (const warning of warnings) workshopNote('harness', warning, 'warn', token);
+
+    workshopTurns += 1;
+
+    // A proposal is model-generated, so ask the harness's own adapter whether the
+    // shape is valid for it rather than implying the operator is reviewing
+    // something checked. This proves payload and adapter policy compatibility —
+    // not that the connector works, and not that its credentials are right.
+    //
+    // But a proposal that needs a secret arrives with its placeholders unbound,
+    // on purpose, and the control plane refuses to normalize a definition with an
+    // unbound placeholder. Validating now would therefore fail every time and
+    // report it as though the shape were wrong, which is what a live harness
+    // proposing ${GITHUB_TOKEN} actually produced.
+    const pending = [...placeholdersInForm().keys()].filter((name) => !placeholderBindings.has(name));
+    if (pending.length) {
+      if (mine()) {
+        ui.workshopStatus.textContent = `Filled in below. Choose what fills ${pending.join(', ')}; the shape is checked when you save.`;
+      }
+      return;
+    }
+    ui.workshopStatus.textContent = 'Checking the proposal against this harness…';
+    const checked = await checkProposal(agentId, proposal, token, abort.signal);
+    if (mine()) ui.workshopStatus.textContent = checked;
+  } catch (error) {
+    if (!mine() || error.name === 'AbortError') return;
+    // Not fatal: the exchange stays open so the next ask is a correction.
+    workshopNote('harness', error.message, 'failed', token);
+    ui.workshopStatus.textContent = 'Nothing was filled in. Tell it what was wrong and ask again.';
+  } finally {
+    if (mine()) {
+      workshopRunning = false;
+      ui.workshopRun.disabled = false;
+      ui.workshopObjective.value = '';
+      workshopAbort = null;
+    }
+  }
+}
+
+// crypto.randomUUID is secure-context only, and this page is reachable over plain
+// http on a LAN address. Falling back keeps the feature working there instead of
+// throwing inside the click handler.
+function workshopId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  (globalThis.crypto?.getRandomValues ?? ((array) => array.forEach((_, index) => { array[index] = Math.floor(Math.random() * 256); })))(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function workshopDispatch(agentId, prompt, conversationId, abort) {
+  const body = conversationId ? { prompt, conversationId } : { prompt };
+  return fetch(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/tasks`, {
+    method: 'POST',
+    // Same headers api() would send. This reads the stream itself rather than
+    // going through api(), which must not mean losing the CSRF header: without
+    // it an OIDC session refuses the request outright.
+    headers: { 'content-type': 'application/json', 'x-agent-dock-csrf': '1' },
+    body: JSON.stringify(body),
+    signal: abort.signal
+  });
+}
+
+async function checkProposal(agentId, proposal, token, signal) {
+  try {
+    const result = await api(`${API_ROOT}/agents/${encodeURIComponent(agentId)}/mcp/validate`, {
+      method: 'POST',
+      body: JSON.stringify({ server: proposal }),
+      signal
+    });
+    const warnings = result.mcp?.validation?.warnings ?? [];
+    for (const warning of warnings) workshopNote('harness', warning.message ?? String(warning), 'warn', token);
+    return `Filled in below. Valid for this harness${warnings.length ? ` with ${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
+  } catch (error) {
+    workshopNote('harness', error.message, 'warn', token);
+    // Only a 400 is the adapter judging the shape. A duplicate name, an unknown
+    // agent, or an unreachable worker are the control plane's own answers and
+    // never reach the harness at all, so they must not be reported as its verdict.
+    return error.status === 400
+      ? 'Filled in below, but this harness rejected the shape. Review and correct before saving.'
+      : 'Filled in below. The compatibility check could not be completed, so nothing about the shape was confirmed.';
+  }
+}
+
 async function saveMcpDefinition(event) {
   event.preventDefault();
   ui.saveMcp.disabled = true;
   ui.mcpFormMessage.classList.add('hidden');
   try {
     const payload = mcpFormPayload();
+    // A registry-level workshop still names a real harness. Once the operator
+    // has filled its placeholders, make that harness enforce its command policy
+    // before persisting the model-generated proposal. Hand-written reusable
+    // definitions remain vendor-neutral and can be validated when attached.
+    if (!currentAgent && workshopConversationAgentId) {
+      await api(`${API_ROOT}/agents/${encodeURIComponent(workshopConversationAgentId)}/mcp/validate`, {
+        method: 'POST',
+        body: JSON.stringify({ server: payload })
+      });
+    }
     const id = ui.mcpDefinitionId.value;
     const result = await api(id ? `${API_ROOT}/mcp/servers/${encodeURIComponent(id)}` : `${API_ROOT}/mcp/servers`, {
       method: id ? 'PATCH' : 'POST',
       body: JSON.stringify(payload)
     });
     const server = result.server;
+    // The same dialog serves two places. On an agent it also attaches and
+    // applies, because that is what the operator came to do; on the MCP page
+    // there is no agent to attach to, so it only defines the connector.
+    if (!currentAgent) {
+      ui.mcpDialog.close();
+      await loadRegistry();
+      return;
+    }
     if (!id) {
       await api(agentApi('mcp/bindings'), {
         method: 'POST',
@@ -1532,8 +2113,9 @@ async function validateMcp(serverId) {
   ui.mcpMessage.textContent = 'Validating against this worker harness and command policy…';
   try {
     const result = await api(agentApi('mcp/validate'), { method: 'POST', body: JSON.stringify({ serverId }) });
-    const warnings = result.mcp?.validation?.warnings?.length ?? 0;
-    ui.mcpMessage.textContent = `Valid for ${adapterLabel(currentAgent.adapter)}${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}.`;
+    const warnings = result.mcp?.validation?.warnings ?? [];
+    const detail = warnings.map((warning) => warning.message ?? String(warning)).join(' · ');
+    ui.mcpMessage.textContent = `Valid for ${adapterLabel(currentAgent.adapter)}${detail ? `. Warning: ${detail}` : '.'}`;
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
   }
@@ -1558,7 +2140,7 @@ async function deleteMcpDefinition() {
   if (!server || !window.confirm(`Delete the reusable MCP definition ${server.name}? It must not be attached to another agent.`)) return;
   try {
     const attachedHere = mcpBindings.some((binding) => binding.serverId === serverId);
-    if (attachedHere) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
+    if (attachedHere && currentAgent) await api(agentApi(`mcp/bindings/${encodeURIComponent(serverId)}`), { method: 'DELETE' });
     await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
     ui.mcpDialog.close();
     ui.mcpMessage.textContent = `${server.name} deleted.`;
@@ -2629,6 +3211,16 @@ $('#attach-mcp').addEventListener('click', attachExistingMcp);
 $('#apply-mcp').addEventListener('click', applyMcp);
 $('#close-mcp-dialog').addEventListener('click', () => ui.mcpDialog.close());
 $('#cancel-mcp').addEventListener('click', () => ui.mcpDialog.close());
+// Closing the dialog abandons any run it started, however it was closed —
+// button, Escape, or form submit. Otherwise the stream keeps going and writes
+// into whatever the dialog is showing next.
+ui.mcpDialog.addEventListener('close', () => {
+  workshopRunToken += 1;
+  workshopAbort?.abort();
+  workshopAbort = null;
+  workshopRunning = false;
+  ui.workshopRun.disabled = false;
+});
 ui.deleteMcpDefinition.addEventListener('click', deleteMcpDefinition);
 ui.attachmentRoot.addEventListener('change', () => {
   folderBrowserPath = '.';
@@ -2682,6 +3274,8 @@ ui.testAgentButton.addEventListener('click', () => {
 window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 
 let storedCredentials = [];
+let registryServers = [];
+let credentialsLoaded = false;
 
 function credentialRow(credential) {
   const row = document.createElement('article');
@@ -2696,14 +3290,22 @@ function credentialRow(credential) {
       <button class="text-button danger-text credential-delete" type="button">Delete</button>
     </div>`;
   row.querySelector('strong').textContent = credential.name;
-  row.querySelector('small').textContent = `${credential.type} · header ${credential.header}`;
-  row.querySelector('.credential-hint').textContent = credential.hint ?? '…';
-  // The hosts are the point of the record, so they are on the row rather than
-  // hidden behind an edit dialog.
+  row.querySelector('small').textContent = credential.type;
+  // A key created by writing a placeholder has no value yet. Saying so on the
+  // row is the whole point of letting it exist in that state.
+  const hint = row.querySelector('.credential-hint');
+  if (credential.complete) {
+    hint.textContent = credential.hint ?? '…';
+  } else {
+    row.classList.add('incomplete');
+    hint.className = 'credential-needs-value';
+    hint.textContent = 'needs a value';
+  }
   const hosts = credential.hosts ?? [];
   const hostList = row.querySelector('.credential-hosts');
-  hostList.textContent = hosts.join(', ');
-  hostList.title = hosts.join('\n');
+  // An empty list is not a blank cell: it means this key is not limited.
+  hostList.textContent = hosts.length ? hosts.join(', ') : 'any host';
+  hostList.title = hosts.length ? hosts.join('\n') : 'This key is not limited to any host.';
   row.querySelector('.credential-edit').addEventListener('click', () => openCredentialDialog(credential));
   row.querySelector('.credential-delete').addEventListener('click', () => deleteCredential(credential));
   return row;
@@ -2734,21 +3336,121 @@ function renderCredentialStorage(storage = {}) {
   ui.credentialStorageNote.classList.remove('hidden');
 }
 
-async function loadCredentials() {
-  ui.credentialsView.classList.remove('hidden');
+// Connectors and the keys they authenticate with are one page, because a stored
+// key exists only to be used by a connector.
+async function loadMcpPage() {
+  ui.mcpView.classList.remove('hidden');
   ui.dashboardView.classList.add('hidden');
   ui.agentView.classList.add('hidden');
   ui.jobsView.classList.add('hidden');
-  document.title = 'Credentials — Agent Dock';
+  document.title = 'MCP — Agent Dock';
+  await Promise.all([loadRegistry(), loadCredentials()]);
+}
+
+async function loadRegistry() {
+  try {
+    const { servers } = await api(`${API_ROOT}/mcp/servers`);
+    registryServers = servers ?? [];
+    ui.registryMessage.textContent = '';
+    renderRegistry();
+    ui.registryCount.textContent = `${registryServers.length} defined`;
+    setConnection('online', 'Control plane online');
+  } catch (error) {
+    ui.registryMessage.textContent = error.message;
+    ui.registryList.innerHTML = '<p class="usage-error">Could not load connectors.</p>';
+    setConnection('offline', error.message);
+  }
+}
+
+function renderRegistry() {
+  ui.registryList.replaceChildren();
+  if (!registryServers.length) {
+    ui.registryList.innerHTML = '<p class="empty">No connectors yet. Add one, then attach it from an agent.</p>';
+    return;
+  }
+  for (const server of registryServers) {
+    const row = document.createElement('article');
+    row.className = 'mcp-row';
+    row.dataset.serverId = server.id;
+
+    const heading = document.createElement('div');
+    heading.className = 'mcp-row-heading';
+    const identity = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = server.name;
+    const kind = document.createElement('small');
+    kind.textContent = server.transport === 'http' ? 'remote HTTP' : 'local stdio process';
+    identity.append(name, kind);
+    heading.append(identity);
+
+    const endpoint = document.createElement('code');
+    endpoint.className = 'mcp-endpoint';
+    endpoint.textContent = mcpEndpoint(server);
+
+    const meta = document.createElement('p');
+    meta.className = 'mcp-meta';
+    meta.textContent = registryMeta(server);
+
+    const actions = document.createElement('div');
+    actions.className = 'mcp-row-actions';
+    const edit = document.createElement('button');
+    edit.className = 'text-button';
+    edit.type = 'button';
+    edit.textContent = 'Edit';
+    edit.addEventListener('click', () => openMcpDialog(server));
+    const remove = document.createElement('button');
+    remove.className = 'text-button danger';
+    remove.type = 'button';
+    remove.textContent = 'Delete';
+    remove.addEventListener('click', () => deleteRegistryServer(server));
+    actions.append(edit, remove);
+
+    row.append(heading, endpoint, meta, actions);
+    ui.registryList.append(row);
+  }
+}
+
+function registryMeta(server) {
+  const bound = Object.entries(server.placeholders ?? {});
+  if (bound.length) {
+    return bound.map(([name, binding]) => {
+      if (binding.source === 'credential') {
+        const credential = storedCredentials.find((item) => item.id === binding.credentialId);
+        if (credential) return `${name} ← stored key ${credential.name}`;
+        return credentialsLoaded ? `${name} ← a key that is no longer stored` : `${name} ← checking`;
+      }
+      return `${name} ← ${CONNECTOR_SECRET_PREFIX}${binding.name} in the container`;
+    }).join(' · ');
+  }
+  return `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
+}
+
+async function deleteRegistryServer(server) {
+  if (!window.confirm(`Delete ${server.name}? It must be detached from every agent first.`)) return;
+  try {
+    await api(`${API_ROOT}/mcp/servers/${encodeURIComponent(server.id)}`, { method: 'DELETE' });
+    ui.registryMessage.textContent = '';
+    await loadRegistry();
+  } catch (error) {
+    // Beside the list being acted on, not in the topbar status.
+    ui.registryMessage.textContent = error.message;
+  }
+}
+
+async function loadCredentials() {
   try {
     const result = await api(`${API_ROOT}/credentials`);
     storedCredentials = result.credentials ?? [];
+    credentialsLoaded = true;
+    ui.credentialListMessage.textContent = '';
     renderCredentialStorage(result.storage ?? {});
     renderCredentials();
     ui.credentialsRefreshed.textContent = `${storedCredentials.length} stored`;
-    setConnection('online', 'Credential store online');
+    // A connector row names the key it uses, so it has to re-render once the
+    // keys are known.
+    if (registryServers.length) renderRegistry();
   } catch (error) {
-    setConnection('offline', error.message);
+    ui.credentialListMessage.textContent = error.message;
     ui.credentialList.innerHTML = '<p class="usage-error">Could not load credentials.</p>';
   }
 }
@@ -2759,14 +3461,16 @@ function openCredentialDialog(credential = null) {
   ui.credentialId.value = credential?.id ?? '';
   ui.credentialDialogTitle.textContent = credential ? `Edit ${credential.name}` : 'New credential';
   ui.credentialName.value = credential?.name ?? '';
-  ui.credentialHeader.value = credential?.header ?? 'X-Api-Key';
   ui.credentialHosts.value = (credential?.hosts ?? []).join('\n');
   // Editing cannot show the value, so the field means "replace it" rather than
   // "here is what it is".
-  ui.credentialValue.required = !credential;
-  ui.credentialValueHint.textContent = credential
-    ? `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`
-    : 'pasted once, never shown again';
+  const incomplete = credential && !credential.complete;
+  ui.credentialValue.required = !credential || incomplete;
+  ui.credentialValueHint.textContent = !credential
+    ? 'pasted once, never shown again'
+    : incomplete
+      ? 'this key has no value yet — paste it to finish setting it up'
+      : `currently ${credential.hint} — leave blank to keep it, required if you change the hosts`;
   ui.credentialDialog.showModal();
 }
 
@@ -2777,7 +3481,6 @@ async function saveCredential(event) {
   const body = {
     name: ui.credentialName.value.trim(),
     type: 'api-key',
-    header: ui.credentialHeader.value.trim(),
     hosts
   };
   if (ui.credentialValue.value) body.value = ui.credentialValue.value;
@@ -2787,6 +3490,7 @@ async function saveCredential(event) {
     ui.credentialDialog.close();
     ui.credentialValue.value = '';
     await loadCredentials();
+    if (registryServers.length) renderRegistry();
   } catch (error) {
     ui.credentialMessage.textContent = error.message;
     ui.credentialMessage.classList.remove('hidden');
@@ -2797,35 +3501,22 @@ async function deleteCredential(credential) {
   if (!window.confirm(`Delete ${credential.name}? Any connector still using it must be changed first.`)) return;
   try {
     await api(`${API_ROOT}/credentials/${encodeURIComponent(credential.id)}?confirmation=${encodeURIComponent(credential.name)}`, { method: 'DELETE' });
+    ui.credentialListMessage.textContent = '';
     await loadCredentials();
   } catch (error) {
-    setConnection('offline', error.message);
+    // Next to the credential being deleted. This used to overwrite the topbar
+    // connection status, which reads as the control plane having gone offline.
+    ui.credentialListMessage.textContent = error.message;
   }
 }
 
-// The connector dialog offers stored credentials rather than asking for a
-// variable name, so the legacy field is only for definitions that already use it.
-async function syncCredentialOptions(selectedId = '') {
-  try {
-    const { credentials } = await api(`${API_ROOT}/credentials`);
-    storedCredentials = credentials;
-    ui.mcpCredential.replaceChildren();
-    const none = document.createElement('option');
-    none.value = '';
-    none.textContent = credentials.length ? 'None' : 'None stored yet';
-    ui.mcpCredential.append(none);
-    for (const credential of credentials) {
-      const option = document.createElement('option');
-      option.value = credential.id;
-      option.textContent = `${credential.name} · ${credential.header} · ${credential.hosts.join(', ')}`;
-      ui.mcpCredential.append(option);
-    }
-    ui.mcpCredential.value = selectedId ?? '';
-  } catch {
-    // A connector can still be defined without one.
-  }
-}
-
+ui.mcpArgs.addEventListener('input', renderPlaceholderRows);
+ui.mcpUrl.addEventListener('input', renderPlaceholderRows);
+ui.mcpHeaders.addEventListener('input', renderPlaceholderRows);
+ui.mcpCwd.addEventListener('input', renderPlaceholderRows);
+ui.mcpEnvironment.addEventListener('input', renderPlaceholderRows);
+ui.workshopRun?.addEventListener('click', runWorkshop);
+ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());
 ui.newCredential.addEventListener('click', () => openCredentialDialog());
 ui.credentialForm.addEventListener('submit', saveCredential);
 ui.cancelCredential.addEventListener('click', () => ui.credentialDialog.close());
@@ -2833,9 +3524,13 @@ ui.closeCredentialDialog.addEventListener('click', () => ui.credentialDialog.clo
 
 const agentRoute = window.location.pathname.match(/^\/agents\/([^/]+)\/?$/);
 const jobsRoute = /^\/(?:jobs|schedules)\/?$/.test(window.location.pathname);
-const credentialsRoute = /^\/credentials\/?$/.test(window.location.pathname);
+// Served at /connectors, not /mcp: the control plane's own MCP protocol endpoint
+// owns /mcp and answers a browser GET with 503. /credentials stays an alias so
+// existing links and bookmarks resolve, since credentials are now a section here
+// rather than a page of their own.
+const mcpRoute = /^\/(?:connectors|credentials)\/?$/.test(window.location.pathname);
 void loadPlatformSession();
 if (agentRoute) loadAgent(decodeURIComponent(agentRoute[1]));
 else if (jobsRoute) loadJobs();
-else if (credentialsRoute) loadCredentials();
+else if (mcpRoute) loadMcpPage();
 else loadDashboard();

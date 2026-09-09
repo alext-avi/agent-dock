@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   applyCodexMcpServers,
   codexMcpCapabilities,
+  codexMcpTaskEnvironment,
   validateCodexMcpServers
 } from '../adapters/codex-mcp.mjs';
 import {
@@ -64,32 +65,94 @@ export function connectorSecrets(environment = {}) {
 // Silent about the reason on purpose: an unprovisioned name and an illegitimate
 // one are both simply absent from the map.
 export function unresolvedSecretReferences(servers, environment = {}) {
-  const names = (server) => [
-    ...Object.values(server?.secretEnvironment ?? {}),
-    ...Object.values(server?.secretHeaders ?? {})
-  ].map((reference) => (typeof reference === 'string' ? reference : reference?.sourceEnv));
+  const names = (server) => Object.values(server?.placeholders ?? {})
+    .filter((binding) => binding?.source === 'connector-secret')
+    .map((binding) => binding.name);
 
   return (servers ?? []).flatMap((server) => names(server)
     .filter((name) => name && environment[name] === undefined)
     .map((name) => ({ server: server.name ?? server.id, name })));
 }
 
-// Credentials delivered by the control plane for this apply, keyed by id. They
-// are held for the life of the process and never written to the state file: the
-// control plane is the record, and a restart re-delivers on the next apply.
-function applyDeliveredCredentials(resolved, server, delivered) {
-  if (!server.credentialId) return;
-  const credential = delivered?.[server.credentialId];
-  if (!credential) {
-    throw Object.assign(
-      new Error(
-        `Credential ${server.credentialId} was not delivered with this configuration. `
-        + 'Delivered credentials are held in memory, so a worker restart needs a fresh apply.'
-      ),
-      { status: 409, code: 'missing_credential' }
-    );
+// Placeholders: one mechanism instead of three.
+//
+// A definition is written the way the connector actually looks, with ${NAME}
+// wherever a secret belongs — an argument, a url, a header, an environment
+// value. The presence of a placeholder is what declares that a binding is
+// needed; there is no separate question about whether the connector has
+// authentication, and nothing to ask when it has none.
+//
+// Substitution happens here, at the last possible moment, and the value is never
+// written back into the stored definition. A value substituted into argv is
+// readable by other processes in that same container, which is the same trust
+// boundary as its environment — the agent can already read its own secrets — but
+// it is a real difference from the environment on any host that shares a process
+// table, so it is documented rather than glossed.
+export const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+// Must match the control plane's deliveryKey. The two cannot share a module
+// without putting worker code above the wrapper, so test/placeholders.test.mjs
+// asserts they agree.
+export function deliveryKeyFor(server, name) {
+  return `${server.id}\u0000${name}`;
+}
+
+export function placeholderNames(server) {
+  const found = new Set();
+  const scan = (value) => {
+    if (typeof value !== 'string') return;
+    for (const match of value.matchAll(PLACEHOLDER)) found.add(match[1]);
+  };
+  scan(server?.url);
+  scan(server?.cwd);
+  for (const argument of server?.args ?? []) scan(argument);
+  for (const value of Object.values(server?.headers ?? {})) scan(value);
+  for (const value of Object.values(server?.environment ?? {})) scan(value);
+  return [...found];
+}
+
+function unboundPlaceholder(name) {
+  const error = new Error(
+    `The placeholder ${name} has no value. Bind it to a stored key or a connector secret, `
+    + 'or remove it from the definition.'
+  );
+  error.status = 409;
+  error.code = 'unbound_placeholder';
+  return error;
+}
+
+// Values come from two places and neither is the definition: a credential the
+// control plane resolved and delivered for this apply, or a connector secret
+// provisioned in this container's own MCP_SECRET_ namespace.
+function placeholderValues(server, environment, delivered) {
+  const values = {};
+  for (const name of placeholderNames(server)) {
+    const binding = server.placeholders?.[name];
+    if (!binding) throw unboundPlaceholder(name);
+    if (binding.source === 'credential') {
+      const credential = delivered?.[deliveryKeyFor(server, name)];
+      if (!credential) {
+        const error = new Error(
+          `The stored key for ${name} was not delivered with this configuration. `
+          + 'Delivered values are held in memory, so a worker restart needs a fresh apply.'
+        );
+        error.status = 409;
+        error.code = 'missing_credential';
+        throw error;
+      }
+      values[name] = credential.value;
+      continue;
+    }
+    const value = environment[binding.name];
+    if (value === undefined) throw missingSecret(binding.name);
+    values[name] = value;
   }
-  resolved.headers[credential.header] = credential.value;
+  return values;
+}
+
+function fill(value, values) {
+  if (typeof value !== 'string') return value;
+  return value.replace(PLACEHOLDER, (whole, name) => (name in values ? values[name] : whole));
 }
 
 function resolveServers(servers, environment, { requireSecrets, credentials } = {}) {
@@ -97,17 +160,19 @@ function resolveServers(servers, environment, { requireSecrets, credentials } = 
     const resolved = clone(server);
     resolved.environment = { ...(server.environment ?? {}) };
     resolved.headers = { ...(server.headers ?? {}) };
-    for (const [target, reference] of Object.entries(server.secretEnvironment ?? {})) {
-      const sourceEnv = typeof reference === 'string' ? reference : reference.sourceEnv;
-      const value = environment[sourceEnv];
-      if (value === undefined && requireSecrets) throw missingSecret(sourceEnv);
-      if (value !== undefined) resolved.environment[target] = value;
-    }
-    if (requireSecrets) applyDeliveredCredentials(resolved, server, credentials);
-    for (const [header, reference] of Object.entries(server.secretHeaders ?? {})) {
-      const value = environment[reference.sourceEnv];
-      if (value === undefined && requireSecrets) throw missingSecret(reference.sourceEnv);
-      if (value !== undefined) resolved.headers[header] = `${reference.prefix ?? ''}${value}`;
+    // Fill the definition itself. Only when secrets are required: validation runs
+    // without them and must not report a shape nobody will ever run.
+    if (requireSecrets) {
+      const values = placeholderValues(server, environment, credentials);
+      resolved.url = fill(resolved.url, values);
+      resolved.cwd = fill(resolved.cwd, values);
+      resolved.args = (resolved.args ?? []).map((argument) => fill(argument, values));
+      for (const [header, value] of Object.entries(resolved.headers)) {
+        resolved.headers[header] = fill(value, values);
+      }
+      for (const [key, value] of Object.entries(resolved.environment)) {
+        resolved.environment[key] = fill(value, values);
+      }
     }
     return resolved;
   });
@@ -206,6 +271,20 @@ export function createMcpManager(options) {
 
   function validate(servers, { requireSecrets = false, credentials = null } = {}) {
     if (!Array.isArray(servers)) return { valid: false, errors: [{ field: 'servers', code: 'invalid_type', message: 'servers must be an array' }], warnings: [] };
+    const legacyErrors = servers.flatMap((server, index) => ['credentialId', 'secretHeaders', 'secretEnvironment']
+      .filter((field) => {
+        const value = server?.[field];
+        return value !== undefined && value !== null
+          && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 0);
+      })
+      .map((field) => ({
+        index,
+        name: server?.name ?? null,
+        field,
+        code: 'unsupported_legacy_credential',
+        message: `${field} is no longer supported; put \${NAME} where the value belongs and bind it in placeholders`
+      })));
+    if (legacyErrors.length) return { valid: false, errors: legacyErrors, warnings: [] };
     let resolved;
     try { resolved = resolveServers(servers, environment, { requireSecrets, credentials: credentials ?? deliveredCredentials }); }
     catch (error) {
@@ -222,23 +301,26 @@ export function createMcpManager(options) {
   let deliveredCredentials = {};
 
   function pendingCredentials() {
-    return state.servers
-      .filter((server) => server.credentialId && !deliveredCredentials[server.credentialId])
-      .map((server) => server.name);
+    const waiting = (server) => {
+      return Object.entries(server.placeholders ?? {}).some(([name, binding]) =>
+        binding.source === 'credential' && !deliveredCredentials[deliveryKeyFor(server, name)]);
+    };
+    return state.servers.filter(waiting).map((server) => server.name);
   }
 
   async function apply(servers, credentials = {}) {
     await ready;
     const desired = clone(servers);
-    const validation = validate(desired, { requireSecrets: true, credentials });
+    const previousCredentials = deliveredCredentials;
+    const nextCredentials = credentials ?? {};
+    const validation = validate(desired, { requireSecrets: true, credentials: nextCredentials });
     if (!validation.valid) {
       const error = new Error(validation.errors.map((item) => item.message).join('; ') || 'Invalid MCP configuration');
       error.status = 400;
       error.validation = validation;
       throw error;
     }
-    deliveredCredentials = credentials ?? {};
-    const resolved = resolveServers(desired, environment, { requireSecrets: true, credentials: deliveredCredentials });
+    const resolved = resolveServers(desired, environment, { requireSecrets: true, credentials: nextCredentials });
     if (adapterId === 'claude-code') {
       await atomicJson(path.join(configDir, 'claude.json'), renderClaudeMcpConfig(resolved, { workspace, allowedCommands }));
     } else if (adapterId === 'opencode') {
@@ -246,14 +328,32 @@ export function createMcpManager(options) {
       try { baseConfig = JSON.parse(await readFile(providerConfigPath, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       await atomicJson(providerConfigPath, renderOpenCodeMcpConfig(resolved, { baseConfig, workspace, allowedCommands }));
     } else {
+      // Rollback values are memory-only too. Prefer the newly delivered map (it
+      // normally contains every still-attached connector), then the last apply's
+      // values. If a removed connector's value is unavailable after a restart,
+      // the adapter can still remove its managed name but cannot pretend it can
+      // restore a configuration containing an unresolved placeholder.
+      let previousServers = [];
+      try {
+        previousServers = resolveServers(state.servers, environment, {
+          requireSecrets: true,
+          credentials: { ...previousCredentials, ...nextCredentials }
+        });
+      } catch { /* no safe rollback definition is available */ }
       await applyCodexMcpServers(resolved, {
-        previousServers: resolveServers(state.servers, environment, { requireSecrets: false }),
+        previousServers,
+        previousNames: state.servers.map((server) => server.name),
         allowedCommands,
         env: execEnvironment,
         run,
         demoMode
       });
     }
+    // Commit the memory-only delivery only after the provider accepted the new
+    // configuration. A failed Codex apply may restore the previous native MCP;
+    // swapping this first would then run that restored configuration with the
+    // rejected definition's values.
+    deliveredCredentials = nextCredentials;
     state = { schemaVersion: 1, generation: state.generation + 1, appliedAt: new Date().toISOString(), servers: desired };
     health = {
       checkedAt: state.appliedAt,
@@ -302,7 +402,7 @@ export function createMcpManager(options) {
         env: openCodeMcpTaskEnvironment(baseEnvironment, resolved, { allowedCommands, disableServerNames })
       };
     }
-    return { args: [], env: baseEnvironment };
+    return { args: [], env: codexMcpTaskEnvironment(baseEnvironment, resolved) };
   }
 
   async function observe(event) {

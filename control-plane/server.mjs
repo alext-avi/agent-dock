@@ -444,7 +444,10 @@ export function createControlPlane(options = {}) {
           }
           if (stored.schemaVersion >= 4) {
             for (const record of stored.credentials ?? []) {
-              if (record?.id && record?.name && record?.sealed) credentialRecords.set(record.id, record);
+              if (record?.id && record?.name) {
+                const { header: _legacyHeader, ...current } = record;
+                credentialRecords.set(record.id, current);
+              }
             }
           }
           if (stored.schemaVersion >= 3) {
@@ -1537,7 +1540,11 @@ export function createControlPlane(options = {}) {
       const record = credentials.get(id);
       // Report the recoverable objection first: being told to confirm a deletion
       // that would have been refused anyway is a worse error than being told why.
-      const inUse = [...mcpServers.values()].filter((server) => server.credentialId === id).map((server) => server.name);
+      // A key can be used two ways, and checking only one of them made a key
+      // bound through a placeholder deletable while a connector still needed it.
+      const usesCredential = (server) => Object.values(server.placeholders ?? {})
+        .some((binding) => binding.source === 'credential' && binding.credentialId === id);
+      const inUse = [...mcpServers.values()].filter(usesCredential).map((server) => server.name);
       if (inUse.length) {
         throw Object.assign(
           new Error(`Credential is still used by ${inUse.join(', ')}; detach it from those connectors first`),

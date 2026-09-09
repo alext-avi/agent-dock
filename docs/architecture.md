@@ -13,7 +13,7 @@ flowchart TB
     ControlMcp["Control-plane MCP · official TypeScript SDK\nSafe fleet + durable delegation tools"]
     Auth["Platform identity + policy\nOIDC/PKCE · sessions · roles/scopes"]
     AuthDb[("SQLite\nRevocable browser sessions")]
-    Registry["Schema-v4 JSON registry\nAgents · runtimes · MCP · scoped data"]
+    Registry["Schema-v4 JSON registry\nAgents · runtimes · MCP · stored keys · scoped data"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Data["Scoped storage service\nHost subfolders · managed volumes\nRO/RW policy + write leases"]
     Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
@@ -75,8 +75,8 @@ flowchart TB
   API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  McpService -->|"same servers payload"| WA
-  McpService -->|"same servers payload"| WB
+  McpService -->|"canonical servers + ephemeral placeholder values"| WA
+  McpService -->|"canonical servers + ephemeral placeholder values"| WB
   WA --> MCP
   WB --> MCP
   ControlMcp --- Guard
@@ -92,7 +92,7 @@ flowchart TB
 | Provider harnesses | Official `@openai/codex`, `@anthropic-ai/claude-code`, and `opencode-ai` CLI distributions |
 | Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
 | Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/secret, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Optional approved sources are mounted at exact `/data` targets with Docker-enforced read-only or exclusive read/write policy. Managed traffic uses short-lived scope- and audience-bound JWTs. Concurrent runtime attachment is rejected. A runtime's container can be replaced from the current image while retaining all four private volumes and its scoped mounts, so new worker code does not cost a provider login. Containers are addressed by their stable name rather than their ID, which changes on replacement. |
-| Persistence | Current: schema-v4 JSON agent/runtime/MCP/data-source registry, SQLite schedule/occurrence/run-history, delegated-task lineage/results, and revocable browser-session databases, plus unique Docker named volumes per managed agent and optional managed data-source volumes. Planned: migrate the JSON registry behind the same Postgres-ready repository boundary. |
+| Persistence | Current: schema-v4 JSON agent/runtime/MCP/key/data-source registry, SQLite schedule/occurrence/run-history, delegated-task lineage/results, and revocable browser-session databases, plus unique Docker named volumes per managed agent and optional managed data-source volumes. Planned: migrate the JSON registry behind the same Postgres-ready repository boundary. |
 | Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default |
 | Authentication | Platform: explicit trusted-local development mode or OIDC Authorization Code + PKCE, signed server-side sessions, centralized roles/scopes, and separately audience-bound REST/MCP bearer tokens. MCP is unavailable in trusted-local mode; agent identities also require a code-level tool/target policy. Provider: Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default. The two identity planes are never exchanged. |
 | Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |

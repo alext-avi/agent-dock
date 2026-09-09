@@ -435,8 +435,10 @@ test('streaming task submission uses the authenticated CSRF request path', async
   const page = await openPage(`/agents/${agent.id}#test`);
   t.after(() => page.close());
   let requestHeaders;
+  let requestBody;
   await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
     requestHeaders = route.request().headers();
+    requestBody = route.request().postDataJSON();
     await route.fulfill({
       status: 200,
       contentType: 'application/x-ndjson',
@@ -448,6 +450,78 @@ test('streaming task submission uses the authenticated CSRF request path', async
   await page.click('#run-button');
   await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
   assert.equal(requestHeaders?.['x-agent-dock-csrf'], '1');
+  assert.match(requestBody?.conversationId, /^test-/);
+});
+
+test('the Test workbench continues one harness conversation until the operator starts over', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  const requests = [];
+  await page.route(`**/api/v1/agents/${agent.id}/conversations/*`, (route) => route.fulfill({ status: 204 }));
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    const body = route.request().postDataJSON();
+    requests.push(body);
+    const turn = requests.filter((request) => request.conversationId === body.conversationId).length;
+    const taskId = `conversation-task-${requests.length}`;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ type: 'conversation.continued', taskId, data: { conversationId: body.conversationId, resumed: turn > 1, turns: turn } }),
+        JSON.stringify({ type: 'task.started', taskId, data: { executionMode: 'provider-sandbox', model: 'claude-test' } }),
+        JSON.stringify({ type: 'activity.started', taskId, data: { kind: 'tool', name: 'Inspect files' } }),
+        JSON.stringify({ type: 'message.completed', taskId, data: { role: 'assistant', text: `answer ${requests.length}` } }),
+        JSON.stringify({ type: 'usage.observed', taskId, data: { request: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } }),
+        JSON.stringify({ type: 'task.completed', taskId, data: { status: 'succeeded', exitCode: 0 } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.fill('#prompt', 'first request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 1' }).waitFor();
+  await page.fill('#prompt', 'follow-up request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 2' }).waitFor();
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].conversationId, requests[1].conversationId);
+  assert.equal(await page.locator('.test-turn').count(), 2);
+  assert.match(await page.locator('.test-turn').nth(1).textContent(), /resumed conversation/);
+  assert.match(await page.locator('.test-turn').nth(1).textContent(), /15 tokens/);
+  assert.match(await page.locator('#test-session-state').textContent(), /2 turns/);
+
+  await page.click('#new-conversation');
+  await page.locator('.conversation-empty').waitFor();
+  assert.equal(await page.locator('.test-turn').count(), 0);
+  assert.equal((await page.locator('#test-session-state').textContent()).trim(), 'new conversation');
+
+  await page.fill('#prompt', 'fresh request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 3' }).waitFor();
+  assert.notEqual(requests[2].conversationId, requests[1].conversationId);
+  assert.equal(await page.locator('.test-turn').count(), 1);
+});
+
+test('the Test agent shortcut reveals the workbench without focus scrolling past it', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}`);
+  t.after(() => page.close());
+
+  await page.click('#test-agent-button');
+  await page.waitForTimeout(500);
+
+  const layout = await page.evaluate(() => ({
+    headingTop: document.querySelector('#test-panel h2')?.getBoundingClientRect().top,
+    tabBottom: document.querySelector('.tab-list')?.getBoundingClientRect().bottom,
+    activeElement: document.activeElement?.id,
+    activeTab: document.querySelector('.tab-button.active')?.dataset.tab
+  }));
+  assert.equal(layout.activeTab, 'test');
+  assert.equal(layout.activeElement, 'prompt');
+  assert.ok(layout.headingTop >= layout.tabBottom, 'focusing the composer scrolled the workbench heading behind the tabs');
+  assert.ok(layout.headingTop < 260, 'the shortcut did not bring the workbench heading near the top of the viewport');
 });
 
 test('the workspace navigator expands folders and filters nested files', async (t) => {

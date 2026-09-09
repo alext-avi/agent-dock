@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Dock</title>
-    <link rel="stylesheet" href="/styles.css?v=10">
+    <link rel="stylesheet" href="/styles.css?v=11">
   </head>
   <body>
     <header class="topbar">
@@ -310,26 +310,34 @@
         </section>
 
         <section id="test-panel" class="tab-panel hidden" role="tabpanel" data-panel="test">
-          <section class="panel task-panel">
-            <div class="panel-heading">
-              <div><p class="kicker">EPHEMERAL TEST</p><h2>Send a task</h2></div>
-              <span class="hint">not saved · streaming JSONL</span>
+          <section class="panel test-workbench" aria-labelledby="test-workbench-title">
+            <div class="test-workbench-heading">
+              <div><p class="kicker">CONVERSATIONAL TEST</p><h2 id="test-workbench-title">Work with this agent</h2></div>
+              <div class="test-session-actions">
+                <span id="test-session-state" class="pill neutral">new conversation</span>
+                <button id="new-conversation" class="text-button" type="button">New conversation</button>
+              </div>
             </div>
-            <label for="prompt">Message <span>⌘/Ctrl + Enter to run</span></label>
-            <textarea id="prompt" rows="5" placeholder="Research the subject, write a concise brief, and save it as /workspace/brief.md."></textarea>
-            <div class="actions">
-              <button id="run-button" class="button primary">Run in container <span>→</span></button>
-              <button id="cancel-button" class="button danger hidden">Cancel run</button>
-              <span id="run-message" class="run-message"></span>
+            <p class="test-session-note">The transcript stays in this page. The agent keeps a private harness conversation handle so follow-up messages retain context until you start a new conversation.</p>
+            <div class="test-context-strip">
+              <span>Context applied to every turn</span>
+              <strong id="test-context-summary">Durable instructions · provider default model</strong>
             </div>
-          </section>
-          <section class="panel output-panel">
-            <div class="panel-heading">
-              <div><p class="kicker">EPHEMERAL SESSION</p><h2>Test conversation</h2></div>
-              <button id="clear-output" class="text-button">Clear</button>
+            <div id="conversation" class="conversation" role="log" aria-live="polite" aria-relevant="additions">
+              <div class="conversation-empty"><span aria-hidden="true">A/</span><strong>Start a conversation</strong><small>Ask for work, then refine the result with follow-up messages.</small></div>
             </div>
-            <div id="conversation" class="conversation"><div class="welcome-line"><span>system</span> Waiting for a test task. This transcript is not persisted.</div></div>
-            <details class="event-details"><summary>Raw event stream</summary><pre id="raw-output" class="terminal"></pre></details>
+            <div class="test-composer">
+              <label class="sr-only" for="prompt">Message this agent</label>
+              <textarea id="prompt" rows="3" placeholder="Ask this agent to research, create, review, or change something…"></textarea>
+              <div class="test-composer-footer">
+                <span id="run-message" class="run-message" role="status">⌘/Ctrl + Enter to send</span>
+                <div class="test-composer-actions">
+                  <button id="cancel-button" class="button danger hidden" type="button">Cancel</button>
+                  <button id="run-button" class="button primary" type="button">Send <span>→</span></button>
+                </div>
+              </div>
+            </div>
+            <details class="event-details"><summary>Technical activity and raw event stream</summary><pre id="raw-output" class="terminal"></pre></details>
           </section>
         </section>
       </div>
@@ -527,6 +535,6 @@
     </dialog>
 
     <footer><span>POC / local first</span><span>No account rollover · No provider credential proxy</span></footer>
-    <script type="module" src="/app.js?v=15"></script>
+    <script type="module" src="/app.js?v=17"></script>
   </body>
 </html>

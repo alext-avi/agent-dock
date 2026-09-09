@@ -52,8 +52,8 @@ documented under "Reasonable deferrals" below.
   servers when a prior credential value is no longer available.
 - Contracts, security language, and the architecture source now describe the
   canonical placeholder model and the actual stored-key boundary.
-- Final verification after remediation: **157/157** unit and integration tests
-  and **34/34** Playwright tests.
+- Final verification after merging current `origin/main`: **172/172** unit and
+  integration tests and **38/38** Playwright tests.
 
 ### Reasonable deferrals
 

@@ -78,7 +78,7 @@ Roles are computed on every request. Allowlist changes apply to existing session
 |---|---|
 | `viewer` | Read fleet, agent, schedule, usage, and runtime status |
 | `operator` | Viewer access plus task execution, schedule management, and usage refresh |
-| `admin` | All REST/UI operations, including agent, runtime, provider-auth, MCP, and workspace management |
+| `admin` | All REST/UI operations, including agent, runtime, provider-auth, MCP, workspace, and scoped-storage management |
 
 Configure roles with comma-separated immutable OIDC subjects whenever possible:
 

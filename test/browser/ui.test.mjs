@@ -45,6 +45,7 @@ function createFakeRuntimeManager(workers) {
     currentImage: 'agent-dock-worker:v1',
     recreateDelay: null,
     provisioned: [],
+    recreated: [],
     async provision({ agentId, adapter }) {
       const worker = workers[adapter];
       const id = `runtime-${this.provisioned.length + 1}`;
@@ -62,6 +63,8 @@ function createFakeRuntimeManager(workers) {
         image: this.currentImage,
         imageId: this.currentImage,
         volumes: { auth: `${id}-auth`, binary: `${id}-bin`, telemetry: `${id}-data`, workspace: `${id}-work` },
+        appliedAttachmentIds: [],
+        workingDirectory: '/workspace',
         state: 'running',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -76,8 +79,9 @@ function createFakeRuntimeManager(workers) {
     async currentImageId() {
       return this.currentImage;
     },
-    async recreate(runtime) {
+    async recreate(runtime, { attachments = [], previousAttachments = attachments } = {}) {
       if (this.recreateDelay) await this.recreateDelay;
+      this.recreated.push({ runtimeId: runtime.id, attachments, previousAttachments });
       return {
         containerId: `${runtime.containerId}-new`,
         containerName: runtime.containerName,
@@ -85,9 +89,34 @@ function createFakeRuntimeManager(workers) {
         image: this.currentImage,
         imageId: this.currentImage,
         volumes: runtime.volumes,
+        appliedAttachmentIds: attachments.map((attachment) => attachment.id),
+        workingDirectory: attachments.find((attachment) => attachment.purpose === 'working-directory')?.target ?? '/workspace',
         state: 'running',
         updatedAt: new Date().toISOString()
       };
+    },
+    async materializeAttachments({ attachments, sources }) {
+      return attachments.map((attachment) => {
+        const source = sources.get(attachment.dataSourceId);
+        return {
+          ...attachment,
+          mount: {
+            Type: source.kind === 'managed-volume' ? 'volume' : 'bind',
+            Source: source.volumeName ?? `/approved/${source.rootId}/${source.relativePath}`,
+            Target: attachment.target,
+            ReadOnly: attachment.access === 'read-only'
+          }
+        };
+      });
+    },
+    async createManagedDataVolume(id) { return `managed-${id}`; },
+    async deleteManagedDataVolume() {},
+    async listHostDirectories({ relativePath }) {
+      const listings = {
+        '.': [{ name: 'agent-container', relativePath: 'agent-container' }, { name: 'reference', relativePath: 'reference' }],
+        'agent-container': [{ name: 'control-plane', relativePath: 'agent-container/control-plane' }]
+      };
+      return { relativePath, directories: listings[relativePath] ?? [], truncated: false };
     },
     async stop() {},
     async start() {},
@@ -140,6 +169,10 @@ async function startApp() {
     workerToken: token,
     runtimeManager,
     dataPath: null,
+    attachmentRoots: {
+      projects: { label: 'Projects', hostPath: '/Users/tester/Projects', allowWrite: true },
+      reference: { label: 'Reference', hostPath: '/Users/tester/Reference', allowWrite: false }
+    },
     credentialKeyProvider: environmentKeyProvider({
       CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64')
     })
@@ -349,6 +382,91 @@ test('a deferred one-off job is configured without scheduling notation', async (
   assert.match(await page.locator(`.job-card[data-schedule-id="${schedule.id}"]`).textContent(), /Run once/);
 });
 
+test('the Data tab maps a chosen folder with explicit access in one flow', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#data`);
+  t.after(() => page.close());
+  await page.waitForFunction(() => document.querySelector('#attachment-count')?.textContent === '0 attached');
+
+  await page.click('#new-attachment');
+  await page.selectOption('#attachment-root', 'projects');
+  assert.match(await page.locator('#attachment-root-policy').textContent(), /choose read-only or exclusive read\/write/i);
+  assert.equal(await page.locator('#attachment-access').inputValue(), 'read-only');
+  await page.click('#browse-attachment');
+  const projectFolder = page.locator('.folder-browser-row').filter({ hasText: 'agent-container' });
+  await projectFolder.waitFor({ state: 'visible' });
+  await projectFolder.click();
+  await page.waitForFunction(() => document.querySelector('#folder-browser-selection')?.textContent === 'agent-container');
+  assert.match(await page.locator('#folder-browser-breadcrumbs').textContent(), /Projects\/agent-container/);
+  await page.click('#choose-folder');
+  assert.equal(await page.locator('#attachment-path').getAttribute('readonly'), '');
+  assert.equal(await page.locator('#attachment-path').inputValue(), 'agent-container');
+  await page.fill('#attachment-name', 'project');
+  await page.selectOption('#attachment-access', 'read-write');
+  await page.selectOption('#attachment-purpose', 'working-directory');
+  assert.match(await page.locator('#attachment-policy').textContent(), /exclusive/);
+  await page.click('#save-attachment');
+  await page.waitForFunction(() => document.querySelector('#attachment-count')?.textContent === '1 attached');
+
+  const attachmentCard = page.locator('#attachment-list .data-record');
+  assert.match(await attachmentCard.textContent(), /WORKING DIRECTORY/);
+  assert.match(await attachmentCard.textContent(), /read \/ write/);
+  assert.match(await attachmentCard.textContent(), /\/data\/project/);
+  assert.equal(await page.locator('#workspace-root').textContent(), '/data/project');
+  assert.equal(await page.locator('#workspace-access').textContent(), 'read / write');
+  assert.match(await page.locator('#workspace-description').textContent(), /agent-container/);
+
+  const attachmentState = await (await fetch(`${app.url}/api/v1/agents/${agent.id}/attachments`)).json();
+  assert.equal(attachmentState.workingDirectory, '/data/project');
+  assert.equal(attachmentState.attachments[0].access, 'read-write');
+  assert.equal(JSON.stringify(attachmentState).includes('/Users/tester/Projects'), false);
+  assert.equal(app.runtimeManager.recreated.at(-1).attachments[0].mount.ReadOnly, false);
+
+  const attachment = attachmentState.attachments[0];
+  const source = attachment.source;
+  await fetch(`${app.url}/api/v1/agents/${agent.id}/attachments/${attachment.id}`, { method: 'DELETE' });
+  await fetch(`${app.url}/api/v1/data-sources/${source.id}`, {
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: '{}'
+  });
+});
+
+test('streaming task submission uses the authenticated CSRF request path', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  let requestHeaders;
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    requestHeaders = route.request().headers();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: '{"type":"task.completed","taskId":"browser-csrf-test","data":{"status":"completed"}}\n'
+    });
+  });
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'Verify the authenticated streaming request.');
+  await page.click('#run-button');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  assert.equal(requestHeaders?.['x-agent-dock-csrf'], '1');
+});
+
+test('the workspace navigator expands folders and filters nested files', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#data`);
+  t.after(() => page.close());
+  const folder = page.locator('[data-path="control-plane"] > .file-tree-row');
+  await folder.waitFor({ state: 'visible' });
+  assert.equal(await folder.getAttribute('aria-expanded'), 'false');
+  await folder.click();
+  assert.equal(await folder.getAttribute('aria-expanded'), 'true');
+  await page.locator('[data-path="control-plane/auth.mjs"] > .file-tree-row').waitFor({ state: 'visible' });
+
+  await page.fill('#workspace-search', 'docker-runtime.mjs');
+  await page.locator('[data-path="control-plane/docker-runtime.mjs"] > .file-tree-row').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#workspace-list-message').textContent(), /item/);
+  assert.equal(await page.locator('#file-list').getAttribute('role'), 'tree');
+});
+
 test('a weekly job uses plain-language controls while the API receives cron internally', async (t) => {
   const page = await openPage('/jobs');
   t.after(() => page.close());
@@ -474,6 +592,19 @@ test('image drift is shown only for a managed runtime that is behind', async (t)
   await agentPage.goto(`${app.url}/agents/${app.agents['codex-cli'].id}`);
   await agentPage.waitForFunction(() => !document.querySelector('#runtime-drift')?.classList.contains('hidden'));
   assert.match(await agentPage.locator('#refresh-runtime').textContent(), /update available/);
+});
+
+test('a persisted runtime recovery failure remains visible on the agent page', async (t) => {
+  const agent = app.agents['claude-code'];
+  const runtime = app.runtimeManager.provisioned.find((candidate) => candidate.id === agent.runtime.id);
+  runtime.lastError = 'MCP configuration could not be re-applied after refresh: validation failed';
+  t.after(() => { runtime.lastError = null; });
+
+  const page = await openPage(`/agents/${agent.id}`);
+  t.after(() => page.close());
+  const alert = page.locator('#runtime-error');
+  await alert.waitFor({ state: 'visible' });
+  assert.match(await alert.textContent(), /MCP configuration could not be re-applied/);
 });
 
 test('the status poll cannot re-enable a runtime refresh that is still running', async (t) => {

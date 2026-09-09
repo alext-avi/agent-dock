@@ -1537,7 +1537,9 @@ function renderPlaceholderRows() {
     choice.setAttribute('aria-label', `What fills ${name}`);
     const where_ = document.createElement('span');
     where_.className = 'placeholder-where';
-    where_.textContent = `used in ${where}`;
+    where_.textContent = where === 'the environment'
+      ? 'passed to the connector as an environment variable'
+      : `used in ${where}`;
 
     const options = [['', 'choose…']];
     for (const credential of storedCredentials) {
@@ -1643,6 +1645,27 @@ function syncMcpTransportFields() {
   renderPlaceholderRows();
 }
 
+// A direct NAME=${NAME} entry is the ordinary, safe way to inject a bound value
+// into a connector process. The binding row already explains it in operator
+// language, so opening the raw advanced editor for it makes a normal setup look
+// like two unrelated credential mechanisms. More complex environment templates
+// remain expanded for review.
+function onlyDirectPlaceholderEnvironment(environment = {}) {
+  const entries = Object.entries(environment);
+  return entries.length > 0
+    && entries.every(([name, value]) => value === `\${${name}}`);
+}
+
+function needsAdvancedConnectionReview(definition = {}) {
+  definition ??= {};
+  const environment = definition.environment ?? {};
+  return Boolean(
+    Object.keys(definition.headers ?? {}).length
+    || definition.cwd
+    || (Object.keys(environment).length && !onlyDirectPlaceholderEnvironment(environment))
+  );
+}
+
 function openMcpDialog(server = null) {
   ui.mcpForm.reset();
   ui.mcpDefinitionId.value = server?.id ?? '';
@@ -1655,11 +1678,7 @@ function openMcpDialog(server = null) {
   ui.mcpHeaders.value = formatSettings(server?.headers, ': ');
   ui.mcpCwd.value = server?.cwd ?? '';
   ui.mcpEnvironment.value = formatSettings(server?.environment, '=');
-  ui.mcpAdvanced.open = Boolean(
-    Object.keys(server?.headers ?? {}).length
-    || Object.keys(server?.environment ?? {}).length
-    || server?.cwd
-  );
+  ui.mcpAdvanced.open = needsAdvancedConnectionReview(server);
   ui.mcpTimeout.value = String(Math.round((server?.timeoutMs ?? 30_000) / 1000));
   // Bindings come from the definition, and the rows are drawn from whatever
   // placeholders the definition actually contains.
@@ -1831,11 +1850,7 @@ function applyProposalToForm(proposal) {
   ui.mcpHeaders.value = formatSettings(proposal.headers, ': ');
   ui.mcpCwd.value = proposal.cwd ?? '';
   ui.mcpEnvironment.value = formatSettings(proposal.environment, '=');
-  ui.mcpAdvanced.open = Boolean(
-    Object.keys(proposal.headers ?? {}).length
-    || Object.keys(proposal.environment ?? {}).length
-    || proposal.cwd
-  );
+  ui.mcpAdvanced.open = needsAdvancedConnectionReview(proposal);
   ui.mcpTimeout.value = String(Math.round((proposal.timeoutMs ?? 30_000) / 1000));
   // A proposal describes the shape; what fills a placeholder is the operator's
   // to choose, so the rows appear unbound and the connector cannot be saved
@@ -2040,6 +2055,16 @@ async function saveMcpDefinition(event) {
   ui.mcpFormMessage.classList.add('hidden');
   try {
     const payload = mcpFormPayload();
+    // A registry-level workshop still names a real harness. Once the operator
+    // has filled its placeholders, make that harness enforce its command policy
+    // before persisting the model-generated proposal. Hand-written reusable
+    // definitions remain vendor-neutral and can be validated when attached.
+    if (!currentAgent && workshopConversationAgentId) {
+      await api(`${API_ROOT}/agents/${encodeURIComponent(workshopConversationAgentId)}/mcp/validate`, {
+        method: 'POST',
+        body: JSON.stringify({ server: payload })
+      });
+    }
     const id = ui.mcpDefinitionId.value;
     const result = await api(id ? `${API_ROOT}/mcp/servers/${encodeURIComponent(id)}` : `${API_ROOT}/mcp/servers`, {
       method: id ? 'PATCH' : 'POST',

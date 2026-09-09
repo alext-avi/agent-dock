@@ -408,7 +408,7 @@
         <input id="credential-id" type="hidden">
         <div class="dialog-heading"><div><p class="kicker">CONNECTOR CREDENTIAL</p><h2 id="credential-dialog-title">New credential</h2></div><button id="close-credential-dialog" class="icon-button" type="button" aria-label="Close">×</button></div>
         <p class="dialog-copy">The value is write-only. Once saved it is never displayed or returned again — only the last four characters, so you can recognise a key you already hold.</p>
-        <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company-docs"></label>
+        <label class="field">Name <span>a descriptive label; an internal ID is generated automatically</span><input id="credential-name" required maxlength="64" placeholder="GitHub personal token"></label>
         <label class="field">Permitted hosts <span>optional; one per line. Checked against a connector's URL when it is saved — not egress control, and not consulted for a local process. Hostnames resolve inside the agent's container, so a proxy elsewhere is its container name or <code>host.docker.internal</code>, never <code>127.0.0.1</code>.</span><textarea id="credential-hosts" rows="3" placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
         <label class="field">Value <span id="credential-value-hint">pasted once, never shown again</span><input id="credential-value" type="password" autocomplete="off" maxlength="4096" placeholder="paste the key"></label>
         <p id="credential-message" class="usage-error hidden"></p>
@@ -448,7 +448,7 @@
         <section id="mcp-stdio-fields" class="mcp-transport-fields hidden">
           <label class="field">Allowed executable<input id="mcp-command" placeholder="node"></label>
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
-          <p class="field-note">Put <code>${NAME}</code> anywhere a secret belongs — usually an argument. You will be asked what fills it.</p>
+          <p class="field-note">Put <code>${NAME}</code> where the command actually consumes a secret. Environment-based secrets are summarized under Values to bind.</p>
         </section>
         <details id="mcp-advanced" class="mcp-advanced">
           <summary>Advanced connection settings</summary>

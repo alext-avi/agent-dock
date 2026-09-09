@@ -33,9 +33,11 @@ export function buildMcpWorkshopPrompt(goal) {
 
 Investigate the connector using the tools and outbound network available inside your container. You may install or run software in your own workspace for a safe test, but do not call the Agent Dock control-plane API, edit its registry, change provider-native MCP configuration, or include any credential value. The operator will review and approve the final definition.
 
-Determine the correct transport, endpoint or executable, arguments, and timeout.
+Determine the correct transport, endpoint or executable, arguments, and timeout. Before proposing a local stdio connector, confirm that its executable is installed and can actually be invoked inside this container. Do not propose docker unless the docker executable is present and usable here. Prefer a supported remote HTTP endpoint when the requested local launcher is unavailable. If neither can be verified, explain that the connector is blocked instead of presenting an unverified definition as ready.
 
 Where the connector needs a secret, write a placeholder in the form \${NAME} at the exact position the value belongs — in an argument, URL, header, environment value, or working directory. Use a descriptive upper-case name, for example \${ACCESS_TOKEN}. Agent Dock fills a placeholder in at the moment the connector starts, so it goes exactly where the real value would go — for example an Authorization header of "Bearer \${ACCESS_TOKEN}" — not a separate secret mapping.
+
+Only put a placeholder in environment when the executable's documented interface actually reads that environment variable; never invent an environment entry merely to give a placeholder somewhere to live. One intentional case is "docker run -e NAME": Docker reads NAME from its own environment and forwards it to the child container, so use an environment entry of "NAME": "\${NAME}" and keep the argument as NAME. This avoids placing the resolved secret in the process argument list. Explain this forwarding choice before the proposal. Do not invent a working directory such as /workspace/project; use null unless a real, required directory was verified.
 
 Do not decide what fills it. The operator binds each placeholder to a key Agent Dock stores or to a secret provisioned inside the agent's container, and that choice is theirs. Never put a token, cookie, password or key value anywhere in the proposal — a placeholder is how you say a secret is needed. If the connector needs no secret, use no placeholders and say so.
 

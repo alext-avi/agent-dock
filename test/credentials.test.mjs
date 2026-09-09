@@ -155,6 +155,16 @@ test('a key needs a name and little else, and says what it is limited to', async
   await assert.rejects(() => credentials.create({ name: 'no name at all'.repeat(20), value: 'x' }), /too long|alphanumeric/);
 });
 
+test('credential labels can be human-readable while their ids stay machine-safe', async () => {
+  const { credentials } = store();
+  const created = await credentials.create({
+    name: 'GitHub personal token',
+    value: 'github-friendly-label-0001'
+  });
+  assert.equal(created.name, 'GitHub personal token');
+  assert.equal(created.id, 'github-personal-token');
+});
+
 test('a key can exist before it has a value, and nothing can use it until it does', async () => {
   const { credentials } = store();
 

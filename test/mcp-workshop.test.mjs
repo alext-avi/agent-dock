@@ -174,6 +174,11 @@ test('the prompt teaches the placeholder syntax and leaves the binding to the op
   assert.match(prompt, /operator binds each placeholder/);
   assert.match(prompt, /Never put a token, cookie, password or key value/);
   assert.match(prompt, /argument, URL, header, environment value, or working directory/);
+  assert.match(prompt, /confirm that its executable is installed/i);
+  assert.match(prompt, /Do not propose docker unless/i);
+  assert.match(prompt, /never invent an environment entry/i);
+  assert.match(prompt, /docker run -e NAME/i);
+  assert.match(prompt, /Do not invent a working directory/i);
   assert.match(prompt, /the GitHub MCP server/);
 });
 

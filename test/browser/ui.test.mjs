@@ -661,7 +661,7 @@ test('no connection detail reaches the browser', async (t) => {
 });
 
 
-test('a credential can be added from the UI and its value never comes back', async (t) => {
+test('a credential can use a human-readable label and its value never comes back', async (t) => {
   const page = await openPage('/credentials');
   t.after(() => page.close());
   await page.waitForFunction(() => document.querySelector('#credential-list')?.textContent?.includes('No credentials yet'));
@@ -672,14 +672,14 @@ test('a credential can be added from the UI and its value never comes back', asy
   assert.match(note, /Anyone able to read this host can read them/);
 
   await page.click('#new-credential');
-  await page.fill('#credential-name', 'company-docs');
+  await page.fill('#credential-name', 'Company docs key');
   await page.fill('#credential-hosts', 'mcp.example.com');
   await page.fill('#credential-value', 'sk-browser-secret-9999');
   await page.click('#credential-form button[type="submit"]');
 
   await page.waitForFunction(() => document.querySelectorAll('.credential-row').length === 1);
   const row = page.locator('.credential-row').first();
-  assert.match(await row.textContent(), /company-docs/);
+  assert.match(await row.textContent(), /Company docs key/);
   assert.match(await row.textContent(), /…9999/);
 
   // Nothing on the page carries the value, including after a save.
@@ -1375,6 +1375,51 @@ test('a proposal carrying a placeholder asks the operator what fills it', async 
   assert.match(status, /Choose what fills SERVICE_TOKEN/);
   assert.doesNotMatch(status, /rejected the shape/i);
   assert.doesNotMatch(status, /could not be completed/i);
+});
+
+test('ordinary environment secret forwarding stays concise and an unusable workshop command is not saved', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  await page.route('**/api/v1/agents/*/tasks', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/x-ndjson',
+    body: [
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId: 'docker-proposal' }),
+      JSON.stringify({
+        apiVersion: 'agent-wrapper/v1',
+        type: 'message.completed',
+        taskId: 'docker-proposal',
+        data: {
+          role: 'assistant',
+          text: '<agent-dock-mcp-proposal>{"name":"docker-proposal","transport":"stdio","command":"docker","args":["run","--rm","-i","-e","GITHUB_PERSONAL_ACCESS_TOKEN","example.invalid/mcp","stdio"],"cwd":null,"environment":{"GITHUB_PERSONAL_ACCESS_TOKEN":"${GITHUB_PERSONAL_ACCESS_TOKEN}"},"timeoutMs":30000}</agent-dock-mcp-proposal>'
+        }
+      }),
+      JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId: 'docker-proposal', data: { status: 'succeeded' } })
+    ].join('\n') + '\n'
+  }));
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'the GitHub MCP server in Docker');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#mcp-name')?.value === 'docker-proposal');
+
+  assert.equal(await page.locator('#mcp-advanced').evaluate((node) => node.open), false);
+  const row = page.locator('.placeholder-row', { hasText: 'GITHUB_PERSONAL_ACCESS_TOKEN' });
+  await row.waitFor();
+  assert.match(await row.textContent(), /passed to the connector as an environment variable/);
+
+  await row.locator('select').selectOption('__new');
+  await row.locator('input').fill('GITHUB_PERSONAL_ACCESS_TOKEN');
+  await page.click('#mcp-form button[type="submit"]');
+
+  const message = page.locator('#mcp-form-message');
+  await message.waitFor({ state: 'visible' });
+  assert.match(await message.textContent(), /not allowed/i);
+  assert.equal(await page.locator('#registry-list .mcp-row', { hasText: 'docker-proposal' }).count(), 0);
 });
 
 test('a key named after the placeholder is preselected', async (t) => {

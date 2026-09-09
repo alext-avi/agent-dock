@@ -11,7 +11,6 @@
 
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 
-const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,79}$/;
 const HOST_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
 
@@ -181,7 +180,6 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       throw failure('header is no longer stored on a credential; put ${NAME} in the connector header instead');
     }
     const name = text(input.name, 'name', { required: true, max: 64 });
-    if (!NAME_PATTERN.test(name)) throw failure('name must be alphanumeric with dashes or underscores');
     const duplicate = [...records.values()].find((item) => item.name.toLowerCase() === name.toLowerCase() && item.id !== currentId);
     if (duplicate) throw failure('A credential with that name already exists', 409);
 

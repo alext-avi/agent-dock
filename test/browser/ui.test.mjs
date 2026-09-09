@@ -575,6 +575,131 @@ test('a runtime without conversation support is described honestly and receives 
   assert.match(await page.locator('.test-turn-context').textContent(), /independent turn/i);
 });
 
+// Uses the real demo worker (no page.route mocking) rather than a scripted
+// fixture: the demo adapter genuinely streams task.started, then the answer,
+// then completion over real ~120ms gaps (worker/server.mjs runDemo), which is
+// what gives the operator's mid-stream scroll an actual window to land in.
+test('the transcript keeps a manual scroll position during streaming and resumes on a new turn', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+
+  const runTurn = async (prompt) => {
+    await page.fill('#prompt', prompt);
+    await page.click('#run-button');
+    await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  };
+
+  // Enough turns to make the transcript taller than its own viewport, or there
+  // is nothing for a scroll-up to preserve.
+  for (let i = 1; i <= 5; i += 1) {
+    await runTurn(`seed turn ${i}: ${'enough transcript content to require scrolling. '.repeat(12)}`);
+  }
+  const overflowing = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight > el.clientHeight;
+  });
+  assert.ok(overflowing, 'the seed turns did not make the transcript scrollable, so scroll preservation below proves nothing');
+
+  // Start one more turn, then scroll up the instant its card appears —
+  // before the streamed answer and completion events land.
+  await page.fill('#prompt', 'streaming turn');
+  await page.click('#run-button');
+  await page.waitForFunction((count) => document.querySelectorAll('.test-turn').length === count, 6);
+  await page.evaluate(() => { document.querySelector('#conversation').scrollTop = 0; });
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+
+  const scrollTopAfterStreaming = await page.evaluate(() => document.querySelector('#conversation').scrollTop);
+  assert.ok(scrollTopAfterStreaming < 20, 'a streamed event snapped the transcript back to the bottom while the operator was reading an earlier turn');
+
+  // Sending a new turn resumes following even though the operator never
+  // scrolled back down themselves.
+  await runTurn('resumed turn');
+  const followingAfterNewTurn = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= 32;
+  });
+  assert.ok(followingAfterNewTurn, 'sending a new turn did not resume following the transcript');
+
+  // Scrolling back down to the bottom by hand also resumes following, without
+  // needing to send a turn.
+  await page.fill('#prompt', 'one more turn to scroll away from');
+  await page.click('#run-button');
+  await page.waitForFunction((count) => document.querySelectorAll('.test-turn').length === count, 8);
+  await page.evaluate(() => { document.querySelector('#conversation').scrollTop = 0; });
+  await page.waitForTimeout(60);
+  await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    el.scrollTop = el.scrollHeight;
+    el.dispatchEvent(new Event('scroll'));
+  });
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  const followingAfterManualReturn = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= 32;
+  });
+  assert.ok(followingAfterManualReturn, 'scrolling back to the bottom by hand did not resume following the transcript');
+});
+
+// The demo worker's fixed reply text is too short to be pathological on its
+// own, so this scripts a single response carrying the shapes that have
+// actually overflowed a card: a bare URL, a run-on word with no break
+// opportunities, inline-code-style text, and a multi-line preformatted block,
+// plus a long value in the collapsible activity panel.
+test('long agent output stays inside its turn card at narrow and normal widths', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  await page.setViewportSize({ width: 1180, height: 900 });
+
+  const longWord = 'a'.repeat(220);
+  const longUrl = `https://example.test/${'b'.repeat(180)}/resource?token=${'c'.repeat(120)}`;
+  const preformatted = Array.from({ length: 6 }, (_, i) => `line ${i}: ${'d'.repeat(140)}`).join('\n');
+  const answerText = `Read this: ${longUrl}\nInline code like \`${longWord}\` and a run-on word ${longWord}.\n\n${preformatted}`;
+
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    const taskId = 'overflow-task';
+    const body = [
+      JSON.stringify({ type: 'task.started', taskId, data: { executionMode: 'demo' } }),
+      JSON.stringify({ type: 'activity.started', taskId, data: { kind: 'tool', name: 'fetch', command: longUrl } }),
+      JSON.stringify({ type: 'message.completed', taskId, data: { role: 'assistant', text: answerText } }),
+      JSON.stringify({ type: 'task.completed', taskId, data: { status: 'succeeded', exitCode: 0 } })
+    ].join('\n') + '\n';
+    await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body });
+  });
+
+  await page.goto(`${app.url}/agents/${agent.id}#test`);
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'produce pathological output');
+  await page.click('#run-button');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  // Open the activity panel so its long value is actually laid out rather
+  // than sitting inert inside a closed <details>.
+  await page.click('.test-turn-activity summary');
+
+  for (const width of [1180, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const layout = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const card = document.querySelector('.test-turn');
+      const overflowing = [...card.querySelectorAll('*')]
+        .filter((el) => el.scrollWidth > el.clientWidth + 1)
+        .map((el) => ({ tag: el.tagName, cls: el.className, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+      return {
+        viewport: doc.clientWidth,
+        documentWidth: doc.scrollWidth,
+        cardScrollWidth: card.scrollWidth,
+        cardClientWidth: card.clientWidth,
+        overflowing
+      };
+    });
+    assert.equal(layout.documentWidth, layout.viewport, `${width}px viewport has horizontal page overflow`);
+    assert.ok(layout.cardScrollWidth <= layout.cardClientWidth + 1, `${width}px turn card itself overflows its own bounds`);
+    assert.deepEqual(layout.overflowing, [], `${width}px has a fragment overflowing its own box: ${JSON.stringify(layout.overflowing)}`);
+  }
+});
+
 test('the Test agent shortcut reveals the workbench without focus scrolling past it', async (t) => {
   const agent = app.agents['claude-code'];
   const page = await openPage(`/agents/${agent.id}`);

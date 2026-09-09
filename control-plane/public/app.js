@@ -283,6 +283,11 @@ let testConversationEstablished = false;
 // applied after it. Same shape as workshopRunToken below.
 let testRunToken = 0;
 let activeTestRunToken = null;
+// Whether the transcript should keep following newly streamed content. Starts
+// true (nothing to scroll away from yet) and is cleared the moment the
+// operator scrolls up to read an earlier turn, so a streaming answer never
+// yanks their read position back to the bottom.
+let followTranscript = true;
 let authPolling = null;
 let refreshingAuth = false;
 let currentAgent = null;
@@ -3067,6 +3072,28 @@ async function refreshWorkspace() {
   }
 }
 
+// Anything closer to the bottom than this is treated as "still there" even
+// though a fractional-pixel layout reflow means scrollTop rarely lands on the
+// exact max value.
+const TRANSCRIPT_FOLLOW_THRESHOLD_PX = 32;
+
+function isTranscriptNearBottom() {
+  const el = ui.conversation;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= TRANSCRIPT_FOLLOW_THRESHOLD_PX;
+}
+
+// Scrolling up to read an earlier turn clears the follow flag; scrolling back
+// down to the bottom (or starting a new turn, see runTask/resetTestConversation)
+// restores it. Streamed content only snaps the view down while this is true.
+function handleTranscriptScroll() {
+  followTranscript = isTranscriptNearBottom();
+}
+
+function followTranscriptIfNeeded() {
+  if (!followTranscript) return;
+  ui.conversation.scrollTop = ui.conversation.scrollHeight;
+}
+
 function showEmptyTestConversation() {
   const empty = document.createElement('div');
   empty.className = 'conversation-empty';
@@ -3106,6 +3133,7 @@ function resetTestConversation() {
   ui.testSessionState.className = 'pill neutral';
   ui.rawOutput.textContent = '';
   ui.testTurnLive.textContent = '';
+  followTranscript = true;
   showEmptyTestConversation();
 }
 
@@ -3188,6 +3216,9 @@ function createTestTurn(prompt) {
   // front instead of leaving the default text implying continuity exists.
   if (!currentConversationsSupported) turn.context.textContent = 'independent turn';
   ui.conversation.append(card);
+  // Sending a new turn always resumes following, even if the operator was
+  // reading back through earlier turns when they sent it.
+  followTranscript = true;
   ui.conversation.scrollTop = ui.conversation.scrollHeight;
   announceTestTurnStatus(turn, 'queued');
   return turn;
@@ -3201,7 +3232,7 @@ function appendTestAnswer(turn, text, className = '') {
   paragraph.className = className;
   paragraph.textContent = text;
   turn.answer.append(paragraph);
-  ui.conversation.scrollTop = ui.conversation.scrollHeight;
+  followTranscriptIfNeeded();
 }
 
 function observeTestEvent(turn, event) {
@@ -3460,6 +3491,7 @@ ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);
 ui.cancelButton.addEventListener('click', cancelRun);
 ui.newConversation.addEventListener('click', startNewTestConversation);
+ui.conversation.addEventListener('scroll', handleTranscriptScroll);
 ui.refreshUsage.addEventListener('click', refreshUsage);
 ui.refreshAuth.addEventListener('click', refreshAuthentication);
 ui.signOut.addEventListener('click', signOut);

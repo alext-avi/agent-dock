@@ -84,9 +84,21 @@ function toolResult(value) {
 }
 
 function toolError(error) {
+  const status = Number.isInteger(error?.status) ? error.status : 500;
+  const code = status === 401 || status === 403
+    ? 'authorization_denied'
+    : status === 404
+      ? 'not_found'
+      : status === 409
+        ? 'conflict'
+        : status === 429
+          ? 'rate_limited'
+          : 'tool_error';
+  const value = { error: { code, status, message: error?.message ?? String(error) } };
   return {
     isError: true,
-    content: [{ type: 'text', text: error?.message ?? String(error) }]
+    content: [{ type: 'text', text: JSON.stringify(value) }],
+    structuredContent: value
   };
 }
 
@@ -202,9 +214,10 @@ export function createControlMcp(options = {}) {
         description: 'Dispatch autonomous work to an allowed agent and return a durable task handle immediately. A busy worker can finish with skipped_busy.',
         inputSchema: z.object({
           targetAgentId: z.string().min(1).max(200),
-          prompt: z.string().min(1).max(50_000)
+          prompt: z.string().min(1).max(50_000),
+          idempotencyKey: z.string().trim().min(8).max(200)
         }),
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false }
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true }
       }, guarded(async (input) => {
         if (!targetAllowed(principal, policy, input.targetAgentId)) throw httpError('Target agent is not allowed by caller policy', 403);
         return toolResult({ task: delegation.submit(input, caller, policy ?? {}) });

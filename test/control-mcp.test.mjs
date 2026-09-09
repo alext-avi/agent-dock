@@ -120,6 +120,7 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
 
   const listed = await rpc(`${base}/mcp`, principal, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
   assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
+  assert.equal(listed.result.tools.find((tool) => tool.name === 'submit_agent_task').annotations.idempotentHint, true);
   const modernListed = await modernRpc(`${base}/mcp`, principal, 'tools/list');
   assert.deepEqual(modernListed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
 
@@ -143,18 +144,43 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
 
   const denied = await rpc(`${base}/mcp`, principal, {
     jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
-      name: 'submit_agent_task', arguments: { targetAgentId: 'hidden', prompt: 'should fail' }
+      name: 'submit_agent_task', arguments: {
+        targetAgentId: 'hidden', prompt: 'should fail', idempotencyKey: 'hidden-task-1'
+      }
     }
   });
   assert.equal(denied.result.isError, true);
-  assert.match(denied.result.content[0].text, /not allowed/);
+  assert.equal(denied.result.structuredContent.error.code, 'authorization_denied');
+  assert.equal(denied.result.structuredContent.error.status, 403);
+  assert.match(denied.result.structuredContent.error.message, /not allowed/);
 
   const submitted = await rpc(`${base}/mcp`, principal, {
     jsonrpc: '2.0', id: 4, method: 'tools/call', params: {
-      name: 'submit_agent_task', arguments: { targetAgentId: 'target', prompt: 'do work' }
+      name: 'submit_agent_task', arguments: {
+        targetAgentId: 'target', prompt: 'do work', idempotencyKey: 'target-task-1'
+      }
     }
   });
   const taskId = submitted.result.structuredContent.task.id;
+  assert.equal(submitted.result.structuredContent.task.idempotentReplay, false);
+  const replayed = await rpc(`${base}/mcp`, principal, {
+    jsonrpc: '2.0', id: 6, method: 'tools/call', params: {
+      name: 'submit_agent_task', arguments: {
+        targetAgentId: 'target', prompt: 'do work', idempotencyKey: 'target-task-1'
+      }
+    }
+  });
+  assert.equal(replayed.result.structuredContent.task.id, taskId);
+  assert.equal(replayed.result.structuredContent.task.idempotentReplay, true);
+  const conflictingReplay = await rpc(`${base}/mcp`, principal, {
+    jsonrpc: '2.0', id: 7, method: 'tools/call', params: {
+      name: 'submit_agent_task', arguments: {
+        targetAgentId: 'target', prompt: 'different work', idempotencyKey: 'target-task-1'
+      }
+    }
+  });
+  assert.equal(conflictingReplay.result.structuredContent.error.code, 'conflict');
+  assert.equal(conflictingReplay.result.structuredContent.error.status, 409);
   await delegation.whenIdle();
   const completed = await rpc(`${base}/mcp`, principal, {
     jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'get_agent_task', arguments: { taskId } }

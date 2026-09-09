@@ -222,6 +222,13 @@ drift appears only for a managed runtime that is behind, that the status poll ca
 re-enable a runtime refresh mid-request, and that no worker endpoint or token reaches
 the DOM.
 
+GitHub Actions runs three credential-free checks on every pull request and push to
+`main`: **Unit and integration**, **Browser**, and **Container and Compose**. The last
+check validates `docker-compose.yml` and builds the control-plane image without
+installing or authenticating any provider CLI. Repository administrators should add
+all three check names to the `main` branch protection rule; the workflow is available
+for an on-demand run from the Actions tab as well.
+
 To exercise the complete UI without authenticating or spending subscription usage, start the deterministic demo worker:
 
 ```bash

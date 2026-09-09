@@ -41,7 +41,7 @@ Only put a placeholder in environment when the executable's documented interface
 
 Do not decide what fills it. The operator binds each placeholder to a key Agent Dock stores or to a secret provisioned inside the agent's container, and that choice is theirs. Never put a token, cookie, password or key value anywhere in the proposal — a placeholder is how you say a secret is needed. If the connector needs no secret, use no placeholders and say so.
 
-End your response with exactly one proposal between these tags:
+Only when you have verified a viable definition, end your response with exactly one proposal between these tags. If the connector is blocked by a missing executable, unsupported transport, or another unresolved requirement, explain the blocker and do not emit proposal tags; an unverified proposal is worse than no proposal.
 <agent-dock-mcp-proposal>
 {
   "name": "lowercase_connector_name",

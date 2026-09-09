@@ -24,8 +24,8 @@ export const claudeMcpCapabilities = Object.freeze({
   inspect: true,
   restartRequired: false,
   secretDelivery: 'worker-resolved-environment',
-  // Advertised so the control plane can refuse to send a credentialId
-  // definition to a worker that would apply it with no header at all.
+  // Advertised so the control plane can refuse to send a stored-key placeholder
+  // to a worker that would apply it with the literal placeholder still present.
   credentialDelivery: true,
   // A definition may carry ${NAME} in an argument, a url, a header or an
   // environment value, and the worker fills it at the last moment.

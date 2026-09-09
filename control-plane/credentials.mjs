@@ -13,7 +13,6 @@ import { createCipheriv, createDecipheriv, randomBytes, randomUUID, timingSafeEq
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,79}$/;
-const HEADER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const HOST_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
 
 export const CREDENTIAL_TYPES = Object.freeze(['api-key']);
@@ -142,7 +141,6 @@ export function publicCredential(record) {
     id: record.id,
     name: record.name,
     type: record.type,
-    header: record.header,
     hosts: [...record.hosts],
     // Enough to tell one key from another without disclosing any of it. Null
     // until the key has a value at all.
@@ -179,6 +177,9 @@ export function createCredentialStore({ records, persist, keyProvider = environm
   }
 
   function normalize(input, { currentId = null } = {}) {
+    if (input.header !== undefined && input.header !== null && input.header !== '') {
+      throw failure('header is no longer stored on a credential; put ${NAME} in the connector header instead');
+    }
     const name = text(input.name, 'name', { required: true, max: 64 });
     if (!NAME_PATTERN.test(name)) throw failure('name must be alphanumeric with dashes or underscores');
     const duplicate = [...records.values()].find((item) => item.name.toLowerCase() === name.toLowerCase() && item.id !== currentId);
@@ -189,16 +190,11 @@ export function createCredentialStore({ records, persist, keyProvider = environm
       throw failure(`type must be one of ${CREDENTIAL_TYPES.join(', ')}`);
     }
 
-    // Optional. It is only meaningful for the older path that sends a credential
-    // as a header; a placeholder puts the value exactly where it is written.
-    const header = text(input.header, 'header', { max: 64 }) ?? null;
-    if (header && !HEADER_PATTERN.test(header)) throw failure('header must be a valid HTTP header name');
-
     // Opt-in. An empty list means this key is not limited to any host, which is
     // a real loss of protection for a remote connector and is reported as such
     // rather than left to be assumed — see hostPermitted.
     const hosts = hostList(input.hosts, 'hosts');
-    return { name, type, header, hosts };
+    return { name, type, hosts };
   }
 
   return {
@@ -301,7 +297,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
           403
         );
       }
-      return { header: record.header, value: open(record.sealed, keyProvider.key()) };
+      return { value: open(record.sealed, keyProvider.key()) };
     },
 
     // A local process has no destination, so a host list cannot constrain where
@@ -311,7 +307,7 @@ export function createCredentialStore({ records, persist, keyProvider = environm
     resolveForLocalProcess(id) {
       const record = requireRecord(id);
       requireComplete(record);
-      return { header: record.header, value: open(record.sealed, keyProvider.key()) };
+      return { value: open(record.sealed, keyProvider.key()) };
     },
 
     // Constant-time comparison, used by tests and by any future verification path

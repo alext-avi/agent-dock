@@ -51,7 +51,6 @@ const ui = {
   credentialDialogTitle: $('#credential-dialog-title'),
   credentialId: $('#credential-id'),
   credentialName: $('#credential-name'),
-  credentialHeader: $('#credential-header'),
   credentialHosts: $('#credential-hosts'),
   credentialValue: $('#credential-value'),
   credentialValueHint: $('#credential-value-hint'),
@@ -141,6 +140,12 @@ const ui = {
   mcpUrl: $('#mcp-url'),
   mcpCommand: $('#mcp-command'),
   mcpArgs: $('#mcp-args'),
+  mcpAdvanced: $('#mcp-advanced'),
+  mcpHttpAdvanced: $('#mcp-http-advanced'),
+  mcpStdioAdvanced: $('#mcp-stdio-advanced'),
+  mcpHeaders: $('#mcp-headers'),
+  mcpCwd: $('#mcp-cwd'),
+  mcpEnvironment: $('#mcp-environment'),
   mcpPlaceholders: $('#mcp-placeholders'),
   mcpPlaceholderRows: $('#mcp-placeholder-rows'),
   mcpTimeout: $('#mcp-timeout'),
@@ -262,7 +267,12 @@ async function api(path, options = {}) {
   }
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
-  if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error ?? `HTTP ${response.status}`);
+    error.status = response.status;
+    error.details = data;
+    throw error;
+  }
   return data;
 }
 
@@ -1239,13 +1249,6 @@ function mcpEndpoint(server) {
   return [server.command, ...(server.args ?? [])].filter(Boolean).join(' ');
 }
 
-function mcpSecretReferences(server) {
-  return [
-    ...Object.values(server.secretEnvironment ?? {}).map((value) => value.sourceEnv),
-    ...Object.values(server.secretHeaders ?? {}).map((value) => value.sourceEnv)
-  ].filter(Boolean);
-}
-
 function renderMcpLibrary() {
   const bound = new Set(mcpBindings.map((binding) => binding.serverId));
   const available = mcpDefinitions.filter((server) => !bound.has(server.id));
@@ -1304,7 +1307,6 @@ function renderMcp(result, definitions) {
     const endpoint = document.createElement('code');
     endpoint.className = 'mcp-endpoint';
     endpoint.textContent = mcpEndpoint(server);
-    const refs = mcpSecretReferences(server);
     const meta = document.createElement('p');
     meta.className = 'mcp-meta';
     // A stored credential is not a connector-secret reference, and saying "no
@@ -1378,12 +1380,19 @@ const CONNECTOR_SECRET_PREFIX = 'MCP_SECRET_';
 // actually edit here, so scanning those is scanning all of them.
 function placeholdersInForm() {
   const sources = ui.mcpTransport.value === 'stdio'
-    ? [ui.mcpArgs.value]
-    : [ui.mcpUrl.value];
+    ? [
+        [ui.mcpArgs.value, 'the arguments'],
+        [ui.mcpCwd.value, 'the working directory'],
+        [ui.mcpEnvironment.value, 'the environment']
+      ]
+    : [
+        [ui.mcpUrl.value, 'the URL'],
+        [ui.mcpHeaders.value, 'the headers']
+      ];
   const found = new Map();
-  for (const value of sources) {
+  for (const [value, where] of sources) {
     for (const match of String(value ?? '').matchAll(PLACEHOLDER)) {
-      if (!found.has(match[1])) found.set(match[1], ui.mcpTransport.value === 'stdio' ? 'an argument' : 'the URL');
+      if (!found.has(match[1])) found.set(match[1], where);
     }
   }
   return found;
@@ -1568,6 +1577,8 @@ function syncMcpTransportFields() {
   const http = ui.mcpTransport.value === 'http';
   ui.mcpHttpFields.classList.toggle('hidden', !http);
   ui.mcpStdioFields.classList.toggle('hidden', http);
+  ui.mcpHttpAdvanced.classList.toggle('hidden', !http);
+  ui.mcpStdioAdvanced.classList.toggle('hidden', http);
   ui.mcpUrl.required = http;
   ui.mcpCommand.required = !http;
   renderPlaceholderRows();
@@ -1582,6 +1593,14 @@ function openMcpDialog(server = null) {
   ui.mcpUrl.value = server?.url ?? '';
   ui.mcpCommand.value = server?.command ?? '';
   ui.mcpArgs.value = (server?.args ?? []).join('\n');
+  ui.mcpHeaders.value = formatSettings(server?.headers, ': ');
+  ui.mcpCwd.value = server?.cwd ?? '';
+  ui.mcpEnvironment.value = formatSettings(server?.environment, '=');
+  ui.mcpAdvanced.open = Boolean(
+    Object.keys(server?.headers ?? {}).length
+    || Object.keys(server?.environment ?? {}).length
+    || server?.cwd
+  );
   ui.mcpTimeout.value = String(Math.round((server?.timeoutMs ?? 30_000) / 1000));
   // Bindings come from the definition, and the rows are drawn from whatever
   // placeholders the definition actually contains.
@@ -1594,6 +1613,26 @@ function openMcpDialog(server = null) {
   syncMcpTransportFields();
   void prepareWorkshop(server);
   ui.mcpDialog.showModal();
+}
+
+function formatSettings(value, separator) {
+  return Object.entries(value ?? {}).map(([name, setting]) => `${name}${separator}${setting}`).join('\n');
+}
+
+function parseSettings(value, separator, label) {
+  const result = {};
+  for (const [index, raw] of String(value ?? '').split('\n').entries()) {
+    const line = raw.trim();
+    if (!line) continue;
+    const at = line.indexOf(separator);
+    if (at <= 0) throw new Error(`${label} line ${index + 1} must use ${separator === ':' ? 'Name: value' : 'NAME=value'}.`);
+    const name = line.slice(0, at).trim();
+    const setting = line.slice(at + separator.length).trim();
+    if (!name || !setting) throw new Error(`${label} line ${index + 1} must have both a name and a value.`);
+    if (Object.hasOwn(result, name)) throw new Error(`${label} contains ${name} more than once.`);
+    result[name] = setting;
+  }
+  return result;
 }
 
 function mcpFormPayload() {
@@ -1612,13 +1651,10 @@ function mcpFormPayload() {
     transport,
     command: transport === 'stdio' ? ui.mcpCommand.value.trim() : null,
     args: transport === 'stdio' ? ui.mcpArgs.value.split('\n').map((value) => value.trim()).filter(Boolean) : [],
-    cwd: null,
+    cwd: transport === 'stdio' ? ui.mcpCwd.value.trim() || null : null,
     url: transport === 'http' ? ui.mcpUrl.value.trim() : null,
-    environment: {},
-    secretEnvironment: {},
-    headers: {},
-    secretHeaders: {},
-    credentialId: null,
+    environment: transport === 'stdio' ? parseSettings(ui.mcpEnvironment.value, '=', 'Environment') : {},
+    headers: transport === 'http' ? parseSettings(ui.mcpHeaders.value, ':', 'Headers') : {},
     placeholders,
     timeoutMs: Number(ui.mcpTimeout.value) * 1000
   };
@@ -1733,6 +1769,14 @@ function applyProposalToForm(proposal) {
   ui.mcpUrl.value = proposal.url ?? '';
   ui.mcpCommand.value = proposal.command ?? '';
   ui.mcpArgs.value = (proposal.args ?? []).join('\n');
+  ui.mcpHeaders.value = formatSettings(proposal.headers, ': ');
+  ui.mcpCwd.value = proposal.cwd ?? '';
+  ui.mcpEnvironment.value = formatSettings(proposal.environment, '=');
+  ui.mcpAdvanced.open = Boolean(
+    Object.keys(proposal.headers ?? {}).length
+    || Object.keys(proposal.environment ?? {}).length
+    || proposal.cwd
+  );
   ui.mcpTimeout.value = String(Math.round((proposal.timeoutMs ?? 30_000) / 1000));
   // A proposal describes the shape; what fills a placeholder is the operator's
   // to choose, so the rows appear unbound and the connector cannot be saved
@@ -1917,8 +1961,9 @@ async function checkProposal(agentId, proposal, token, signal) {
       body: JSON.stringify({ server: proposal }),
       signal
     });
-    const warnings = result.mcp?.validation?.warnings?.length ?? 0;
-    return `Filled in below. Valid for this harness${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
+    const warnings = result.mcp?.validation?.warnings ?? [];
+    for (const warning of warnings) workshopNote('harness', warning.message ?? String(warning), 'warn', token);
+    return `Filled in below. Valid for this harness${warnings.length ? ` with ${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : ''} — that checks the shape, not that the connector works. Review before saving.`;
   } catch (error) {
     workshopNote('harness', error.message, 'warn', token);
     // Only a 400 is the adapter judging the shape. A duplicate name, an unknown
@@ -1984,8 +2029,9 @@ async function validateMcp(serverId) {
   ui.mcpMessage.textContent = 'Validating against this worker harness and command policy…';
   try {
     const result = await api(agentApi('mcp/validate'), { method: 'POST', body: JSON.stringify({ serverId }) });
-    const warnings = result.mcp?.validation?.warnings?.length ?? 0;
-    ui.mcpMessage.textContent = `Valid for ${adapterLabel(currentAgent.adapter)}${warnings ? ` with ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}.`;
+    const warnings = result.mcp?.validation?.warnings ?? [];
+    const detail = warnings.map((warning) => warning.message ?? String(warning)).join(' · ');
+    ui.mcpMessage.textContent = `Valid for ${adapterLabel(currentAgent.adapter)}${detail ? `. Warning: ${detail}` : '.'}`;
   } catch (error) {
     ui.mcpMessage.textContent = error.message;
   }
@@ -2729,9 +2775,7 @@ function credentialRow(credential) {
       <button class="text-button danger-text credential-delete" type="button">Delete</button>
     </div>`;
   row.querySelector('strong').textContent = credential.name;
-  row.querySelector('small').textContent = credential.header
-    ? `${credential.type} · sent as ${credential.header}`
-    : credential.type;
+  row.querySelector('small').textContent = credential.type;
   // A key created by writing a placeholder has no value yet. Saying so on the
   // row is the whole point of letting it exist in that state.
   const hint = row.querySelector('.credential-hint');
@@ -2863,18 +2907,6 @@ function registryMeta(server) {
       return `${name} ← ${CONNECTOR_SECRET_PREFIX}${binding.name} in the container`;
     }).join(' · ');
   }
-  const refs = mcpSecretReferences(server);
-  if (refs.length) return `Connector secret${refs.length === 1 ? '' : 's'}: ${refs.join(', ')}`;
-  if (server.credentialId) {
-    const credential = storedCredentials.find((item) => item.id === server.credentialId);
-    if (credential) return `Credential ${credential.name} · sent as ${credential.header} to ${credential.hosts.join(', ')}`;
-    // Unknown is not the same as gone. Saying "no longer stored" before the keys
-    // have loaded, or when loading them failed, states a negative we cannot know —
-    // and both halves of this page load concurrently, so it happened every time.
-    return credentialsLoaded
-      ? `Credential ${server.credentialId} · no longer stored`
-      : `Credential ${server.credentialId} · checking`;
-  }
   return `Timeout ${Math.round(server.timeoutMs / 1000)}s · no credential references`;
 }
 
@@ -2914,9 +2946,6 @@ function openCredentialDialog(credential = null) {
   ui.credentialId.value = credential?.id ?? '';
   ui.credentialDialogTitle.textContent = credential ? `Edit ${credential.name}` : 'New credential';
   ui.credentialName.value = credential?.name ?? '';
-  // Empty for a key that has none, rather than writing a default back into a
-  // field the dialog keeps folded away.
-  ui.credentialHeader.value = credential ? credential.header ?? '' : '';
   ui.credentialHosts.value = (credential?.hosts ?? []).join('\n');
   // Editing cannot show the value, so the field means "replace it" rather than
   // "here is what it is".
@@ -2937,7 +2966,6 @@ async function saveCredential(event) {
   const body = {
     name: ui.credentialName.value.trim(),
     type: 'api-key',
-    header: ui.credentialHeader.value.trim() || null,
     hosts
   };
   if (ui.credentialValue.value) body.value = ui.credentialValue.value;
@@ -2969,6 +2997,9 @@ async function deleteCredential(credential) {
 
 ui.mcpArgs.addEventListener('input', renderPlaceholderRows);
 ui.mcpUrl.addEventListener('input', renderPlaceholderRows);
+ui.mcpHeaders.addEventListener('input', renderPlaceholderRows);
+ui.mcpCwd.addEventListener('input', renderPlaceholderRows);
+ui.mcpEnvironment.addEventListener('input', renderPlaceholderRows);
 ui.workshopRun?.addEventListener('click', runWorkshop);
 ui.newRegistryMcp?.addEventListener('click', () => openMcpDialog());
 ui.newCredential.addEventListener('click', () => openCredentialDialog());

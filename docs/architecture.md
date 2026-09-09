@@ -13,7 +13,7 @@ flowchart TB
     ControlMcp["Control-plane MCP · official TypeScript SDK\nSafe fleet + durable delegation tools"]
     Auth["Platform identity + policy\nOIDC/PKCE · sessions · roles/scopes"]
     AuthDb[("SQLite\nRevocable browser sessions")]
-    Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
+    Registry["Schema-v4 JSON registry\nAgents · runtimes · MCP definitions/bindings · stored keys"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
     ScheduleDb[("SQLite\nSchedules · occurrence claims · run history")]
@@ -71,8 +71,8 @@ flowchart TB
   API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  McpService -->|"same servers payload"| WA
-  McpService -->|"same servers payload"| WB
+  McpService -->|"canonical servers + ephemeral placeholder values"| WA
+  McpService -->|"canonical servers + ephemeral placeholder values"| WB
   WA --> MCP
   WB --> MCP
   ControlMcp --- Guard
@@ -83,12 +83,12 @@ flowchart TB
 | Layer | Current stack |
 |---|---|
 | Browser | Current: semantic HTML5, hand-written CSS, vanilla JavaScript ES modules, Fetch API, fleet and scheduled-job working surfaces, and visibility-aware 3-second polling. Planned: React + TypeScript + Vite after an explicit React/Vue spike. |
-| Control plane | Node.js 22, built-in `http`, `crypto`, and `node:sqlite`; official MCP TypeScript SDK; OIDC/PKCE identity and centralized policy; schema-v3 filesystem-backed JSON registry; durable schedule and MCP delegation services; provider-neutral worker MCP configuration service; streaming Fetch proxy; Docker Engine Unix-socket client |
+| Control plane | Node.js 22, built-in `http`, `crypto`, and `node:sqlite`; official MCP TypeScript SDK; OIDC/PKCE identity and centralized policy; schema-v4 filesystem-backed JSON registry; durable schedule and MCP delegation services; provider-neutral worker MCP configuration service; streaming Fetch proxy; Docker Engine Unix-socket client |
 | Worker wrapper | Node.js 22, built-in `http`, `child_process`, filesystem persistence |
 | Provider harnesses | Official `@openai/codex`, `@anthropic-ai/claude-code`, and `opencode-ai` CLI distributions |
 | Internal protocol | `agent-wrapper/v1`; REST/JSON for control and NDJSON for task streams |
 | Runtime/isolation | Dockerfiles + private network; every managed agent owns an exclusive container, worker identity/secret, CLI-binary volume, auth/config volume, telemetry volume, and workspace volume. Managed traffic uses short-lived scope- and audience-bound JWTs. Concurrent runtime attachment is rejected. A runtime's container can be replaced from the current image while retaining all four volumes, so new worker code does not cost a provider login. Containers are addressed by their stable name rather than their ID, which changes on replacement. |
-| Persistence | Current: schema-v3 JSON agent/runtime/MCP registry, SQLite schedule/occurrence/run-history, delegated-task lineage/results, and revocable browser-session databases, plus unique Docker named volumes per managed agent. Planned: migrate the JSON registry behind the same Postgres-ready repository boundary. |
+| Persistence | Current: schema-v4 JSON agent/runtime/MCP/key registry, SQLite schedule/occurrence/run-history, delegated-task lineage/results, and revocable browser-session databases, plus unique Docker named volumes per managed agent. Planned: migrate the JSON registry behind the same Postgres-ready repository boundary. |
 | Usage telemetry | Per-request tokens from every adapter; Codex quota windows and account activity via app-server; Claude Code quota windows only through an opt-in experimental OAuth source that is off by default |
 | Authentication | Platform: explicit trusted-local development mode or OIDC Authorization Code + PKCE, signed server-side sessions, centralized roles/scopes, and separately audience-bound REST/MCP bearer tokens. MCP is unavailable in trusted-local mode; agent identities also require a code-level tool/target policy. Provider: Codex device authorization; Claude browser OAuth with an ephemeral, non-persisted completion-code handoff; OpenCode provider auth with GitHub Copilot device authorization as the POC default. The two identity planes are never exchanged. |
 | Tests | Node.js built-in test runner plus live Docker/API/browser smoke tests |

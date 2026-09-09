@@ -88,7 +88,7 @@ test('a placeholder in an argument is filled from a stored key at spawn time', a
   });
 
   const credential = (await (await post('/api/v1/credentials', {
-    name: 'local-key', header: 'X-Api-Key', hosts: ['unused.example.test'], value: 'sk-live-IN-AN-ARGUMENT'
+    name: 'local-key', hosts: ['unused.example.test'], value: 'sk-live-IN-AN-ARGUMENT'
   })).json()).credential;
 
   const created = await post('/api/v1/mcp/servers', {
@@ -274,68 +274,6 @@ test('the authority scanner reads the same region a url parser does', () => {
   assert.equal(urlAuthorityPlaceholder(null), null);
 });
 
-test('a credential id and a placeholder of the same name each get their own value', async (t) => {
-  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-keyspace-'));
-  const configDir = join(temporary, 'worker-config');
-  const token = 'keyspace-token';
-  const worker = createWorkerServer({
-    token,
-    adapter: 'claude-code',
-    demoMode: true,
-    workspace: '/workspace',
-    dataPath: null,
-    mcpStatePath: join(temporary, 'state.json'),
-    mcpConfigDir: configDir
-  });
-  const workerUrl = await listen(worker);
-  const control = createControlPlane({
-    workerUrl,
-    workerToken: token,
-    dataPath: null,
-    credentialKeyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: Buffer.alloc(32, 4).toString('base64') })
-  });
-  const controlUrl = await listen(control);
-  t.after(async () => {
-    await Promise.all([
-      new Promise((resolve) => control.close(resolve)),
-      new Promise((resolve) => worker.close(resolve))
-    ]);
-    await rm(temporary, { recursive: true, force: true });
-  });
-  const post = (path, body) => fetch(`${controlUrl}${path}`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
-  });
-
-  // Any hyphen-free lowercase credential id is also a legal placeholder name, so
-  // one delivery map served both and the later connector won — quietly handing a
-  // key to a connector that never asked for it.
-  const legacy = (await (await post('/api/v1/credentials', {
-    name: 'sharedname', header: 'X-Legacy', hosts: ['legacy.example.test'], value: 'sk-live-LEGACY-VALUE'
-  })).json()).credential;
-  const viaPlaceholder = (await (await post('/api/v1/credentials', {
-    name: 'other-key', hosts: ['placeheld.example.test'], value: 'sk-live-PLACEHOLDER-VALUE'
-  })).json()).credential;
-  assert.equal(legacy.id, 'sharedname');
-
-  const legacyServer = (await (await post('/api/v1/mcp/servers', {
-    name: 'legacy-connector', transport: 'http', url: 'https://legacy.example.test/mcp', credentialId: legacy.id
-  })).json()).server;
-  const placeheldServer = (await (await post('/api/v1/mcp/servers', {
-    name: 'placeheld-connector',
-    transport: 'http',
-    url: 'https://placeheld.example.test/mcp?k=${sharedname}',
-    placeholders: { sharedname: { source: 'credential', credentialId: viaPlaceholder.id } }
-  })).json()).server;
-
-  assert.equal((await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: legacyServer.id, apply: false })).status, 201);
-  assert.equal((await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: placeheldServer.id, apply: true })).status, 201);
-
-  const rendered = JSON.parse(await readFile(join(configDir, 'claude.json'), 'utf8'));
-  // Each connector gets the key it asked for, not whichever was resolved last.
-  assert.equal(rendered.mcpServers['legacy-connector'].headers['X-Legacy'], 'sk-live-LEGACY-VALUE');
-  assert.match(rendered.mcpServers['placeheld-connector'].url, /k=sk-live-PLACEHOLDER-VALUE/);
-});
-
 test('a restarted worker reports a placeholder-only connector as waiting', async (t) => {
   const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-pending-'));
   const statePath = join(temporary, 'state.json');
@@ -378,10 +316,8 @@ test('a restarted worker reports a placeholder-only connector as waiting', async
   assert.equal((await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: server.id, apply: true })).status, 201);
   await new Promise((resolve) => worker.close(resolve));
 
-  // A restart empties the delivery. The connector has no credentialId — it
-  // authenticates only through a placeholder — and used to be reported as
-  // nothing pending, so the control plane believed the agent was whole until a
-  // task died with missing_credential.
+  // A restart empties the delivery. The control plane must see that the
+  // placeholder-bound key is pending before a task dies with missing_credential.
   const restarted = createWorkerServer(options);
   const restartedUrl = await listen(restarted);
   t.after(() => new Promise((resolve) => restarted.close(resolve)));

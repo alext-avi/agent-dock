@@ -1,30 +1,21 @@
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PLACEHOLDER = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/;
 
-function secretEnvironment(value, warnings) {
+function placeholderMap(value, warnings, field) {
   const entries = value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [];
   const result = {};
-  for (const [target, reference] of entries) {
-    const sourceEnv = typeof reference === 'string' ? reference : reference?.sourceEnv;
-    if (!ENVIRONMENT_NAME.test(target) || !ENVIRONMENT_NAME.test(sourceEnv ?? '')) {
-      warnings.push('An invalid secret environment reference was discarded.');
+  for (const [name, raw] of entries) {
+    const nameValid = field === 'environment' ? ENVIRONMENT_NAME.test(name) : Boolean(name) && !/\0|[\r\n]/.test(name);
+    const valueValid = typeof raw === 'string' && raw.length <= 4000 && !/\0|[\r\n]/.test(raw);
+    if (!nameValid || !valueValid) {
+      warnings.push(`An invalid ${field} entry was discarded.`);
       continue;
     }
-    result[target] = { sourceEnv };
-  }
-  return result;
-}
-
-function secretHeaders(value, warnings) {
-  const entries = value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [];
-  const result = {};
-  for (const [header, reference] of entries) {
-    const sourceEnv = typeof reference === 'string' ? reference : reference?.sourceEnv;
-    const prefix = typeof reference === 'object' && typeof reference?.prefix === 'string' ? reference.prefix : '';
-    if (!header || !ENVIRONMENT_NAME.test(sourceEnv ?? '') || /\0|[\r\n]/.test(header) || /\0|[\r\n]/.test(prefix)) {
-      warnings.push('An invalid secret header reference was discarded.');
+    if (!PLACEHOLDER.test(raw)) {
+      warnings.push(`Literal ${field} values were removed; use a \${PLACEHOLDER} instead.`);
       continue;
     }
-    result[header] = { sourceEnv, prefix };
+    result[name] = raw.trim();
   }
   return result;
 }
@@ -44,25 +35,21 @@ Investigate the connector using the tools and outbound network available inside 
 
 Determine the correct transport, endpoint or executable, arguments, and timeout.
 
-Where the connector needs a secret, write a placeholder in the form \${NAME} at the exact position the value belongs — in an argument, or in the url. Use a descriptive upper-case name, for example \${ACCESS_TOKEN}. Agent Dock fills a placeholder in at the moment the connector starts, so it goes exactly where the real value would go — an argument list of "--token" then "\${ACCESS_TOKEN}" — not a separate mapping.
+Where the connector needs a secret, write a placeholder in the form \${NAME} at the exact position the value belongs — in an argument, URL, header, environment value, or working directory. Use a descriptive upper-case name, for example \${ACCESS_TOKEN}. Agent Dock fills a placeholder in at the moment the connector starts, so it goes exactly where the real value would go — for example an Authorization header of "Bearer \${ACCESS_TOKEN}" — not a separate secret mapping.
 
 Do not decide what fills it. The operator binds each placeholder to a key Agent Dock stores or to a secret provisioned inside the agent's container, and that choice is theirs. Never put a token, cookie, password or key value anywhere in the proposal — a placeholder is how you say a secret is needed. If the connector needs no secret, use no placeholders and say so.
-
-Put placeholders only in args or url. Leave headers, environment, secretHeaders and secretEnvironment empty: the operator's interface does not edit headers, so a header you propose cannot be reviewed and will be discarded.
 
 End your response with exactly one proposal between these tags:
 <agent-dock-mcp-proposal>
 {
   "name": "lowercase_connector_name",
-  "transport": "stdio",
-  "command": "npx",
-  "args": ["-y", "@example/mcp-server", "--token", "\${ACCESS_TOKEN}"],
+  "transport": "http",
+  "command": null,
+  "args": [],
   "cwd": null,
-  "url": null,
+  "url": "https://mcp.example.com/mcp",
   "environment": {},
-  "secretEnvironment": {},
-  "headers": {},
-  "secretHeaders": {},
+  "headers": { "Authorization": "Bearer \${ACCESS_TOKEN}" },
   "timeoutMs": 30000
 }
 </agent-dock-mcp-proposal>
@@ -89,9 +76,19 @@ export function extractMcpWorkshopProposal(output) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('The harness proposal must be a JSON object.');
 
   const warnings = [];
-  if (raw.environment && Object.keys(raw.environment).length) warnings.push('Literal environment values were removed; use worker secret references.');
-  if (raw.headers && Object.keys(raw.headers).length) warnings.push('Literal header values were removed; use worker secret references.');
   const transport = raw.transport === 'stdio' ? 'stdio' : 'http';
+  if (transport === 'http' && raw.environment && Object.keys(raw.environment).length) {
+    warnings.push('Environment values were removed because HTTP connectors do not use a process environment.');
+  }
+  if (transport === 'stdio' && raw.headers && Object.keys(raw.headers).length) {
+    warnings.push('Header values were removed because stdio connectors do not make an HTTP request.');
+  }
+  for (const field of ['credentialId', 'secretHeaders', 'secretEnvironment']) {
+    const value = raw[field];
+    if (value !== undefined && value !== null && (typeof value !== 'object' || Object.keys(value).length)) {
+      warnings.push(`${field} was removed because placeholder bindings are the only credential mechanism.`);
+    }
+  }
   const args = Array.isArray(raw.args)
     ? raw.args.map((value) => boundedString(value, '', 2000)).filter(Boolean).slice(0, 64)
     : [];
@@ -103,58 +100,11 @@ export function extractMcpWorkshopProposal(output) {
     args: transport === 'stdio' ? args : [],
     cwd: transport === 'stdio' ? boundedString(raw.cwd, null, 1000) : null,
     url: transport === 'http' ? boundedString(raw.url, '', 2000) : null,
-    environment: {},
-    secretEnvironment: transport === 'stdio' ? secretEnvironment(raw.secretEnvironment, warnings) : {},
-    headers: {},
-    secretHeaders: transport === 'http' ? secretHeaders(raw.secretHeaders, warnings) : {},
+    environment: transport === 'stdio' ? placeholderMap(raw.environment, warnings, 'environment') : {},
+    headers: transport === 'http' ? placeholderMap(raw.headers, warnings, 'header') : {},
     timeoutMs: Number.isInteger(timeout) && timeout >= 1000 && timeout <= 300_000 ? timeout : 30_000
   };
   return { proposal, warnings: [...new Set(warnings)] };
-}
-
-function cloneMap(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, entry && typeof entry === 'object' ? { ...entry } : entry]))
-    : {};
-}
-
-export function mergeMcpQuickEdit(base = {}, quick = {}) {
-  const transport = quick.transport === 'stdio' ? 'stdio' : 'http';
-  const sameTransport = base.transport === transport;
-  const environment = sameTransport ? cloneMap(base.environment) : {};
-  const headers = sameTransport ? cloneMap(base.headers) : {};
-  const secretEnvironmentMap = sameTransport ? cloneMap(base.secretEnvironment) : {};
-  const secretHeadersMap = sameTransport ? cloneMap(base.secretHeaders) : {};
-
-  if (transport === 'stdio') {
-    const original = Object.entries(secretEnvironmentMap)[0];
-    if (original) delete secretEnvironmentMap[original[0]];
-    if (quick.secretTarget && quick.secretSource) {
-      secretEnvironmentMap[quick.secretTarget] = { sourceEnv: quick.secretSource };
-    }
-  } else {
-    const original = Object.entries(secretHeadersMap).find(([header, value]) => (
-      header.toLowerCase() === 'authorization' && value?.prefix === 'Bearer '
-    ));
-    if (original) delete secretHeadersMap[original[0]];
-    if (quick.bearerEnv) {
-      secretHeadersMap.Authorization = { sourceEnv: quick.bearerEnv, prefix: 'Bearer ' };
-    }
-  }
-
-  return {
-    name: quick.name ?? '',
-    transport,
-    command: transport === 'stdio' ? quick.command ?? '' : null,
-    args: transport === 'stdio' ? quick.args ?? [] : [],
-    cwd: transport === 'stdio' && sameTransport ? base.cwd ?? null : null,
-    url: transport === 'http' ? quick.url ?? '' : null,
-    environment: transport === 'stdio' ? environment : {},
-    secretEnvironment: transport === 'stdio' ? secretEnvironmentMap : {},
-    headers: transport === 'http' ? headers : {},
-    secretHeaders: transport === 'http' ? secretHeadersMap : {},
-    timeoutMs: quick.timeoutMs ?? 30_000
-  };
 }
 
 export function createWorkshopRunState() {

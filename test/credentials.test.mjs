@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControlPlane } from '../control-plane/server.mjs';
 import { createMcpService } from '../control-plane/mcp-service.mjs';
+import { deliveryKey } from '../control-plane/placeholders.mjs';
 import {
   createCredentialStore,
   environmentKeyProvider,
@@ -27,10 +31,18 @@ function store() {
 const apiKey = (overrides = {}) => ({
   name: 'company-docs',
   type: 'api-key',
-  header: 'X-Api-Key',
   hosts: ['mcp.example.com'],
   value: 'sk-live-abcdef123456',
   ...overrides
+});
+
+const connectorWithCredential = (name, url, credentialId) => ({
+  name,
+  transport: 'http',
+  url,
+  headers: { Authorization: 'Bearer ${ACCESS_TOKEN}' },
+  placeholders: { ACCESS_TOKEN: { source: 'credential', credentialId } },
+  timeoutMs: 30_000
 });
 
 test('a credential value is never returned once saved', async () => {
@@ -87,7 +99,7 @@ test('a credential is only released for a host it was issued for', async () => {
   const created = await credentials.create(apiKey({ hosts: ['mcp.example.com', '*.internal.example.net'] }));
 
   const released = credentials.resolveForHost(created.id, 'https://mcp.example.com/mcp');
-  assert.deepEqual(released, { header: 'X-Api-Key', value: 'sk-live-abcdef123456' });
+  assert.deepEqual(released, { value: 'sk-live-abcdef123456' });
 
   // Wildcard covers a subdomain but not the bare suffix.
   assert.ok(credentials.resolveForHost(created.id, 'https://tools.internal.example.net/mcp'));
@@ -123,11 +135,10 @@ test('host matching is not a substring check', async () => {
 test('a key needs a name and little else, and says what it is limited to', async () => {
   const { credentials } = store();
 
-  // A name and a value is the whole requirement. A header only mattered when a
-  // credential was delivered as one; a placeholder puts the value where it is
-  // written, so it is optional. So is the host list.
+  // A name and a value is the whole requirement. Placement belongs to the
+  // connector placeholder; the host list is optional.
   const plain = await credentials.create({ name: 'plain-key', value: 'sk-plain-000011112222' });
-  assert.equal(plain.header, null);
+  assert.equal(plain.header, undefined);
   assert.deepEqual(plain.hosts, []);
   assert.equal(plain.complete, true);
   // And it says plainly that nothing limits it, rather than leaving an empty
@@ -139,7 +150,7 @@ test('a key needs a name and little else, and says what it is limited to', async
 
   // What is still refused is malformed, not merely absent.
   await assert.rejects(() => credentials.create({ name: 'bad-hosts', value: 'x'.repeat(20), hosts: ['not a hostname'] }), /is not a hostname/);
-  await assert.rejects(() => credentials.create({ name: 'bad-header', value: 'x'.repeat(20), header: 'Bad Header' }), /valid HTTP header/);
+  await assert.rejects(() => credentials.create({ name: 'old-header', value: 'x'.repeat(20), header: 'X-Api-Key' }), /no longer stored/);
   await assert.rejects(() => credentials.create({ name: 'bad-type', value: 'x'.repeat(20), type: 'oauth' }), /type must be one of/);
   await assert.rejects(() => credentials.create({ name: 'no name at all'.repeat(20), value: 'x' }), /too long|alphanumeric/);
 });
@@ -271,17 +282,40 @@ test('credentials can be managed over the API without the value coming back', as
   assert.equal((await (await fetch(`${url}/api/v1/credentials`)).json()).credentials.length, 0);
 });
 
+test('a key waiting for its value survives a control-plane restart', async (t) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-dock-incomplete-key-'));
+  const dataPath = join(temporary, 'registry.json');
+  const options = {
+    workerUrl: 'http://127.0.0.1:1',
+    workerToken: 'unused',
+    dataPath,
+    credentialKeyProvider: environmentKeyProvider({ CREDENTIAL_ENCRYPTION_KEY: KEY })
+  };
+  let server = createControlPlane(options);
+  let url = await listen(server);
+  t.after(async () => {
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    await rm(temporary, { recursive: true, force: true });
+  });
+
+  const created = await post(`${url}/api/v1/credentials`, { name: 'waiting-key' });
+  assert.equal(created.status, 201);
+  assert.equal((await created.json()).credential.complete, false);
+
+  await new Promise((resolve) => server.close(resolve));
+  server = createControlPlane(options);
+  url = await listen(server);
+  const listed = await (await fetch(`${url}/api/v1/credentials`)).json();
+  assert.equal(listed.credentials.length, 1);
+  assert.equal(listed.credentials[0].name, 'waiting-key');
+  assert.equal(listed.credentials[0].complete, false);
+});
+
 test('a credential still attached to a connector cannot be deleted', async (t) => {
   const url = await controlPlane(t);
   const credential = (await (await post(`${url}/api/v1/credentials`, apiKey())).json()).credential;
 
-  const attached = await post(`${url}/api/v1/mcp/servers`, {
-    name: 'company-docs',
-    transport: 'http',
-    url: 'https://mcp.example.com/mcp',
-    timeoutMs: 30_000,
-    credentialId: credential.id
-  });
+  const attached = await post(`${url}/api/v1/mcp/servers`, connectorWithCredential('company-docs', 'https://mcp.example.com/mcp', credential.id));
   assert.equal(attached.status, 201);
 
   const refused = await fetch(`${url}/api/v1/credentials/${credential.id}?confirmation=${credential.name}`, { method: 'DELETE' });
@@ -306,32 +340,22 @@ test('the API refuses credential work when no key is configured', async (t) => {
 test('a connector cannot reference a credential that does not exist', async (t) => {
   const url = await controlPlane(t);
 
-  const refused = await post(`${url}/api/v1/mcp/servers`, {
-    name: 'ghost',
-    transport: 'http',
-    url: 'https://mcp.example.com/mcp',
-    timeoutMs: 30_000,
-    credentialId: 'no-such-credential'
-  });
+  const refused = await post(`${url}/api/v1/mcp/servers`, connectorWithCredential('ghost', 'https://mcp.example.com/mcp', 'no-such-credential'));
   assert.equal(refused.status, 400, 'a dangling reference should fail when written, not at apply time');
   assert.match((await refused.json()).error, /does not exist/);
 });
 
-test('a connector uses a credential or a secret header, not both', async (t) => {
+test('legacy credential fields are rejected rather than silently ignored', async (t) => {
   const url = await controlPlane(t);
-  const credential = (await (await post(`${url}/api/v1/credentials`, apiKey())).json()).credential;
-
   const refused = await post(`${url}/api/v1/mcp/servers`, {
     name: 'ambiguous',
     transport: 'http',
     url: 'https://mcp.example.com/mcp',
     timeoutMs: 30_000,
-    credentialId: credential.id,
     secretHeaders: { Authorization: { sourceEnv: 'SOMETHING', prefix: 'Bearer ' } }
   });
-  // Two mechanisms deciding one header, with no rule for which wins.
   assert.equal(refused.status, 400);
-  assert.match((await refused.json()).error, /not both/);
+  assert.match((await refused.json()).error, /secretHeaders is no longer supported/);
 });
 
 
@@ -359,21 +383,20 @@ test('a credential reaches the worker only for the connector that uses it', asyn
     persist: async () => {},
     credentials,
     workerRequest: async (agent, method, path, body) => {
-      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true, placeholders: true } } };
       delivered.push(body);
       return { mcp: { servers: body.servers } };
     }
   });
 
-  await service.createServer({
-    name: 'docs-connector', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: docs.id
-  });
+  const server = await service.createServer(connectorWithCredential('docs-connector', 'https://mcp.example.com/mcp', docs.id));
   await service.bind('agent-1', 'docs-connector', { apply: false });
   await service.applyAgent('agent-1');
 
   const payload = delivered.at(-1);
-  assert.deepEqual(Object.keys(payload.credentials), [docs.id], 'the worker received a credential it does not use');
-  assert.equal(payload.credentials[docs.id].value, 'sk-docs-111111111111');
+  const address = deliveryKey(server, 'ACCESS_TOKEN');
+  assert.deepEqual(Object.keys(payload.credentials), [address], 'the worker received a credential it does not use');
+  assert.equal(payload.credentials[address].value, 'sk-docs-111111111111');
   assert.ok(!JSON.stringify(payload).includes('sk-unused-2222222222'), 'an unrelated credential was delivered');
   assert.equal(unused.id in payload.credentials, false);
 });
@@ -397,18 +420,16 @@ test('editing a connector url cannot redirect its credential', async (t) => {
     persist: async () => {},
     credentials,
     workerRequest: async (agent, method, path, body) => {
-      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true, placeholders: true } } };
       lastBody = body;
       return { mcp: {} };
     }
   });
 
-  await service.createServer({
-    name: 'docs', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: credential.id
-  });
+  const server = await service.createServer(connectorWithCredential('docs', 'https://mcp.example.com/mcp', credential.id));
   await service.bind('agent-1', 'docs', { apply: false });
   await service.applyAgent('agent-1');
-  assert.ok(lastBody.credentials[credential.id], 'the permitted destination should resolve');
+  assert.ok(lastBody.credentials[deliveryKey(server, 'ACCESS_TOKEN')], 'the permitted destination should resolve');
 
   // The exfiltration shape: keep the credential, change where it is sent.
   lastBody = null;
@@ -444,14 +465,12 @@ test('widening a credential host list cannot redirect it without the value', asy
     persist: async () => {},
     credentials,
     workerRequest: async (agent, method, path, body) => {
-      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true } } };
+      if (method === 'GET') return { mcp: { capabilities: { credentialDelivery: true, placeholders: true } } };
       lastBody = body;
       return { mcp: {} };
     }
   });
-  await service.createServer({
-    name: 'docs', transport: 'http', url: 'https://mcp.example.com/mcp', timeoutMs: 30_000, credentialId: credential.id
-  });
+  await service.createServer(connectorWithCredential('docs', 'https://mcp.example.com/mcp', credential.id));
   await service.bind('agent-1', 'docs', { apply: false });
 
   // Step one of the exploit: move the allowlist to the destination you want.

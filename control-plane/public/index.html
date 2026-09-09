@@ -403,10 +403,6 @@
         <p class="dialog-copy">The value is write-only. Once saved it is never displayed or returned again — only the last four characters, so you can recognise a key you already hold.</p>
         <label class="field">Name<input id="credential-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="company-docs"></label>
         <label class="field">Permitted hosts <span>optional; one per line. Checked against a connector's URL when it is saved — not egress control, and not consulted for a local process. Hostnames resolve inside the agent's container, so a proxy elsewhere is its container name or <code>host.docker.internal</code>, never <code>127.0.0.1</code>.</span><textarea id="credential-hosts" rows="3" placeholder="mcp.example.com&#10;*.internal.example.net"></textarea></label>
-        <details class="credential-advanced">
-          <summary>Send as a header (older connectors only)</summary>
-          <label class="field">Header <span>not needed when a connector uses a placeholder</span><input id="credential-header" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="X-Api-Key"></label>
-        </details>
         <label class="field">Value <span id="credential-value-hint">pasted once, never shown again</span><input id="credential-value" type="password" autocomplete="off" maxlength="4096" placeholder="paste the key"></label>
         <p id="credential-message" class="usage-error hidden"></p>
         <div class="dialog-actions">
@@ -424,7 +420,7 @@
 
         <section id="workshop" class="workshop hidden">
           <div class="workshop-head">
-            <div><p class="kicker">ASK A HARNESS</p><small>Describe the connector and let an agent work out its shape. You review everything before it is saved.</small></div>
+            <div><p class="kicker">ASK A HARNESS</p><small>Describe the connector and let an agent work out its shape. It may install and run software inside the selected agent container while investigating; you review everything before it is saved.</small></div>
             <select id="workshop-agent" aria-label="Harness to ask"><option value="">No agents available</option></select>
           </div>
           <label class="field" for="workshop-objective">What should it connect to?<textarea id="workshop-objective" rows="3" maxlength="12000" placeholder="The GitHub MCP server, for reading issues and pull requests."></textarea></label>
@@ -447,6 +443,16 @@
           <label class="field">Arguments <span>one argument per line</span><textarea id="mcp-args" rows="4" placeholder="/opt/mcp/server.mjs"></textarea></label>
           <p class="field-note">Put <code>${NAME}</code> anywhere a secret belongs — usually an argument. You will be asked what fills it.</p>
         </section>
+        <details id="mcp-advanced" class="mcp-advanced">
+          <summary>Advanced connection settings</summary>
+          <div id="mcp-http-advanced" class="mcp-advanced-fields">
+            <label class="field">Headers <span>one per line as Name: value; placeholders are supported</span><textarea id="mcp-headers" rows="3" placeholder="Authorization: Bearer ${ACCESS_TOKEN}"></textarea></label>
+          </div>
+          <div id="mcp-stdio-advanced" class="mcp-advanced-fields hidden">
+            <label class="field">Working directory <span>must be inside /workspace; placeholders are supported</span><input id="mcp-cwd" placeholder="/workspace/project"></label>
+            <label class="field">Environment <span>one per line as NAME=value; placeholders are supported</span><textarea id="mcp-environment" rows="3" placeholder="SERVICE_TOKEN=${ACCESS_TOKEN}"></textarea></label>
+          </div>
+        </details>
         <label class="field">Connection timeout <span>seconds</span><input id="mcp-timeout" type="number" min="1" max="300" value="30"></label>
         <p id="mcp-form-message" class="usage-error hidden"></p>
         <fieldset id="mcp-placeholders" class="auth-block hidden">

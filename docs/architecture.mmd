@@ -8,7 +8,7 @@ flowchart TB
     ControlMcp["Control-plane MCP · official TypeScript SDK\nSafe fleet + durable delegation tools"]
     Auth["Platform identity + policy\nOIDC/PKCE · sessions · roles/scopes"]
     AuthDb[("SQLite\nRevocable browser sessions")]
-    Registry["Schema-v3 JSON registry\nAgents · runtimes · MCP definitions/bindings"]
+    Registry["Schema-v4 JSON registry\nAgents · runtimes · MCP definitions/bindings · stored keys"]
     McpService["Provider-neutral MCP service\nRound-trippable desired state"]
     Scheduler["Durable job scheduler\nOne-off + 5-field cron · IANA timezone · leases"]
     ScheduleDb[("SQLite\nSchedules · occurrence claims · run history")]
@@ -66,8 +66,8 @@ flowchart TB
   API -.-> Legacy
   UI -.->|"staged migration"| React
   Registry -.->|"data migration"| Database
-  McpService -->|"same servers payload"| WA
-  McpService -->|"same servers payload"| WB
+  McpService -->|"canonical servers + ephemeral placeholder values"| WA
+  McpService -->|"canonical servers + ephemeral placeholder values"| WB
   WA --> MCP
   WB --> MCP
   ControlMcp --- Guard

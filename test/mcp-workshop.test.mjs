@@ -5,7 +5,6 @@ import {
   buildMcpWorkshopPrompt,
   createWorkshopRunState,
   extractMcpWorkshopProposal,
-  mergeMcpQuickEdit,
   observeWorkshopRunEvent,
   requireSuccessfulWorkshopRun
 } from '../control-plane/public/mcp-workshop.js';
@@ -28,7 +27,10 @@ test('extracts a canonical HTTP proposal and drops literal secrets', () => {
   "transport": "http",
   "url": "https://example.test/mcp",
   "environment": { "LEAK": "literal-secret" },
-  "headers": { "X-Token": "literal-secret" },
+  "headers": {
+    "Authorization": "Bearer \${GITHUB_TOKEN}",
+    "X-Token": "literal-secret"
+  },
   "secretHeaders": {
     "Authorization": { "sourceEnv": "GITHUB_TOKEN", "prefix": "Bearer " }
   },
@@ -44,16 +46,13 @@ test('extracts a canonical HTTP proposal and drops literal secrets', () => {
     cwd: null,
     url: 'https://example.test/mcp',
     environment: {},
-    secretEnvironment: {},
-    headers: {},
-    secretHeaders: {
-      Authorization: { sourceEnv: 'GITHUB_TOKEN', prefix: 'Bearer ' }
-    },
+    headers: { Authorization: 'Bearer ${GITHUB_TOKEN}' },
     timeoutMs: 45000
   });
   assert.deepEqual(result.warnings, [
-    'Literal environment values were removed; use worker secret references.',
-    'Literal header values were removed; use worker secret references.'
+    'Environment values were removed because HTTP connectors do not use a process environment.',
+    'secretHeaders was removed because placeholder bindings are the only credential mechanism.',
+    'Literal header values were removed; use a ${PLACEHOLDER} instead.'
   ]);
   assert.doesNotMatch(JSON.stringify(result), /literal-secret/);
 });
@@ -66,9 +65,10 @@ test('extracts a fenced stdio proposal and normalizes unsafe fields', () => {
   "command": "node",
   "args": ["server.mjs", "--safe"],
   "cwd": "/workspace/connectors",
-  "secretEnvironment": {
-    "SERVICE_TOKEN": "WORKER_SERVICE_TOKEN",
-    "bad-name": "NOT VALID"
+  "environment": {
+    "SERVICE_TOKEN": "\${WORKER_SERVICE_TOKEN}",
+    "bad-name": "\${NOT_VALID}",
+    "LOG_LEVEL": "debug"
   },
   "timeoutMs": 100
 }
@@ -77,11 +77,10 @@ test('extracts a fenced stdio proposal and normalizes unsafe fields', () => {
   assert.equal(result.proposal.transport, 'stdio');
   assert.equal(result.proposal.command, 'node');
   assert.deepEqual(result.proposal.args, ['server.mjs', '--safe']);
-  assert.deepEqual(result.proposal.secretEnvironment, {
-    SERVICE_TOKEN: { sourceEnv: 'WORKER_SERVICE_TOKEN' }
-  });
+  assert.deepEqual(result.proposal.environment, { SERVICE_TOKEN: '${WORKER_SERVICE_TOKEN}' });
   assert.equal(result.proposal.timeoutMs, 30000);
-  assert.match(result.warnings.join(' '), /invalid secret environment/i);
+  assert.match(result.warnings.join(' '), /invalid environment/i);
+  assert.match(result.warnings.join(' '), /literal environment/i);
 });
 
 test('rejects missing, malformed, and non-object proposals', () => {
@@ -94,56 +93,6 @@ test('rejects missing, malformed, and non-object proposals', () => {
     () => extractMcpWorkshopProposal('<agent-dock-mcp-proposal>[]</agent-dock-mcp-proposal>'),
     /must be a JSON object/
   );
-});
-
-test('quick edits preserve canonical fields the compact editor does not represent', () => {
-  const result = mergeMcpQuickEdit({
-    transport: 'http',
-    headers: { 'X-Tenant': 'acme' },
-    secretHeaders: {
-      Authorization: { sourceEnv: 'OLD_TOKEN', prefix: 'Bearer ' },
-      'X-Api-Key': { sourceEnv: 'API_KEY', prefix: '' }
-    }
-  }, {
-    name: 'remote_tools',
-    transport: 'http',
-    url: 'https://example.test/mcp',
-    bearerEnv: 'NEW_TOKEN',
-    timeoutMs: 45000
-  });
-
-  assert.deepEqual(result.headers, { 'X-Tenant': 'acme' });
-  assert.deepEqual(result.secretHeaders, {
-    'X-Api-Key': { sourceEnv: 'API_KEY', prefix: '' },
-    Authorization: { sourceEnv: 'NEW_TOKEN', prefix: 'Bearer ' }
-  });
-});
-
-test('quick stdio edits preserve cwd, literals, and additional secret mappings', () => {
-  const result = mergeMcpQuickEdit({
-    transport: 'stdio',
-    cwd: '/workspace/connectors',
-    environment: { LOG_LEVEL: 'warn' },
-    secretEnvironment: {
-      PRIMARY_TOKEN: { sourceEnv: 'OLD_PRIMARY' },
-      SECONDARY_TOKEN: { sourceEnv: 'SECONDARY' }
-    }
-  }, {
-    name: 'local_tools',
-    transport: 'stdio',
-    command: 'node',
-    args: ['server.mjs'],
-    secretTarget: 'PRIMARY_TOKEN',
-    secretSource: 'NEW_PRIMARY',
-    timeoutMs: 30000
-  });
-
-  assert.equal(result.cwd, '/workspace/connectors');
-  assert.deepEqual(result.environment, { LOG_LEVEL: 'warn' });
-  assert.deepEqual(result.secretEnvironment, {
-    SECONDARY_TOKEN: { sourceEnv: 'SECONDARY' },
-    PRIMARY_TOKEN: { sourceEnv: 'NEW_PRIMARY' }
-  });
 });
 
 // A harness investigating a service reports a 401 or a 404 as an error and then
@@ -224,8 +173,7 @@ test('the prompt teaches the placeholder syntax and leaves the binding to the op
   assert.match(prompt, /Do not decide what fills it/);
   assert.match(prompt, /operator binds each placeholder/);
   assert.match(prompt, /Never put a token, cookie, password or key value/);
-  // Headers cannot be reviewed in the dialog, so it must not propose them.
-  assert.match(prompt, /Put placeholders only in args or url/);
+  assert.match(prompt, /argument, URL, header, environment value, or working directory/);
   assert.match(prompt, /the GitHub MCP server/);
 });
 

@@ -353,7 +353,10 @@ export function createControlPlane(options = {}) {
           }
           if (stored.schemaVersion >= 4) {
             for (const record of stored.credentials ?? []) {
-              if (record?.id && record?.name) credentialRecords.set(record.id, record);
+              if (record?.id && record?.name) {
+                const { header: _legacyHeader, ...current } = record;
+                credentialRecords.set(record.id, current);
+              }
             }
           }
           if (stored.schemaVersion >= 3) {
@@ -1067,8 +1070,8 @@ export function createControlPlane(options = {}) {
       // that would have been refused anyway is a worse error than being told why.
       // A key can be used two ways, and checking only one of them made a key
       // bound through a placeholder deletable while a connector still needed it.
-      const usesCredential = (server) => server.credentialId === id
-        || Object.values(server.placeholders ?? {}).some((binding) => binding.source === 'credential' && binding.credentialId === id);
+      const usesCredential = (server) => Object.values(server.placeholders ?? {})
+        .some((binding) => binding.source === 'credential' && binding.credentialId === id);
       const inUse = [...mcpServers.values()].filter(usesCredential).map((server) => server.name);
       if (inUse.length) {
         throw Object.assign(

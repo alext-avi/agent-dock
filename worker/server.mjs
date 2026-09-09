@@ -1105,9 +1105,11 @@ export function createWorkerServer(options = {}) {
     else args.push('--sandbox', 'workspace-write');
     args.push('-');
 
+    const mcpContext = await mcpManager.taskContext(providerEnv);
+
     const child = spawn('codex', args, {
       cwd: config.workspace,
-      env: providerEnv,
+      env: mcpContext.env,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     job.child = child;

@@ -797,6 +797,78 @@ test('the workshop fills the connector form in place and keeps its conversation 
   assert.equal(mine.turns, 2);
 });
 
+test('workshop validation shows warning text and distinguishes a harness rejection', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  let run = 0;
+  await page.route('**/api/v1/agents/*/tasks', (route) => {
+    run += 1;
+    const name = run === 1 ? 'warned-shape' : 'rejected-shape';
+    const taskId = 'validation-' + run;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.started', taskId }),
+        JSON.stringify({
+          apiVersion: 'agent-wrapper/v1',
+          type: 'message.completed',
+          taskId,
+          data: {
+            role: 'assistant',
+            text: '<agent-dock-mcp-proposal>{"name":"' + name + '","transport":"http","url":"https://slightly-off.example.test/mcp","timeoutMs":30000}</agent-dock-mcp-proposal>'
+          }
+        }),
+        JSON.stringify({ apiVersion: 'agent-wrapper/v1', type: 'task.completed', taskId, data: { status: 'succeeded' } })
+      ].join('\n') + '\n'
+    });
+  });
+  await page.route('**/api/v1/agents/*/mcp/validate', (route) => {
+    const body = JSON.parse(route.request().postData() ?? '{}');
+    if (body.server?.name === 'warned-shape') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          mcp: {
+            validation: {
+              warnings: [
+                { message: 'First concrete adapter warning.' },
+                { message: 'Second concrete adapter warning.' }
+              ]
+            }
+          }
+        })
+      });
+    }
+    return route.fulfill({
+      status: 400,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'This header combination is unsupported.' })
+    });
+  });
+
+  await page.click('#new-registry-mcp');
+  await page.waitForSelector('#mcp-dialog[open]');
+  await page.locator('#workshop').waitFor({ state: 'visible' });
+  await page.selectOption('#workshop-agent', app.agents['claude-code'].id);
+  await page.fill('#workshop-objective', 'a connector with adapter warnings');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('with 2 warnings'));
+
+  let log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /First concrete adapter warning/);
+  assert.match(log ?? '', /Second concrete adapter warning/);
+
+  await page.fill('#workshop-objective', 'try the rejected shape instead');
+  await page.click('#run-workshop');
+  await page.waitForFunction(() => document.querySelector('#workshop-status')?.textContent?.includes('rejected the shape'));
+  log = await page.locator('#workshop-log').textContent();
+  assert.match(log ?? '', /This header combination is unsupported/);
+});
+
 test('editing an existing connector does not offer to ask a harness', async (t) => {
   const page = await openPage('/connectors');
   t.after(() => page.close());
@@ -814,6 +886,67 @@ test('editing an existing connector does not offer to ask a harness', async (t) 
   await page.waitForSelector('#mcp-dialog[open]');
   // Editing a known shape is a deliberate act, not a question for a harness.
   assert.equal(await page.locator('#workshop').isVisible(), false);
+});
+
+test('editing preserves every canonical connector field represented by the advanced form', async (t) => {
+  const page = await openPage('/connectors');
+  t.after(() => page.close());
+  await page.waitForSelector('#new-registry-mcp');
+
+  const created = await page.evaluate(async () => {
+    const create = async (body) => (await (await fetch('/api/v1/mcp/servers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-agent-dock-csrf': '1' },
+      body: JSON.stringify(body)
+    })).json()).server;
+    return Promise.all([
+      create({
+        name: 'preserve-http-fields',
+        transport: 'http',
+        url: 'https://preserve-http.example.test/mcp',
+        headers: { 'X-Tenant': 'acme' },
+        timeoutMs: 30_000
+      }),
+      create({
+        name: 'preserve-stdio-fields',
+        transport: 'stdio',
+        command: 'node',
+        args: ['/workspace/server.mjs'],
+        cwd: '/workspace/project',
+        environment: { LOG_LEVEL: 'warn' },
+        timeoutMs: 30_000
+      })
+    ]);
+  });
+  await page.reload();
+
+  let row = page.locator('#registry-list .mcp-row', { hasText: 'preserve-http-fields' });
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.locator('#mcp-advanced').evaluate((node) => node.open), true);
+  assert.equal(await page.inputValue('#mcp-headers'), 'X-Tenant: acme');
+  await page.fill('#mcp-timeout', '45');
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#mcp-dialog').waitFor({ state: 'hidden' });
+  await row.waitFor();
+
+  row = page.locator('#registry-list .mcp-row', { hasText: 'preserve-stdio-fields' });
+  await row.locator('.text-button', { hasText: 'Edit' }).click();
+  await page.waitForSelector('#mcp-dialog[open]');
+  assert.equal(await page.inputValue('#mcp-cwd'), '/workspace/project');
+  assert.equal(await page.inputValue('#mcp-environment'), 'LOG_LEVEL=warn');
+  await page.fill('#mcp-timeout', '45');
+  await page.click('#mcp-form button[type="submit"]');
+  await page.locator('#mcp-dialog').waitFor({ state: 'hidden' });
+
+  const stored = await page.evaluate(async () => (await (await fetch('/api/v1/mcp/servers')).json()).servers);
+  const http = stored.find((server) => server.id === created[0].id);
+  const stdio = stored.find((server) => server.id === created[1].id);
+  assert.deepEqual(http.headers, { 'X-Tenant': 'acme' });
+  assert.equal(http.timeoutMs, 45_000);
+  assert.equal(stdio.cwd, '/workspace/project');
+  assert.deepEqual(stdio.environment, { LOG_LEVEL: 'warn' });
+  assert.equal(stdio.timeoutMs, 45_000);
 });
 
 test('a proposal from a task that failed is refused rather than filled in', async (t) => {
@@ -1042,7 +1175,7 @@ test('a placeholder in an argument asks what fills it, and can use a container s
   const row = page.locator('.placeholder-row').first();
   await row.waitFor();
   assert.match(await row.textContent(), /ACCESS_TOKEN/);
-  assert.match(await row.textContent(), /used in an argument/);
+  assert.match(await row.textContent(), /used in the arguments/);
 
   await row.locator('select').selectOption('__new');
   await row.locator('input').fill('COMPANY_API_TOKEN');

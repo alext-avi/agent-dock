@@ -35,27 +35,6 @@ function stringMap(value, field, { names = false, maxEntries = 32 } = {}) {
   }));
 }
 
-function secretHeaderMap(value) {
-  if (value === undefined || value === null) return {};
-  if (typeof value !== 'object' || Array.isArray(value)) throw failure('secretHeaders must be an object');
-  const entries = Object.entries(value);
-  if (entries.length > 32) throw failure('secretHeaders supports at most 32 entries');
-  return Object.fromEntries(entries.map(([header, raw]) => {
-    const normalizedHeader = text(header, 'secretHeaders key', { required: true, max: 120 });
-    const source = typeof raw === 'string' ? { sourceEnv: raw } : raw;
-    if (!source || typeof source !== 'object' || Array.isArray(source)) {
-      throw failure(`secretHeaders.${normalizedHeader} must name a connector secret provisioned as MCP_SECRET_<NAME>`);
-    }
-    const sourceEnv = text(source.sourceEnv, `secretHeaders.${normalizedHeader}.sourceEnv`, { required: true, max: 120 });
-    if (!ENV_PATTERN.test(sourceEnv)) throw failure(`secretHeaders.${normalizedHeader}.sourceEnv is invalid`);
-    const prefix = source.prefix ?? '';
-    if (typeof prefix !== 'string' || prefix.length > 120 || /\0|[\r\n]/.test(prefix)) {
-      throw failure(`secretHeaders.${normalizedHeader}.prefix must be a bounded single-line string`);
-    }
-    return [normalizedHeader, { sourceEnv, prefix }];
-  }));
-}
-
 const PLACEHOLDER_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // A binding says where one placeholder's value comes from, and nothing else.
@@ -103,20 +82,6 @@ function reconcilePlaceholders(definition) {
   }
 }
 
-function secretEnvironmentMap(value) {
-  if (value === undefined || value === null) return {};
-  if (typeof value !== 'object' || Array.isArray(value)) throw failure('secretEnvironment must be an object');
-  const entries = Object.entries(value);
-  if (entries.length > 32) throw failure('secretEnvironment supports at most 32 entries');
-  return Object.fromEntries(entries.map(([target, raw]) => {
-    if (!ENV_PATTERN.test(target)) throw failure(`secretEnvironment.${target} target is invalid`);
-    const source = typeof raw === 'string' ? raw : raw?.sourceEnv;
-    const sourceEnv = text(source, `secretEnvironment.${target}.sourceEnv`, { required: true, max: 120 });
-    if (!ENV_PATTERN.test(sourceEnv)) throw failure(`secretEnvironment.${target}.sourceEnv is invalid`);
-    return [target, { sourceEnv }];
-  }));
-}
-
 function makeId(name, existingIds) {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70) || 'mcp-server';
   let id = base;
@@ -126,6 +91,14 @@ function makeId(name, existingIds) {
 
 export function normalizeMcpDefinition(input, { existingIds = new Set(), existingNames = new Set(), currentId = null } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw failure('MCP server must be an object');
+  for (const field of ['credentialId', 'secretHeaders', 'secretEnvironment']) {
+    const value = input[field];
+    const populated = value !== undefined && value !== null
+      && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 0);
+    if (populated) {
+      throw failure(`${field} is no longer supported; put \${NAME} where the value belongs and bind it in placeholders`);
+    }
+  }
   const name = text(input.name, 'name', { required: true, max: 64 });
   if (!NAME_PATTERN.test(name)) throw failure('name must contain only letters, numbers, underscores, and hyphens');
   if (existingNames.has(name.toLowerCase())) throw failure(`An MCP server named ${name} already exists`, 409);
@@ -158,18 +131,8 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
     throw failure('timeoutMs must be an integer between 1000 and 300000');
   }
   const environment = stringMap(input.environment, 'environment', { names: true });
-  const secretEnvironment = secretEnvironmentMap(input.secretEnvironment);
   const headers = stringMap(input.headers, 'headers');
-  const secretHeaders = secretHeaderMap(input.secretHeaders);
   const placeholders = placeholderBindings(input.placeholders);
-  const credentialId = text(input.credentialId, 'credentialId', { max: 80 });
-  if (credentialId && !ID_PATTERN.test(credentialId)) throw failure('credentialId must contain lowercase letters, numbers, and hyphens only');
-  if (credentialId && transport !== 'http') throw failure('credentialId is only valid for an HTTP MCP server');
-  // Both would mean two mechanisms deciding the same header, with no rule for
-  // which wins. Pick one.
-  if (credentialId && Object.keys(secretHeaders).length) {
-    throw failure('a definition uses either credentialId or secretHeaders, not both');
-  }
   const now = new Date().toISOString();
   const definition = {
     id,
@@ -179,11 +142,8 @@ export function normalizeMcpDefinition(input, { existingIds = new Set(), existin
     args: transport === 'stdio' ? normalizedArgs : [],
     cwd: transport === 'stdio' ? cwd ?? null : null,
     url: transport === 'http' ? url : null,
-    environment,
-    secretEnvironment,
+    environment: transport === 'stdio' ? environment : {},
     headers: transport === 'http' ? headers : {},
-    secretHeaders: transport === 'http' ? secretHeaders : {},
-    credentialId: transport === 'http' ? credentialId ?? null : null,
     placeholders,
     timeoutMs,
     createdAt: input.createdAt ?? now,
@@ -221,7 +181,6 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
   function requireCredential(server) {
     if (!credentials) return;
     const referenced = new Set();
-    if (server.credentialId) referenced.add(server.credentialId);
     for (const binding of Object.values(server.placeholders ?? {})) {
       if (binding.source === 'credential') referenced.add(binding.credentialId);
     }
@@ -312,11 +271,6 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     if (!credentials) return {};
     const resolved = {};
     for (const server of selected) {
-      if (server.credentialId) {
-        // Throws when the destination is outside the credential's host list, so a
-        // definition cannot redirect a credential by editing its url.
-        resolved[server.credentialId] = credentials.resolveForHost(server.credentialId, server.url);
-      }
       for (const [name, binding] of Object.entries(server.placeholders ?? {})) {
         if (binding.source !== 'credential') continue;
         // Scoped to the definition, not just prefixed. Two connectors naming the
@@ -334,26 +288,27 @@ export function createMcpService({ servers, bindings, agents, persist, workerReq
     return resolved;
   }
 
-  // An older worker ignores an unknown `credentials` field and applies the
-  // definition with no header at all, reporting success. "No secretHeaders" used
-  // to mean "unauthenticated by design"; it must not now silently also mean
-  // "authenticated by a mechanism this worker cannot speak".
+  // Placeholders and delivered stored-key values are separate capabilities. An
+  // older worker may ignore either additive field and apply a connector with the
+  // literal placeholder still present, so both are gated before apply.
   async function requireCredentialDelivery(agent, selected) {
     const wantsPlaceholders = selected.some((server) => Object.keys(server.placeholders ?? {}).length);
-    if (!selected.some((server) => server.credentialId) && !wantsPlaceholders) return;
+    const wantsDelivery = selected.some((server) => Object.values(server.placeholders ?? {})
+      .some((binding) => binding.source === 'credential'));
+    if (!wantsPlaceholders) return;
     let supported = false;
     try {
       const inspected = await workerRequest(agent, 'GET', '/v1/mcp');
       const capabilities = inspected?.mcp?.capabilities ?? {};
-      supported = capabilities.credentialDelivery === true
-        && (!wantsPlaceholders || capabilities.placeholders === true);
+      supported = capabilities.placeholders === true
+        && (!wantsDelivery || capabilities.credentialDelivery === true);
     } catch (error) {
       throw failure(`Could not confirm this runtime supports delivered credentials: ${error.message}`, 502);
     }
     if (!supported) {
       throw failure(
-        'This runtime does not support control-plane delivered credentials, and would apply the connector '
-        + 'with no credential at all. Refresh the runtime onto the current image, then apply again.',
+        'This runtime does not support this connector\'s placeholder or stored-key bindings, and could apply it '
+        + 'without the intended value. Refresh the runtime onto the current image, then apply again.',
         409
       );
     }

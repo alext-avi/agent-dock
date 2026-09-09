@@ -502,7 +502,9 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
 .placeholder-row .field-effect { margin: 0; }
 .placeholder-where { color: var(--faint); font: 10px ui-monospace, monospace; }
 
-.credential-advanced summary { color: var(--muted); font-size: 11px; cursor: pointer; }
-.credential-advanced[open] summary { margin-bottom: 9px; }
+.mcp-advanced { margin-top: 14px; border: 1px solid var(--line); background: #0d110f; }
+.mcp-advanced > summary { padding: 11px 14px; color: var(--muted); cursor: pointer; font: 10px ui-monospace, monospace; }
+.mcp-advanced-fields { display: grid; gap: 13px; padding: 14px; border-top: 1px solid var(--line); }
+.mcp-advanced-fields .field { margin: 0; }
 .credential-row.incomplete { border-left: 2px solid #6a5626; }
 .credential-needs-value { color: #d8c48a; font: 10px ui-monospace, monospace; }

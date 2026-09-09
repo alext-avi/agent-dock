@@ -22,11 +22,20 @@ export async function streamTaskEvents(response, options = {}) {
   try {
     while (continueWhile()) {
       const { done, value } = await reader.read();
+      // continueWhile() was true when this read began, but the read was
+      // in flight — a new conversation started, the agent changed, or the
+      // caller otherwise walked away — while it awaited. A chunk read before
+      // that point must not be applied after it.
+      if (!continueWhile()) return;
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
-      for (const line of lines) await consume(line);
+      for (const line of lines) {
+        if (!continueWhile()) return;
+        await consume(line);
+      }
       if (done) {
+        if (!continueWhile()) return;
         await consume(buffer);
         break;
       }

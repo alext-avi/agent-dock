@@ -446,10 +446,16 @@ test('streaming task submission uses the authenticated CSRF request path', async
     });
   });
   await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
-  await page.fill('#prompt', 'Verify the authenticated streaming request.');
-  await page.click('#run-button');
+  assert.equal(await page.getByText('New conversation', { exact: true }).count(), 1);
+  assert.equal(await page.locator('#prompt').getAttribute('maxlength'), '100000');
+  await page.fill('#prompt', 'Verify the authenticated');
+  await page.press('#prompt', 'Shift+Enter');
+  await page.type('#prompt', 'streaming request.');
+  assert.equal(await page.locator('#prompt').inputValue(), 'Verify the authenticated\nstreaming request.');
+  await page.press('#prompt', 'Enter');
   await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
   assert.equal(requestHeaders?.['x-agent-dock-csrf'], '1');
+  assert.equal(requestBody?.prompt, 'Verify the authenticated\nstreaming request.');
   assert.match(requestBody?.conversationId, /^test-/);
 });
 
@@ -478,6 +484,7 @@ test('the Test workbench continues one harness conversation until the operator s
     });
   });
 
+  await page.waitForFunction(() => document.querySelector('#test-session-state')?.textContent === 'not started');
   await page.fill('#prompt', 'first request');
   await page.click('#run-button');
   await page.locator('.test-turn', { hasText: 'answer 1' }).waitFor();
@@ -495,13 +502,77 @@ test('the Test workbench continues one harness conversation until the operator s
   await page.click('#new-conversation');
   await page.locator('.conversation-empty').waitFor();
   assert.equal(await page.locator('.test-turn').count(), 0);
-  assert.equal((await page.locator('#test-session-state').textContent()).trim(), 'new conversation');
+  assert.equal((await page.locator('#test-session-state').textContent()).trim(), 'not started');
 
   await page.fill('#prompt', 'fresh request');
   await page.click('#run-button');
   await page.locator('.test-turn', { hasText: 'answer 3' }).waitFor();
   assert.notEqual(requests[2].conversationId, requests[1].conversationId);
   assert.equal(await page.locator('.test-turn').count(), 1);
+  assert.equal(await page.locator('#conversation').getAttribute('aria-live'), 'off');
+  assert.equal(await page.locator('#test-turn-live').getAttribute('role'), 'status');
+});
+
+test('starting over does not delete a conversation the worker never established', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  let cleanupRequests = 0;
+  await page.route(`**/api/v1/agents/${agent.id}/conversations/*`, async (route) => {
+    cleanupRequests += 1;
+    await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Not found' }) });
+  });
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, (route) => route.fulfill({
+    status: 500,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: 'The first turn failed before a conversation was created.' })
+  }));
+
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'fail before establishing context');
+  await page.press('#prompt', 'Enter');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent?.includes('first turn failed'));
+  await page.click('#new-conversation');
+
+  assert.equal(cleanupRequests, 0);
+  assert.equal((await page.locator('#run-message').textContent()).trim(), 'New conversation ready');
+});
+
+test('a runtime without conversation support is described honestly and receives independent turns', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  let requestBody;
+  const statusResponse = await fetch(`${app.url}/api/v1/agents/${agent.id}/status`);
+  const unsupportedStatus = await statusResponse.json();
+  unsupportedStatus.capabilities.tasks.conversations = false;
+  await page.route(`**/api/v1/agents/${agent.id}/status`, (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(unsupportedStatus)
+  }));
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ type: 'task.started', taskId: 'independent-task', data: { executionMode: 'demo' } }),
+        JSON.stringify({ type: 'message.completed', taskId: 'independent-task', data: { role: 'assistant', text: 'independent answer' } }),
+        JSON.stringify({ type: 'task.completed', taskId: 'independent-task', data: { status: 'succeeded', exitCode: 0 } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.goto(`${app.url}/agents/${agent.id}#test`);
+  await page.waitForFunction(() => document.querySelector('#test-session-state')?.textContent === 'no continuity');
+  assert.match(await page.locator('#test-session-note').textContent(), /cannot continue a conversation/i);
+  await page.fill('#prompt', 'answer this independently');
+  await page.press('#prompt', 'Enter');
+  await page.locator('.test-turn', { hasText: 'independent answer' }).waitFor();
+
+  assert.equal(requestBody?.conversationId, undefined);
+  assert.match(await page.locator('.test-turn-context').textContent(), /independent turn/i);
 });
 
 test('the Test agent shortcut reveals the workbench without focus scrolling past it', async (t) => {

@@ -314,23 +314,24 @@
             <div class="test-workbench-heading">
               <div><p class="kicker">CONVERSATIONAL TEST</p><h2 id="test-workbench-title">Work with this agent</h2></div>
               <div class="test-session-actions">
-                <span id="test-session-state" class="pill neutral">new conversation</span>
+                <span id="test-session-state" class="pill neutral">checking…</span>
                 <button id="new-conversation" class="text-button" type="button">New conversation</button>
               </div>
             </div>
-            <p class="test-session-note">The transcript stays in this page. The agent keeps a private harness conversation handle so follow-up messages retain context until you start a new conversation.</p>
+            <p id="test-session-note" class="test-session-note">Checking whether this runtime can continue a conversation…</p>
             <div class="test-context-strip">
               <span>Context applied to every turn</span>
               <strong id="test-context-summary">Durable instructions · provider default model</strong>
             </div>
-            <div id="conversation" class="conversation" role="log" aria-live="polite" aria-relevant="additions">
+            <p id="test-turn-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+            <div id="conversation" class="conversation" role="log" aria-live="off">
               <div class="conversation-empty"><span aria-hidden="true">A/</span><strong>Start a conversation</strong><small>Ask for work, then refine the result with follow-up messages.</small></div>
             </div>
             <div class="test-composer">
               <label class="sr-only" for="prompt">Message this agent</label>
-              <textarea id="prompt" rows="3" placeholder="Ask this agent to research, create, review, or change something…"></textarea>
+              <textarea id="prompt" rows="3" maxlength="100000" placeholder="Ask this agent to research, create, review, or change something…"></textarea>
               <div class="test-composer-footer">
-                <span id="run-message" class="run-message" role="status">⌘/Ctrl + Enter to send</span>
+                <span id="run-message" class="run-message" role="status">Enter to send · Shift+Enter for a new line</span>
                 <div class="test-composer-actions">
                   <button id="cancel-button" class="button danger hidden" type="button">Cancel</button>
                   <button id="run-button" class="button primary" type="button">Send <span>→</span></button>

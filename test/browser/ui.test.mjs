@@ -435,8 +435,10 @@ test('streaming task submission uses the authenticated CSRF request path', async
   const page = await openPage(`/agents/${agent.id}#test`);
   t.after(() => page.close());
   let requestHeaders;
+  let requestBody;
   await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
     requestHeaders = route.request().headers();
+    requestBody = route.request().postDataJSON();
     await route.fulfill({
       status: 200,
       contentType: 'application/x-ndjson',
@@ -444,10 +446,278 @@ test('streaming task submission uses the authenticated CSRF request path', async
     });
   });
   await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
-  await page.fill('#prompt', 'Verify the authenticated streaming request.');
-  await page.click('#run-button');
+  assert.equal(await page.getByText('New conversation', { exact: true }).count(), 1);
+  assert.equal(await page.locator('#prompt').getAttribute('maxlength'), '100000');
+  await page.fill('#prompt', 'Verify the authenticated');
+  await page.press('#prompt', 'Shift+Enter');
+  await page.type('#prompt', 'streaming request.');
+  assert.equal(await page.locator('#prompt').inputValue(), 'Verify the authenticated\nstreaming request.');
+  await page.press('#prompt', 'Enter');
   await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
   assert.equal(requestHeaders?.['x-agent-dock-csrf'], '1');
+  assert.equal(requestBody?.prompt, 'Verify the authenticated\nstreaming request.');
+  assert.match(requestBody?.conversationId, /^test-/);
+});
+
+test('the Test workbench continues one harness conversation until the operator starts over', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  const requests = [];
+  await page.route(`**/api/v1/agents/${agent.id}/conversations/*`, (route) => route.fulfill({ status: 204 }));
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    const body = route.request().postDataJSON();
+    requests.push(body);
+    const turn = requests.filter((request) => request.conversationId === body.conversationId).length;
+    const taskId = `conversation-task-${requests.length}`;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ type: 'conversation.continued', taskId, data: { conversationId: body.conversationId, resumed: turn > 1, turns: turn } }),
+        JSON.stringify({ type: 'task.started', taskId, data: { executionMode: 'provider-sandbox', model: 'claude-test' } }),
+        JSON.stringify({ type: 'activity.started', taskId, data: { kind: 'tool', name: 'Inspect files' } }),
+        JSON.stringify({ type: 'message.completed', taskId, data: { role: 'assistant', text: `answer ${requests.length}` } }),
+        JSON.stringify({ type: 'usage.observed', taskId, data: { request: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } }),
+        JSON.stringify({ type: 'task.completed', taskId, data: { status: 'succeeded', exitCode: 0 } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.waitForFunction(() => document.querySelector('#test-session-state')?.textContent === 'not started');
+  await page.fill('#prompt', 'first request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 1' }).waitFor();
+  await page.fill('#prompt', 'follow-up request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 2' }).waitFor();
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].conversationId, requests[1].conversationId);
+  assert.equal(await page.locator('.test-turn').count(), 2);
+  assert.match(await page.locator('.test-turn').nth(1).textContent(), /resumed conversation/);
+  assert.match(await page.locator('.test-turn').nth(1).textContent(), /15 tokens/);
+  assert.match(await page.locator('#test-session-state').textContent(), /2 turns/);
+
+  await page.click('#new-conversation');
+  await page.locator('.conversation-empty').waitFor();
+  assert.equal(await page.locator('.test-turn').count(), 0);
+  assert.equal((await page.locator('#test-session-state').textContent()).trim(), 'not started');
+
+  await page.fill('#prompt', 'fresh request');
+  await page.click('#run-button');
+  await page.locator('.test-turn', { hasText: 'answer 3' }).waitFor();
+  assert.notEqual(requests[2].conversationId, requests[1].conversationId);
+  assert.equal(await page.locator('.test-turn').count(), 1);
+  assert.equal(await page.locator('#conversation').getAttribute('aria-live'), 'off');
+  assert.equal(await page.locator('#test-turn-live').getAttribute('role'), 'status');
+});
+
+test('starting over does not delete a conversation the worker never established', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  let cleanupRequests = 0;
+  await page.route(`**/api/v1/agents/${agent.id}/conversations/*`, async (route) => {
+    cleanupRequests += 1;
+    await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Not found' }) });
+  });
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, (route) => route.fulfill({
+    status: 500,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: 'The first turn failed before a conversation was created.' })
+  }));
+
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'fail before establishing context');
+  await page.press('#prompt', 'Enter');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent?.includes('first turn failed'));
+  await page.click('#new-conversation');
+
+  assert.equal(cleanupRequests, 0);
+  assert.equal((await page.locator('#run-message').textContent()).trim(), 'New conversation ready');
+});
+
+test('a runtime without conversation support is described honestly and receives independent turns', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  let requestBody;
+  const statusResponse = await fetch(`${app.url}/api/v1/agents/${agent.id}/status`);
+  const unsupportedStatus = await statusResponse.json();
+  unsupportedStatus.capabilities.tasks.conversations = false;
+  await page.route(`**/api/v1/agents/${agent.id}/status`, (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(unsupportedStatus)
+  }));
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body: [
+        JSON.stringify({ type: 'task.started', taskId: 'independent-task', data: { executionMode: 'demo' } }),
+        JSON.stringify({ type: 'message.completed', taskId: 'independent-task', data: { role: 'assistant', text: 'independent answer' } }),
+        JSON.stringify({ type: 'task.completed', taskId: 'independent-task', data: { status: 'succeeded', exitCode: 0 } })
+      ].join('\n') + '\n'
+    });
+  });
+
+  await page.goto(`${app.url}/agents/${agent.id}#test`);
+  await page.waitForFunction(() => document.querySelector('#test-session-state')?.textContent === 'no continuity');
+  assert.match(await page.locator('#test-session-note').textContent(), /cannot continue a conversation/i);
+  await page.fill('#prompt', 'answer this independently');
+  await page.press('#prompt', 'Enter');
+  await page.locator('.test-turn', { hasText: 'independent answer' }).waitFor();
+
+  assert.equal(requestBody?.conversationId, undefined);
+  assert.match(await page.locator('.test-turn-context').textContent(), /independent turn/i);
+});
+
+// Uses the real demo worker (no page.route mocking) rather than a scripted
+// fixture: the demo adapter genuinely streams task.started, then the answer,
+// then completion over real ~120ms gaps (worker/server.mjs runDemo), which is
+// what gives the operator's mid-stream scroll an actual window to land in.
+test('the transcript keeps a manual scroll position during streaming and resumes on a new turn', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}#test`);
+  t.after(() => page.close());
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+
+  const runTurn = async (prompt) => {
+    await page.fill('#prompt', prompt);
+    await page.click('#run-button');
+    await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  };
+
+  // Enough turns to make the transcript taller than its own viewport, or there
+  // is nothing for a scroll-up to preserve.
+  for (let i = 1; i <= 5; i += 1) {
+    await runTurn(`seed turn ${i}: ${'enough transcript content to require scrolling. '.repeat(12)}`);
+  }
+  const overflowing = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight > el.clientHeight;
+  });
+  assert.ok(overflowing, 'the seed turns did not make the transcript scrollable, so scroll preservation below proves nothing');
+
+  // Start one more turn, then scroll up the instant its card appears —
+  // before the streamed answer and completion events land.
+  await page.fill('#prompt', 'streaming turn');
+  await page.click('#run-button');
+  await page.waitForFunction((count) => document.querySelectorAll('.test-turn').length === count, 6);
+  await page.evaluate(() => { document.querySelector('#conversation').scrollTop = 0; });
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+
+  const scrollTopAfterStreaming = await page.evaluate(() => document.querySelector('#conversation').scrollTop);
+  assert.ok(scrollTopAfterStreaming < 20, 'a streamed event snapped the transcript back to the bottom while the operator was reading an earlier turn');
+
+  // Sending a new turn resumes following even though the operator never
+  // scrolled back down themselves.
+  await runTurn('resumed turn');
+  const followingAfterNewTurn = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= 32;
+  });
+  assert.ok(followingAfterNewTurn, 'sending a new turn did not resume following the transcript');
+
+  // Scrolling back down to the bottom by hand also resumes following, without
+  // needing to send a turn.
+  await page.fill('#prompt', 'one more turn to scroll away from');
+  await page.click('#run-button');
+  await page.waitForFunction((count) => document.querySelectorAll('.test-turn').length === count, 8);
+  await page.evaluate(() => { document.querySelector('#conversation').scrollTop = 0; });
+  await page.waitForTimeout(60);
+  await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    el.scrollTop = el.scrollHeight;
+    el.dispatchEvent(new Event('scroll'));
+  });
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  const followingAfterManualReturn = await page.evaluate(() => {
+    const el = document.querySelector('#conversation');
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= 32;
+  });
+  assert.ok(followingAfterManualReturn, 'scrolling back to the bottom by hand did not resume following the transcript');
+});
+
+// The demo worker's fixed reply text is too short to be pathological on its
+// own, so this scripts a single response carrying the shapes that have
+// actually overflowed a card: a bare URL, a run-on word with no break
+// opportunities, inline-code-style text, and a multi-line preformatted block,
+// plus a long value in the collapsible activity panel.
+test('long agent output stays inside its turn card at narrow and normal widths', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  await page.setViewportSize({ width: 1180, height: 900 });
+
+  const longWord = 'a'.repeat(220);
+  const longUrl = `https://example.test/${'b'.repeat(180)}/resource?token=${'c'.repeat(120)}`;
+  const preformatted = Array.from({ length: 6 }, (_, i) => `line ${i}: ${'d'.repeat(140)}`).join('\n');
+  const answerText = `Read this: ${longUrl}\nInline code like \`${longWord}\` and a run-on word ${longWord}.\n\n${preformatted}`;
+
+  await page.route(`**/api/v1/agents/${agent.id}/tasks`, async (route) => {
+    const taskId = 'overflow-task';
+    const body = [
+      JSON.stringify({ type: 'task.started', taskId, data: { executionMode: 'demo' } }),
+      JSON.stringify({ type: 'activity.started', taskId, data: { kind: 'tool', name: 'fetch', command: longUrl } }),
+      JSON.stringify({ type: 'message.completed', taskId, data: { role: 'assistant', text: answerText } }),
+      JSON.stringify({ type: 'task.completed', taskId, data: { status: 'succeeded', exitCode: 0 } })
+    ].join('\n') + '\n';
+    await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body });
+  });
+
+  await page.goto(`${app.url}/agents/${agent.id}#test`);
+  await page.waitForFunction(() => document.querySelector('#run-button')?.disabled === false);
+  await page.fill('#prompt', 'produce pathological output');
+  await page.click('#run-button');
+  await page.waitForFunction(() => document.querySelector('#run-message')?.textContent === 'Run complete');
+  // Open the activity panel so its long value is actually laid out rather
+  // than sitting inert inside a closed <details>.
+  await page.click('.test-turn-activity summary');
+
+  for (const width of [1180, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const layout = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const card = document.querySelector('.test-turn');
+      const overflowing = [...card.querySelectorAll('*')]
+        .filter((el) => el.scrollWidth > el.clientWidth + 1)
+        .map((el) => ({ tag: el.tagName, cls: el.className, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+      return {
+        viewport: doc.clientWidth,
+        documentWidth: doc.scrollWidth,
+        cardScrollWidth: card.scrollWidth,
+        cardClientWidth: card.clientWidth,
+        overflowing
+      };
+    });
+    assert.equal(layout.documentWidth, layout.viewport, `${width}px viewport has horizontal page overflow`);
+    assert.ok(layout.cardScrollWidth <= layout.cardClientWidth + 1, `${width}px turn card itself overflows its own bounds`);
+    assert.deepEqual(layout.overflowing, [], `${width}px has a fragment overflowing its own box: ${JSON.stringify(layout.overflowing)}`);
+  }
+});
+
+test('the Test agent shortcut reveals the workbench without focus scrolling past it', async (t) => {
+  const agent = app.agents['claude-code'];
+  const page = await openPage(`/agents/${agent.id}`);
+  t.after(() => page.close());
+
+  await page.click('#test-agent-button');
+  await page.waitForTimeout(500);
+
+  const layout = await page.evaluate(() => ({
+    headingTop: document.querySelector('#test-panel h2')?.getBoundingClientRect().top,
+    tabBottom: document.querySelector('.tab-list')?.getBoundingClientRect().bottom,
+    activeElement: document.activeElement?.id,
+    activeTab: document.querySelector('.tab-button.active')?.dataset.tab
+  }));
+  assert.equal(layout.activeTab, 'test');
+  assert.equal(layout.activeElement, 'prompt');
+  assert.ok(layout.headingTop >= layout.tabBottom, 'focusing the composer scrolled the workbench heading behind the tabs');
+  assert.ok(layout.headingTop < 260, 'the shortcut did not bring the workbench heading near the top of the viewport');
 });
 
 test('the workspace navigator expands folders and filters nested files', async (t) => {

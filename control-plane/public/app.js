@@ -7,6 +7,7 @@ import {
   observeWorkshopRunEvent,
   requireSuccessfulWorkshopRun
 } from './mcp-workshop.js';
+import { streamTaskEvents } from './task-stream.js';
 
 const API_ROOT = '/api/v1';
 const VALID_TABS = new Set(['instructions', 'tools', 'data', 'test']);
@@ -24,6 +25,13 @@ let runtimeRefreshInFlight = false;
 // skip, so the refresh control must not pretend otherwise.
 let usageBackingOff = false;
 let usageThrottled = false;
+// Mirrors the worker's own cap (worker/server.mjs rejects a prompt over this
+// length with 413) so the composer refuses locally instead of round-tripping
+// to find out.
+const TEST_PROMPT_MAX_LENGTH = 100_000;
+// Strict per adapter-contract: absent or non-`true` means "cannot be assumed
+// to work", never "probably works". Set from the runtime's own status.
+let currentConversationsSupported = false;
 
 const ui = {
   dashboardView: $('#dashboard-view'),
@@ -211,6 +219,12 @@ const ui = {
   runButton: $('#run-button'),
   cancelButton: $('#cancel-button'),
   runMessage: $('#run-message'),
+  newConversation: $('#new-conversation'),
+  testSessionState: $('#test-session-state'),
+  testSessionNote: $('#test-session-note'),
+  testContextSummary: $('#test-context-summary'),
+  testTurnLive: $('#test-turn-live'),
+  testPanel: $('#test-panel'),
   conversation: $('#conversation'),
   rawOutput: $('#raw-output'),
   fileList: $('#file-list'),
@@ -257,6 +271,23 @@ const ui = {
 
 let running = false;
 let activeWorkerTaskId = null;
+let testConversationId = null;
+let testConversationAgentId = null;
+let testConversationTurns = 0;
+// True only once the worker has actually confirmed (via `conversation.continued`)
+// that it holds a mapping for testConversationId. A locally-minted id that never
+// reached that point has nothing on the worker side to forget.
+let testConversationEstablished = false;
+// Bumped whenever the active test run is abandoned (a fresh conversation
+// started, or the agent switched) so a chunk read before that point cannot be
+// applied after it. Same shape as workshopRunToken below.
+let testRunToken = 0;
+let activeTestRunToken = null;
+// Whether the transcript should keep following newly streamed content. Starts
+// true (nothing to scroll away from yet) and is cleared the moment the
+// operator scrolls up to read an earlier turn, so a streaming answer never
+// yanks their read position back to the bottom.
+let followTranscript = true;
 let authPolling = null;
 let refreshingAuth = false;
 let currentAgent = null;
@@ -495,7 +526,7 @@ function selectTab(name, { updateHash = true, focus = false } = {}) {
   }
   for (const panel of ui.tabPanels) panel.classList.toggle('hidden', panel.dataset.panel !== selected);
   if (updateHash) history.replaceState(null, '', `#${selected}`);
-  if (focus && selected === 'test') setTimeout(() => ui.prompt.focus(), 100);
+  if (focus && selected === 'test') setTimeout(() => ui.prompt.focus({ preventScroll: true }), 100);
   if (selected === 'tools' && currentAgent) refreshMcp();
   if (selected === 'data' && currentAgent) refreshData();
 }
@@ -1239,6 +1270,7 @@ function populateAgentConfig(agent) {
   const selectedModel = agent.modelPolicy?.mode === 'pinned' ? agent.modelPolicy.primary : '';
   ui.modelSelect.value = selectedModel || '';
   ui.runtimeModel.textContent = selectedModel || 'provider default';
+  ui.testContextSummary.textContent = `${agent.durablePrompt?.trim() ? 'Durable instructions applied' : 'No durable instructions'} · ${selectedModel || 'provider default model'}`;
   const plannedHarness = adapterLabel(agent.adapter);
   ui.agentName.textContent = plannedHarness;
   ui.runtimeIcon.textContent = plannedHarness.slice(0, 1).toUpperCase();
@@ -1914,20 +1946,10 @@ async function runWorkshop() {
     }
 
     const runState = createWorkshopRunState();
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
     let output = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (!mine()) return;
-      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let event;
-        try { event = JSON.parse(line); } catch { continue; }
+    await streamTaskEvents(response, {
+      continueWhile: mine,
+      onEvent: (event) => {
         observeWorkshopRunEvent(runState, event);
         if (event.type === 'message.completed' && event.data?.text) {
           output += `${event.data.text}\n`;
@@ -1941,22 +1963,7 @@ async function runWorkshop() {
         // whether this run failed.
         if (event.type === 'error' && event.data?.message) workshopNote('harness', event.data.message, 'warn', token);
       }
-      if (done) {
-        if (!buffer.trim()) break;
-        try {
-          const event = JSON.parse(buffer);
-          observeWorkshopRunEvent(runState, event);
-          if (event.type === 'message.completed' && event.data?.text) {
-            output += `${event.data.text}\n`;
-            workshopNote('harness', event.data.text, '', token);
-          }
-          if (event.type === 'error' && event.data?.message) {
-            workshopNote('harness', event.data.message, 'warn', token);
-          }
-        } catch { /* a partial final line is not an event */ }
-        break;
-      }
-    }
+    });
 
     // Only a run that started, ended on its own task, and reported success may
     // put anything in the form. Without this a harness could emit a proposal and
@@ -2728,6 +2735,12 @@ function renderStatus(status) {
   // Only a managed runtime has a container of ours to replace, and never while
   // a task is running.
   if (!runtimeRefreshInFlight) ui.refreshRuntime.disabled = !currentAgent.runtime?.managed || active;
+  // Mirrors the gate the control plane itself applies before forwarding a
+  // conversationId (server.mjs requireConversationSupport): strictly `true`,
+  // never assumed. An adapter that cannot resume advertises `false` and the
+  // Test workbench must say so rather than promising continuity it can't keep.
+  currentConversationsSupported = status.capabilities?.tasks?.conversations === true;
+  renderTestContinuityCopy();
   renderRuntimeDrift();
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
@@ -3059,54 +3072,253 @@ async function refreshWorkspace() {
   }
 }
 
-function eventText(event) {
-  const data = event.data ?? {};
-  if (event.type === 'message.completed') return { kind: 'agent', text: data.text };
-  if (event.type === 'activity.started' || event.type === 'activity.completed') {
-    const detail = data.command || data.name || data.text || event.type.replace('.', ' ');
-    return { kind: 'tool', text: `${data.kind || 'activity'}: ${detail}` };
-  }
-  if (event.type === 'log') return { kind: data.level === 'error' ? 'error' : 'tool', text: data.message };
-  if (event.type === 'error') return { kind: 'error', text: data.message };
-  if (event.type === 'task.started') return { kind: 'tool', text: `Task ${event.taskId.slice(0, 8)} started (${data.executionMode}) · ${data.model || 'provider default'}.` };
-  if (event.type === 'task.completed') return { kind: data.status === 'succeeded' ? 'tool' : 'error', text: `Task ${data.status} with exit code ${data.exitCode}.` };
-  if (event.type === 'usage.observed') {
-    const request = data.request;
-    const usage = request ? ` · ${request.inputTokens ?? '?'} in / ${request.outputTokens ?? '?'} out` : '';
-    return { kind: 'tool', text: `Usage observed${usage}.` };
-  }
-  if (event.type === 'usage.updated') return { kind: 'tool', text: 'Usage and subscription limits refreshed.' };
-  return null;
+// Anything closer to the bottom than this is treated as "still there" even
+// though a fractional-pixel layout reflow means scrollTop rarely lands on the
+// exact max value.
+const TRANSCRIPT_FOLLOW_THRESHOLD_PX = 32;
+
+function isTranscriptNearBottom() {
+  const el = ui.conversation;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= TRANSCRIPT_FOLLOW_THRESHOLD_PX;
 }
 
-function appendLine(kind, text) {
-  const row = document.createElement('div');
-  row.className = `event-line ${kind}`;
-  const type = document.createElement('span');
-  type.className = 'event-type';
-  type.textContent = kind;
-  row.append(type, document.createTextNode(text));
-  ui.conversation.append(row);
+// Scrolling up to read an earlier turn clears the follow flag; scrolling back
+// down to the bottom (or starting a new turn, see runTask/resetTestConversation)
+// restores it. Streamed content only snaps the view down while this is true.
+function handleTranscriptScroll() {
+  followTranscript = isTranscriptNearBottom();
+}
+
+function followTranscriptIfNeeded() {
+  if (!followTranscript) return;
   ui.conversation.scrollTop = ui.conversation.scrollHeight;
 }
 
-function appendEvent(event) {
-  if (event.type === 'task.started' && event.taskId) activeWorkerTaskId = event.taskId;
-  if (event.type === 'task.completed' && event.taskId === activeWorkerTaskId) activeWorkerTaskId = null;
+function showEmptyTestConversation() {
+  const empty = document.createElement('div');
+  empty.className = 'conversation-empty';
+  const mark = document.createElement('span');
+  mark.setAttribute('aria-hidden', 'true');
+  mark.textContent = 'A/';
+  const title = document.createElement('strong');
+  title.textContent = 'Start a conversation';
+  const copy = document.createElement('small');
+  copy.textContent = 'Ask for work, then refine the result with follow-up messages.';
+  empty.append(mark, title, copy);
+  ui.conversation.replaceChildren(empty);
+}
+
+// The only copy that depends on the adapter's own `conversations` capability.
+// Called once status has actually reported it, never guessed in advance.
+function renderTestContinuityCopy() {
+  ui.testSessionNote.textContent = currentConversationsSupported
+    ? 'The transcript stays in this page. The agent keeps a private harness conversation handle so follow-up messages retain context until you start a new conversation.'
+    : 'This runtime cannot continue a conversation. Every message is answered on its own, without context from earlier turns in this page.';
+  if (!testConversationId && !running) {
+    ui.testSessionState.textContent = currentConversationsSupported ? 'not started' : 'no continuity';
+    ui.testSessionState.className = 'pill neutral';
+  }
+}
+
+function resetTestConversation() {
+  testConversationId = null;
+  testConversationAgentId = currentAgent?.id ?? null;
+  testConversationTurns = 0;
+  testConversationEstablished = false;
+  activeWorkerTaskId = null;
+  // Any stream still reading for the run this reset walks away from must stop
+  // applying what it reads, not just stop being started again.
+  testRunToken += 1;
+  ui.testSessionState.textContent = currentConversationsSupported ? 'not started' : 'no continuity';
+  ui.testSessionState.className = 'pill neutral';
+  ui.rawOutput.textContent = '';
+  ui.testTurnLive.textContent = '';
+  followTranscript = true;
+  showEmptyTestConversation();
+}
+
+function ensureTestConversation() {
+  if (testConversationAgentId !== currentAgent.id) resetTestConversation();
+  // An adapter that cannot resume a session is never sent a conversationId —
+  // nothing here is minted, and every turn is independent by design.
+  if (!currentConversationsSupported) return null;
+  if (!testConversationId) {
+    testConversationId = `test-${workshopId()}`;
+    testConversationAgentId = currentAgent.id;
+    ui.testSessionState.textContent = 'conversation ready';
+    ui.testSessionState.className = 'pill ready';
+  }
+  return testConversationId;
+}
+
+// A dedicated, small live region for meaningful turn-status transitions
+// (queued/working/done/error). The transcript itself (#conversation) is not
+// live: announcing every streamed token as it lands would be unusable.
+function announceTestTurnStatus(turn, label) {
+  ui.testTurnLive.textContent = `Turn ${turn.number}: ${label}`;
+}
+
+function setTestTurnStatus(turn, label, state = 'neutral') {
+  turn.status.textContent = label;
+  turn.status.className = `pill ${state}`;
+  announceTestTurnStatus(turn, label);
+}
+
+function addTestTurnActivity(turn, label, detail) {
+  if (!detail) return;
+  const line = document.createElement('p');
+  const type = document.createElement('span');
+  type.textContent = label;
+  line.append(type, document.createTextNode(detail));
+  turn.activity.append(line);
+  while (turn.activity.childElementCount > 80) turn.activity.firstElementChild.remove();
+  turn.activityCount += 1;
+  turn.activityLabel.textContent = `${turn.activityCount} event${turn.activityCount === 1 ? '' : 's'}`;
+}
+
+function createTestTurn(prompt) {
+  ui.conversation.querySelector('.conversation-empty')?.remove();
+  const card = document.createElement('article');
+  card.className = 'test-turn';
+  card.innerHTML = `
+    <header class="test-turn-heading">
+      <span class="test-turn-number"></span>
+      <span class="pill neutral test-turn-status">queued</span>
+    </header>
+    <section class="test-turn-message from-operator"><span>You</span><p></p></section>
+    <section class="test-turn-message from-agent"><span></span><div class="test-turn-answer"><p class="test-turn-pending">Waiting for the agent…</p></div></section>
+    <details class="test-turn-activity"><summary>Activity <span>0 events</span></summary><div></div></details>
+    <footer class="test-turn-meta"><span class="test-turn-context">conversation context</span><span class="test-turn-model">provider default</span><span class="test-turn-usage">usage pending</span><span class="test-turn-duration">running</span></footer>
+  `;
+  const number = testConversationTurns + 1;
+  card.querySelector('.test-turn-number').textContent = `Turn ${number}`;
+  card.querySelector('.from-operator p').textContent = prompt;
+  card.querySelector('.from-agent > span').textContent = currentHarnessName;
+  const turn = {
+    card,
+    number,
+    status: card.querySelector('.test-turn-status'),
+    answer: card.querySelector('.test-turn-answer'),
+    pending: card.querySelector('.test-turn-pending'),
+    activity: card.querySelector('.test-turn-activity > div'),
+    activityLabel: card.querySelector('.test-turn-activity summary span'),
+    context: card.querySelector('.test-turn-context'),
+    model: card.querySelector('.test-turn-model'),
+    usage: card.querySelector('.test-turn-usage'),
+    duration: card.querySelector('.test-turn-duration'),
+    activityCount: 0,
+    startedAt: performance.now(),
+    completed: false,
+    reportedTurns: null
+  };
+  // No conversationId is ever sent when the adapter can't resume one, so no
+  // `conversation.continued` event will arrive to say otherwise — say so up
+  // front instead of leaving the default text implying continuity exists.
+  if (!currentConversationsSupported) turn.context.textContent = 'independent turn';
+  ui.conversation.append(card);
+  // Sending a new turn always resumes following, even if the operator was
+  // reading back through earlier turns when they sent it.
+  followTranscript = true;
+  ui.conversation.scrollTop = ui.conversation.scrollHeight;
+  announceTestTurnStatus(turn, 'queued');
+  return turn;
+}
+
+function appendTestAnswer(turn, text, className = '') {
+  if (!text) return;
+  turn.pending?.remove();
+  turn.pending = null;
+  const paragraph = document.createElement('p');
+  paragraph.className = className;
+  paragraph.textContent = text;
+  turn.answer.append(paragraph);
+  followTranscriptIfNeeded();
+}
+
+function observeTestEvent(turn, event) {
+  const data = event.data ?? {};
   ui.rawOutput.textContent += `${JSON.stringify(event)}\n`;
   ui.rawOutput.scrollTop = ui.rawOutput.scrollHeight;
-  if (event.type === 'usage.updated') renderUsage(event.data?.usage);
-  const display = eventText(event);
-  if (display) appendLine(display.kind, display.text);
+
+  if (event.type === 'conversation.continued') {
+    // This is the worker's own confirmation that it now holds a mapping for
+    // testConversationId — the only point at which forgetting it later is a
+    // real cleanup rather than a no-op against something never created.
+    testConversationEstablished = true;
+    turn.reportedTurns = Number(data.turns) || testConversationTurns + 1;
+    turn.context.textContent = data.resumed ? 'resumed conversation' : 'new conversation';
+    ui.testSessionState.textContent = `conversation · ${turn.reportedTurns} turn${turn.reportedTurns === 1 ? '' : 's'}`;
+    ui.testSessionState.className = 'pill ready';
+    return;
+  }
+  if (event.type === 'task.started') {
+    activeWorkerTaskId = event.taskId ?? activeWorkerTaskId;
+    setTestTurnStatus(turn, 'working', 'busy');
+    turn.model.textContent = data.model || ui.runtimeModel.textContent || 'provider default';
+    addTestTurnActivity(turn, 'started', `${data.executionMode || 'runtime'} · ${event.taskId?.slice(0, 8) || 'pending id'}`);
+    return;
+  }
+  if (event.type === 'message.completed') {
+    appendTestAnswer(turn, data.text);
+    return;
+  }
+  if (event.type === 'activity.started' || event.type === 'activity.completed') {
+    const detail = data.command || data.name || data.text || event.type.replace('.', ' ');
+    addTestTurnActivity(turn, data.kind || event.type.replace('.', ' '), detail);
+    return;
+  }
+  if (event.type === 'log') {
+    addTestTurnActivity(turn, data.level || 'log', data.message);
+    return;
+  }
+  if (event.type === 'error') {
+    appendTestAnswer(turn, data.message || 'The runtime reported an error.', 'test-turn-error');
+    addTestTurnActivity(turn, 'error', data.message);
+    announceTestTurnStatus(turn, 'error');
+    return;
+  }
+  if (event.type === 'usage.observed') {
+    const request = data.request;
+    if (request) {
+      turn.usage.textContent = Number.isFinite(Number(request.totalTokens))
+        ? `${formatTokens(request.totalTokens)} tokens`
+        : `${formatTokens(request.inputTokens)} in · ${formatTokens(request.outputTokens)} out`;
+    }
+    return;
+  }
+  if (event.type === 'usage.updated') {
+    renderUsage(data.usage);
+    return;
+  }
+  if (event.type === 'task.completed') {
+    const succeeded = ['succeeded', 'completed'].includes(data.status);
+    activeWorkerTaskId = event.taskId === activeWorkerTaskId ? null : activeWorkerTaskId;
+    turn.completed = true;
+    setTestTurnStatus(turn, data.status || 'completed', succeeded ? 'ready' : 'error');
+    turn.duration.textContent = formatDuration(performance.now() - turn.startedAt);
+    if (!succeeded && turn.pending) appendTestAnswer(turn, `Task ${data.status || 'failed'}${Number.isFinite(data.exitCode) ? ` with exit code ${data.exitCode}` : ''}.`, 'test-turn-error');
+  }
 }
 
 async function runTask() {
   const prompt = ui.prompt.value.trim();
   if (!prompt || running) return;
-  appendLine('user', prompt);
+  if (prompt.length > TEST_PROMPT_MAX_LENGTH) {
+    ui.runMessage.textContent = `Message is too long (${prompt.length.toLocaleString()} of ${TEST_PROMPT_MAX_LENGTH.toLocaleString()} characters max).`;
+    return;
+  }
+  // Resolve an agent switch before capturing this run's token: the reset used
+  // for the switch intentionally invalidates the preceding stream.
+  const conversationId = ensureTestConversation();
+  testRunToken += 1;
+  const token = testRunToken;
+  activeTestRunToken = token;
+  const mine = () => token === testRunToken;
+  const turn = createTestTurn(prompt);
   ui.prompt.value = '';
   running = true;
   ui.runButton.disabled = true;
+  ui.newConversation.disabled = true;
   ui.cancelButton.classList.remove('hidden');
   ui.jobState.textContent = 'running';
   ui.workerState.textContent = 'busy';
@@ -3116,37 +3328,64 @@ async function runTask() {
     const response = await authenticatedFetch(agentApi('tasks'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ prompt })
+      body: JSON.stringify(conversationId ? { prompt, conversationId } : { prompt })
     });
-    if (!response.ok || !response.body) {
-      const error = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
-      throw new Error(error.error ?? `HTTP ${response.status}`);
-    }
+    if (!mine()) return;
     ui.runMessage.textContent = 'Running';
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { appendEvent(JSON.parse(line)); }
-        catch { appendEvent({ type: 'log', data: { level: 'info', message: line } }); }
-      }
-      if (done) break;
+    await streamTaskEvents(response, {
+      continueWhile: mine,
+      onEvent: (event) => observeTestEvent(turn, event),
+      onMalformedLine: (line) => addTestTurnActivity(turn, 'unparsed', line)
+    });
+    if (!mine()) return;
+    testConversationTurns = Math.max(testConversationTurns + 1, turn.reportedTurns ?? 0);
+    if (!turn.completed) {
+      turn.completed = true;
+      setTestTurnStatus(turn, 'stream ended', 'neutral');
+      turn.duration.textContent = formatDuration(performance.now() - turn.startedAt);
     }
     ui.runMessage.textContent = 'Run complete';
   } catch (error) {
-    appendEvent({ type: 'error', data: { source: 'control-plane', message: error.message } });
+    if (!mine()) return;
+    appendTestAnswer(turn, error.message, 'test-turn-error');
+    setTestTurnStatus(turn, 'failed', 'error');
+    turn.duration.textContent = formatDuration(performance.now() - turn.startedAt);
     ui.runMessage.textContent = error.message;
   } finally {
-    running = false;
-    activeWorkerTaskId = null;
-    ui.cancelButton.classList.add('hidden');
+    // Invalidation prevents an abandoned stream from changing transcript
+    // state, but it must not leave the global run lock stuck on forever.
+    if (activeTestRunToken === token) {
+      activeTestRunToken = null;
+      running = false;
+      activeWorkerTaskId = null;
+      ui.runButton.disabled = false;
+      ui.newConversation.disabled = false;
+      ui.cancelButton.classList.add('hidden');
+    }
     await Promise.all([refreshStatus(), refreshWorkspace(), refreshProviders(), refreshMcp()]);
+  }
+}
+
+async function startNewTestConversation() {
+  if (running) return;
+  const previousId = testConversationId;
+  const previousAgentId = testConversationAgentId;
+  const previousEstablished = testConversationEstablished;
+  resetTestConversation();
+  ui.runMessage.textContent = 'New conversation ready';
+  ui.prompt.focus();
+  // A locally-minted id the worker never confirmed (conversation.continued
+  // never arrived — the first turn failed before it, or continuity is
+  // unsupported) has no server-side mapping to forget. Calling DELETE on it
+  // would only surface a 404 as though something had gone wrong.
+  if (!previousId || !previousEstablished || previousAgentId !== currentAgent?.id) return;
+  try {
+    await api(agentApi(`conversations/${encodeURIComponent(previousId)}`), { method: 'DELETE' });
+  } catch (error) {
+    // Already gone (or never known to this worker process) is not a failure —
+    // forgetting a mapping is idempotent by contract.
+    if (error.status === 404) return;
+    ui.runMessage.textContent = `New conversation ready · previous session cleanup failed: ${error.message}`;
   }
 }
 
@@ -3169,7 +3408,9 @@ async function loadAgent(id) {
   ui.jobsView.classList.add('hidden');
   try {
     const [result] = await Promise.all([api(`${API_ROOT}/agents/${encodeURIComponent(id)}`), loadRuntimeDrift()]);
+    const changedAgent = currentAgent?.id !== result.agent.id;
     currentAgent = result.agent;
+    if (changedAgent) resetTestConversation();
     populateAgentConfig(currentAgent);
     document.title = `${currentAgent.name} — Agent Dock`;
     selectTab(location.hash.slice(1), { updateHash: false });
@@ -3249,6 +3490,8 @@ ui.authButton.addEventListener('click', startAuth);
 ui.authCompleteForm.addEventListener('submit', completeAuthentication);
 ui.runButton.addEventListener('click', runTask);
 ui.cancelButton.addEventListener('click', cancelRun);
+ui.newConversation.addEventListener('click', startNewTestConversation);
+ui.conversation.addEventListener('scroll', handleTranscriptScroll);
 ui.refreshUsage.addEventListener('click', refreshUsage);
 ui.refreshAuth.addEventListener('click', refreshAuthentication);
 ui.signOut.addEventListener('click', signOut);
@@ -3259,17 +3502,18 @@ $('#refresh-files').addEventListener('click', refreshWorkspace);
 ui.workspaceSearch.addEventListener('input', renderWorkspaceNavigator);
 $('#expand-workspace').addEventListener('click', () => setAllWorkspaceDirectories(true));
 $('#collapse-workspace').addEventListener('click', () => setAllWorkspaceDirectories(false));
-$('#clear-output').addEventListener('click', () => {
-  ui.conversation.innerHTML = '<div class="welcome-line"><span>system</span> Output cleared. This transcript is not persisted.</div>';
-  ui.rawOutput.textContent = '';
-});
 ui.prompt.addEventListener('keydown', (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') runTask();
+  if (event.key !== 'Enter' || event.isComposing) return;
+  // Shift+Enter inserts a newline (the textarea's own default) instead of
+  // sending. Plain Enter and Cmd/Ctrl+Enter both send.
+  if (event.shiftKey) return;
+  event.preventDefault();
+  runTask();
 });
 for (const button of ui.tabButtons) button.addEventListener('click', () => selectTab(button.dataset.tab));
 ui.testAgentButton.addEventListener('click', () => {
   selectTab('test', { focus: true });
-  ui.tabList.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  ui.testPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
 window.addEventListener('hashchange', () => selectTab(location.hash.slice(1), { updateHash: false }));
 

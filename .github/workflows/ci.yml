@@ -29,8 +29,13 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Install pinned Codex CLI for headless MCP regression test
+        run: npm install --global @openai/codex@0.146.0
       - name: Run unit and integration tests
         run: npm test
+        env:
+          AGENT_DOCK_REQUIRE_CODEX_HEADLESS_TEST: '1'
+          AGENT_DOCK_EXPECT_CODEX_VERSION: '0.146.0'
 
   browser:
     name: Browser

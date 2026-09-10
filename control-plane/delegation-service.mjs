@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -24,6 +24,12 @@ function text(value, name, { required = false, max = 50_000 } = {}) {
   if (required && !normalized) throw httpError(`${name} is required`);
   if (normalized.length > max) throw httpError(`${name} must be at most ${max} characters`);
   return normalized;
+}
+
+function requestFingerprint({ targetAgentId, prompt, parentTaskId }) {
+  return createHash('sha256')
+    .update(JSON.stringify({ targetAgentId, prompt, parentTaskId }))
+    .digest('hex');
 }
 
 function publicTask(row, { includePrompt = false } = {}) {
@@ -92,6 +98,8 @@ export function createDelegationService(options = {}) {
       caller_id TEXT NOT NULL,
       caller_type TEXT NOT NULL,
       caller_agent_id TEXT,
+      idempotency_key TEXT,
+      request_hash TEXT,
       target_agent_id TEXT NOT NULL,
       prompt TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -105,10 +113,18 @@ export function createDelegationService(options = {}) {
       finished_at TEXT,
       updated_at TEXT NOT NULL
     );
+  `);
+  const taskColumns = new Set(db.prepare('PRAGMA table_info(delegation_tasks)').all().map((column) => column.name));
+  if (!taskColumns.has('idempotency_key')) db.exec('ALTER TABLE delegation_tasks ADD COLUMN idempotency_key TEXT');
+  if (!taskColumns.has('request_hash')) db.exec('ALTER TABLE delegation_tasks ADD COLUMN request_hash TEXT');
+  db.exec(`
     CREATE INDEX IF NOT EXISTS delegation_tasks_caller_status ON delegation_tasks(caller_id, status);
     CREATE INDEX IF NOT EXISTS delegation_tasks_trace ON delegation_tasks(trace_id, depth);
     CREATE INDEX IF NOT EXISTS delegation_tasks_target ON delegation_tasks(target_agent_id, created_at);
-    PRAGMA user_version = 1;
+    CREATE UNIQUE INDEX IF NOT EXISTS delegation_tasks_idempotency
+      ON delegation_tasks(caller_id, caller_type, idempotency_key)
+      WHERE idempotency_key IS NOT NULL;
+    PRAGMA user_version = 2;
   `);
 
   // Delegated work is never replayed after a control-plane restart. The
@@ -237,7 +253,18 @@ export function createDelegationService(options = {}) {
     if (!caller?.id) throw httpError('Delegation caller identity is required', 401);
     const targetAgentId = text(input.targetAgentId, 'targetAgentId', { required: true, max: 200 });
     const prompt = text(input.prompt, 'prompt', { required: true });
-    if (!agentExists(targetAgentId)) throw httpError('Target agent not found', 404);
+    const parentTaskId = input.parentTaskId === undefined
+      ? null
+      : text(input.parentTaskId, 'parentTaskId', { required: true, max: 200 });
+    const idempotencyKey = input.idempotencyKey === undefined
+      ? null
+      : text(input.idempotencyKey, 'idempotencyKey', { required: true, max: 200 });
+    if (idempotencyKey !== null && idempotencyKey.length < 8) {
+      throw httpError('idempotencyKey must be at least 8 characters');
+    }
+    const fingerprint = idempotencyKey === null
+      ? null
+      : requestFingerprint({ targetAgentId, prompt, parentTaskId });
 
     const callerLimit = Math.min(maxConcurrentPerCaller, Number(policy.maxConcurrent ?? maxConcurrentPerCaller));
     if (!Number.isInteger(callerLimit) || callerLimit < 1 || callerLimit > maxConcurrentPerCaller) {
@@ -248,7 +275,21 @@ export function createDelegationService(options = {}) {
       throw httpError('Caller depth policy is invalid', 500);
     }
     const id = randomUUID();
-    transaction(() => {
+    const outcome = transaction(() => {
+      if (idempotencyKey !== null) {
+        const existing = db.prepare(`
+          SELECT * FROM delegation_tasks
+          WHERE caller_id = ? AND caller_type = ? AND idempotency_key = ?
+        `).get(caller.id, caller.type ?? 'unknown', idempotencyKey);
+        if (existing) {
+          if (existing.request_hash !== fingerprint) {
+            throw httpError('idempotencyKey was already used with different task input', 409);
+          }
+          return { created: false, row: existing };
+        }
+      }
+
+      if (!agentExists(targetAgentId)) throw httpError('Target agent not found', 404);
       const activeForCaller = db.prepare(`
         SELECT COUNT(*) AS count FROM delegation_tasks
         WHERE caller_id = ? AND status IN ('queued', 'running')
@@ -272,9 +313,8 @@ export function createDelegationService(options = {}) {
         }
         parent = inbound[0] ?? null;
       }
-      if (input.parentTaskId) {
-        const requestedId = text(input.parentTaskId, 'parentTaskId', { required: true, max: 200 });
-        if (!parent || parent.id !== requestedId) {
+      if (parentTaskId !== null) {
+        if (!parent || parent.id !== parentTaskId) {
           throw httpError('Parent task does not match the calling agent active delegation', 403);
         }
       }
@@ -291,8 +331,9 @@ export function createDelegationService(options = {}) {
       db.prepare(`
         INSERT INTO delegation_tasks (
           id, trace_id, parent_task_id, depth, lineage_json, caller_id, caller_type,
-          caller_agent_id, target_agent_id, prompt, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+          caller_agent_id, idempotency_key, request_hash, target_agent_id, prompt,
+          status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
       `).run(
         id,
         traceId,
@@ -302,13 +343,17 @@ export function createDelegationService(options = {}) {
         caller.id,
         caller.type ?? 'unknown',
         caller.agentId ?? null,
+        idempotencyKey,
+        fingerprint,
         targetAgentId,
         prompt,
         now,
         now
       );
+      return { created: true, row: requireRow(id) };
     });
-    const submitted = publicTask(requireRow(id));
+    if (!outcome.created) return { ...publicTask(outcome.row), idempotentReplay: true };
+    const submitted = { ...publicTask(outcome.row), idempotentReplay: false };
     void execute(id).catch((error) => recordExecutionError(id, error));
     return submitted;
   }

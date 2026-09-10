@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { createDelegationService } from '../control-plane/delegation-service.mjs';
 
@@ -36,6 +37,37 @@ test('delegated tasks return stable handles and persist normalized results', asy
   assert.equal(completed.prompt, 'Do the research');
   assert.deepEqual(completed.usage, { totalTokens: 42 });
   assert.throws(() => service.get(submitted.id, agentB), { status: 403 });
+});
+
+test('idempotency keys replay one durable task and reject changed input', async (t) => {
+  let finish;
+  let dispatchCalls = 0;
+  const service = createDelegationService({
+    dispatch: () => {
+      dispatchCalls += 1;
+      return new Promise((resolve) => { finish = resolve; });
+    }
+  });
+  t.after(async () => {
+    finish?.({ status: 'succeeded' });
+    await service.close();
+  });
+
+  const input = { targetAgentId: 'a', prompt: 'Review the branch', idempotencyKey: 'review-branch-001' };
+  const first = service.submit(input, user);
+  const replayed = service.submit(input, user);
+
+  assert.equal(first.idempotentReplay, false);
+  assert.equal(replayed.idempotentReplay, true);
+  assert.equal(replayed.id, first.id);
+  assert.equal(dispatchCalls, 1);
+  assert.throws(
+    () => service.submit({ ...input, prompt: 'Review a different branch' }, user),
+    { status: 409 }
+  );
+
+  finish({ status: 'succeeded', output: 'done' });
+  await service.whenIdle();
 });
 
 test('lineage is derived from owned parent tasks and cycles fail closed', async (t) => {
@@ -199,4 +231,88 @@ test('durable tasks survive restart and in-flight work is never replayed', async
   finish({ status: 'succeeded' });
   await first.whenIdle();
   assert.equal(first.get(submitted.id, user).status, 'failed', 'the old completion cannot overwrite recovery');
+});
+
+test('idempotent submission replays the original handle after restart', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-dock-delegation-idempotency-'));
+  const path = join(directory, 'delegations.sqlite');
+  const input = { targetAgentId: 'a', prompt: 'Run once', idempotencyKey: 'durable-run-001' };
+  const first = createDelegationService({ path, dispatch: async () => ({ status: 'succeeded' }) });
+  const submitted = first.submit(input, user);
+  await first.whenIdle();
+  await first.close();
+
+  let replayDispatches = 0;
+  const restarted = createDelegationService({
+    path,
+    dispatch: async () => {
+      replayDispatches += 1;
+      return { status: 'succeeded' };
+    }
+  });
+  t.after(async () => {
+    await restarted.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const replayed = restarted.submit(input, user);
+  assert.equal(replayed.id, submitted.id);
+  assert.equal(replayed.idempotentReplay, true);
+  assert.equal(replayDispatches, 0);
+});
+
+test('version 1 delegation databases migrate without losing tasks', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-dock-delegation-v1-'));
+  const path = join(directory, 'delegations.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE delegation_tasks (
+      id TEXT PRIMARY KEY,
+      trace_id TEXT NOT NULL,
+      parent_task_id TEXT REFERENCES delegation_tasks(id),
+      depth INTEGER NOT NULL,
+      lineage_json TEXT NOT NULL,
+      caller_id TEXT NOT NULL,
+      caller_type TEXT NOT NULL,
+      caller_agent_id TEXT,
+      target_agent_id TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL,
+      worker_task_id TEXT,
+      output_text TEXT,
+      error TEXT,
+      usage_json TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+    PRAGMA user_version = 1;
+  `);
+  legacy.prepare(`
+    INSERT INTO delegation_tasks (
+      id, trace_id, depth, lineage_json, caller_id, caller_type,
+      target_agent_id, prompt, status, created_at, updated_at
+    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, 'succeeded', ?, ?)
+  `).run('legacy-task', 'legacy-trace', '["a"]', user.id, user.type, 'a', 'legacy prompt',
+    '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  legacy.close();
+
+  const service = createDelegationService({ path, dispatch: async () => ({ status: 'succeeded' }) });
+  t.after(async () => {
+    await service.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  assert.equal(service.get('legacy-task', user, { includePrompt: true }).prompt, 'legacy prompt');
+  const submitted = service.submit({
+    targetAgentId: 'a', prompt: 'new prompt', idempotencyKey: 'post-migration-001'
+  }, user);
+  const replayed = service.submit({
+    targetAgentId: 'a', prompt: 'new prompt', idempotencyKey: 'post-migration-001'
+  }, user);
+  assert.equal(replayed.id, submitted.id);
+  assert.equal(replayed.idempotentReplay, true);
+  await service.whenIdle();
 });

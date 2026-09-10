@@ -121,9 +121,20 @@ The equivalent Codex configuration is:
 [mcp_servers.agent-dock]
 url = "http://127.0.0.1:8787/mcp"
 bearer_token_env_var = "AGENT_DOCK_MCP_TOKEN"
+default_tools_approval_mode = "writes"
+
+[mcp_servers.agent-dock.tools.submit_agent_task]
+approval_mode = "approve"
 ```
 
 `AGENT_DOCK_MCP_TOKEN` and `AUTH_LOCAL_MCP_TOKEN` must contain the same value. The trusted-local token grants the MCP client local administrator capabilities, so do not reuse it as a worker or provider credential and never combine it with a non-loopback bind.
+
+`submit_agent_task` is intentionally advertised as a state-changing MCP tool. Interactive Codex sessions can approve it when prompted, but `codex exec` is non-interactive and rejects prompts. The per-tool `approval_mode = "approve"` setting is the narrow opt-in that permits headless delegation without enabling every Agent Dock write or disabling the Codex sandbox. Keep `cancel_agent_task` prompt-gated unless unattended cancellation is also an explicit local policy decision. For a one-off headless run, the equivalent CLI override is:
+
+```sh
+codex -c 'mcp_servers.agent-dock.tools.submit_agent_task.approval_mode="approve"' exec \
+  'Use Agent Dock to submit the requested work and return the delegated task ID.'
+```
 
 The registered safe tools are:
 
@@ -131,7 +142,7 @@ The registered safe tools are:
 |---|---|
 | `list_agents` | List safe summaries of visible delegation targets |
 | `get_agent_status` | Read an allowed agent's wrapper status |
-| `submit_agent_task` | Dispatch work and return a durable control-plane task handle; a busy worker can finish `skipped_busy` |
+| `submit_agent_task` | Dispatch work using a caller-generated idempotency key and return a durable control-plane task handle; a busy worker can finish `skipped_busy` |
 | `get_agent_task` | Poll an owned or assigned task and read its normalized result/usage |
 | `cancel_agent_task` | Request cancellation of a task owned by the caller |
 
@@ -143,7 +154,7 @@ For example, this lets `researcher` inspect and delegate to two agents, with bou
 MCP_AGENT_POLICIES_JSON={"researcher":{"tools":["list_agents","get_agent_status","submit_agent_task","get_agent_task","cancel_agent_task"],"targetAgentIds":["analyst","writer"],"maxDepth":3,"maxConcurrent":2}}
 ```
 
-Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. An agent's parent is derived from its current inbound delegation rather than accepted from tool input, so depth and cycle checks survive real agent-to-agent hops. Ambiguous lineage, excessive depth, cycles, and per-caller concurrency overflow fail closed.
+Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. Every MCP submission requires an `idempotencyKey` of 8-200 characters. Repeating the same key with the same caller and task input returns the original handle without dispatching again; reusing it for different input fails with `409`. Generate a fresh UUID or similarly unique value for each intended task and retain it until a definitive response is received. Tool-level failures return structured `error.code`, `error.status`, and `error.message` fields, so callers can distinguish authorization denial, conflict, rate limiting, and not-found responses from a transport failure with an unknown submission outcome. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. An agent's parent is derived from its current inbound delegation rather than accepted from tool input, so depth and cycle checks survive real agent-to-agent hops. Ambiguous lineage, excessive depth, cycles, and per-caller concurrency overflow fail closed.
 
 The control plane does not yet mint or exchange third-party agent tokens. The configured authorization server must issue an MCP-audience JWT with the required `agent_id` and scopes. That is an identity-provider provisioning concern, separate from the provider subscription credential isolated in each worker.
 

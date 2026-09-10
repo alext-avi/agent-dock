@@ -17,6 +17,7 @@ import {
 } from './data-attachments.mjs';
 import { createDelegationService } from './delegation-service.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
+import { createFleetUsageCache } from './fleet-usage.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
 import { createCredentialStore, environmentKeyProvider } from './credentials.mjs';
 import { createScheduler } from './scheduler.mjs';
@@ -260,7 +261,8 @@ export function createControlPlane(options = {}) {
     delegationDbPath: options.delegationDbPath ?? process.env.DELEGATION_DB_PATH ?? (dataPath ? join(dirname(dataPath), 'delegations.sqlite') : ':memory:'),
     schedulerEnabled: options.schedulerEnabled ?? process.env.SCHEDULER_ENABLED !== '0',
     schedulerIntervalMs: Number(options.schedulerIntervalMs ?? process.env.SCHEDULER_INTERVAL_MS ?? 1000),
-    mcpTaskTimeoutMs: Number(options.mcpTaskTimeoutMs ?? process.env.MCP_TASK_TIMEOUT_MS ?? 60 * 60 * 1000)
+    mcpTaskTimeoutMs: Number(options.mcpTaskTimeoutMs ?? process.env.MCP_TASK_TIMEOUT_MS ?? 60 * 60 * 1000),
+    mcpUsageStaleAfterMs: Number(options.mcpUsageStaleAfterMs ?? process.env.MCP_USAGE_STALE_AFTER_MS ?? 5 * 60 * 1000)
   };
   if (!config.workerToken) throw new Error('WORKER_TOKEN is required');
   if (!Number.isFinite(config.schedulerIntervalMs) || config.schedulerIntervalMs < 100) {
@@ -268,6 +270,9 @@ export function createControlPlane(options = {}) {
   }
   if (!Number.isFinite(config.mcpTaskTimeoutMs) || config.mcpTaskTimeoutMs < 1_000 || config.mcpTaskTimeoutMs > 24 * 60 * 60 * 1000) {
     throw new Error('MCP_TASK_TIMEOUT_MS must be between 1000 and 86400000');
+  }
+  if (!Number.isFinite(config.mcpUsageStaleAfterMs) || config.mcpUsageStaleAfterMs < 1_000 || config.mcpUsageStaleAfterMs > 24 * 60 * 60 * 1000) {
+    throw new Error('MCP_USAGE_STALE_AFTER_MS must be between 1000 and 86400000');
   }
   const auth = options.authService ?? createAuthService({
     sessionDbPath: dataPath ? join(dirname(dataPath), 'auth.sqlite') : ':memory:',
@@ -282,6 +287,10 @@ export function createControlPlane(options = {}) {
   const dataSources = new Map();
   const dataAttachments = new Map();
   const credentialRecords = new Map();
+  const fleetUsage = createFleetUsageCache({
+    clock: options.clock,
+    staleAfterMs: config.mcpUsageStaleAfterMs
+  });
   let persistQueue = Promise.resolve();
   let storageMutationQueue = Promise.resolve();
   const pendingAttachmentSets = new Map();
@@ -591,17 +600,24 @@ export function createControlPlane(options = {}) {
   }
 
   async function workerRequest(agent, method, pathname, body = undefined, timeout = 30_000) {
-    const { response } = await workerFetch(agent, pathname, {
-      method,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      timeout
-    });
-    const value = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const validationMessage = value.mcp?.validation?.errors?.map((item) => item.message).filter(Boolean).join('; ');
-      throw Object.assign(new Error(value.error ?? validationMessage ?? `Worker returned HTTP ${response.status}`), { status: response.status });
+    const observesUsage = ['/v1/status', '/v1/usage', '/v1/usage/refresh'].includes(pathname);
+    try {
+      const { response } = await workerFetch(agent, pathname, {
+        method,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        timeout
+      });
+      const value = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const validationMessage = value.mcp?.validation?.errors?.map((item) => item.message).filter(Boolean).join('; ');
+        throw Object.assign(new Error(value.error ?? validationMessage ?? `Worker returned HTTP ${response.status}`), { status: response.status });
+      }
+      if (observesUsage) fleetUsage.observe(agent, value);
+      return value;
+    } catch (error) {
+      if (observesUsage) fleetUsage.observeError(agent, error);
+      throw error;
     }
-    return value;
   }
 
   const attachmentsForAgent = (agentId) => [...dataAttachments.values()].filter((attachment) => attachment.agentId === agentId);
@@ -747,21 +763,30 @@ export function createControlPlane(options = {}) {
   });
 
   async function proxyJson(req, res, agent, pathname, timeout = 15_000) {
-    const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : null;
-    const { response: upstream, runtime } = await workerFetch(agent, pathname, { method: req.method, body: body?.length ? body : undefined, timeout });
-    const text = await upstream.text();
-    if (upstream.ok && runtime.managed && pathname === '/v1/status') {
+    const observesUsage = ['/v1/status', '/v1/usage', '/v1/usage/refresh'].includes(pathname);
+    try {
+      const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : null;
+      const { response: upstream, runtime } = await workerFetch(agent, pathname, { method: req.method, body: body?.length ? body : undefined, timeout });
+      const text = await upstream.text();
+      let parsed = null;
       try {
-        const status = JSON.parse(text);
-        if (status.agent?.id && status.agent.id !== runtime.workerId) {
+        parsed = JSON.parse(text);
+        if (upstream.ok && runtime.managed && pathname === '/v1/status' && parsed.agent?.id && parsed.agent.id !== runtime.workerId) {
           throw Object.assign(new Error('Runtime worker identity does not match its control-plane binding'), { status: 502 });
         }
       } catch (error) {
         if (error.status === 502) throw error;
       }
+      if (observesUsage) {
+        if (upstream.ok && parsed) fleetUsage.observe(agent, parsed);
+        else fleetUsage.observeError(agent, { status: upstream.ok ? 502 : upstream.status });
+      }
+      res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'cache-control': 'no-store' });
+      res.end(text);
+    } catch (error) {
+      if (observesUsage) fleetUsage.observeError(agent, error);
+      throw error;
     }
-    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'cache-control': 'no-store' });
-    res.end(text);
   }
 
   // A conversation is only forwarded to a runtime that has said it can continue
@@ -977,6 +1002,7 @@ export function createControlPlane(options = {}) {
     allows: auth.allows,
     allowsMcpPrincipal: auth.allowsMcpPrincipal,
     listAgents: () => [...agents.values()].filter((agent) => !deletingAgents.has(agent.id)).map(agentPublic),
+    listAgentUsage: (visibleAgents) => fleetUsage.list(visibleAgents),
     getAgentStatus: async (agentId) => workerRequest(requireAgent(agentId), 'GET', '/v1/status', undefined, 15_000),
     onerror: (error) => console.error('[control-plane:mcp]', error)
   });
@@ -1142,6 +1168,7 @@ export function createControlPlane(options = {}) {
           runtime.updatedAt = new Date().toISOString();
         }
         agents.delete(id);
+        fleetUsage.remove(id);
         for (const [bindingId, binding] of mcpBindings) {
           if (binding.agentId === id) mcpBindings.delete(bindingId);
         }

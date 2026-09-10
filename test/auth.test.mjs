@@ -211,9 +211,86 @@ test('trusted-local control-plane MCP is unavailable without its token and expos
     'cancel_agent_task',
     'get_agent_status',
     'get_agent_task',
+    'list_agent_usage',
     'list_agents',
     'submit_agent_task'
   ]);
+});
+
+test('control-plane MCP serves normalized fleet usage without fanning out to the worker', async (t) => {
+  const workerToken = 'fleet-usage-worker-token';
+  const mcpToken = 'fleet-usage-local-mcp-token-more-than-thirty-two-bytes';
+  let workerRequests = 0;
+  const worker = createServer((req, res) => {
+    workerRequests += 1;
+    if (req.headers.authorization !== `Bearer ${workerToken}`) {
+      res.writeHead(401).end();
+      return;
+    }
+    if (req.url !== '/v1/status') {
+      res.writeHead(404).end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      agent: { id: 'worker-01', adapter: { id: 'codex-cli', provider: 'openai' } },
+      capabilities: { usage: { requestTokens: true, quotaWindows: true, accountActivity: true } },
+      usage: {
+        updatedAt: '2026-09-10T11:59:00.000Z',
+        lastPollAt: '2026-09-10T11:59:30.000Z',
+        lastSuccessAt: '2026-09-10T11:59:30.000Z',
+        pollError: null,
+        pollErrorKind: null,
+        totals: { requests: 4, totalTokens: 80 },
+        quotaWindows: [{
+          id: 'session', label: 'Session', scope: 'primary', usedPercent: 40,
+          windowDurationMinutes: 300, resetsAt: Date.parse('2026-09-10T13:00:00.000Z') / 1000, reached: false
+        }],
+        account: { lifetimeTokens: 1_000 }
+      }
+    }));
+  });
+  const workerUrl = await listen(worker);
+  const control = createControlPlane({
+    workerUrl,
+    workerToken,
+    dataPath: null,
+    schedulerEnabled: false,
+    mcpUsageStaleAfterMs: 60_000,
+    clock: () => new Date('2026-09-10T12:00:00.000Z'),
+    auth: { mode: 'trusted-local', localMcpToken: mcpToken }
+  });
+  const url = await listen(control);
+  t.after(async () => {
+    await new Promise((resolve) => control.close(resolve));
+    await new Promise((resolve) => worker.close(resolve));
+  });
+
+  const status = await fetch(`${url}/api/v1/status`);
+  assert.equal(status.status, 200);
+  assert.equal(workerRequests, 1);
+
+  const response = await fetch(`${url}/mcp`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${mcpToken}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+      'mcp-protocol-version': '2025-06-18'
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_agent_usage', arguments: {} }
+    })
+  });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const data = text.split('\n').find((line) => line.startsWith('data: '));
+  const payload = JSON.parse(data ? data.slice(6) : text);
+  assert.equal(workerRequests, 1, 'the MCP usage read must use the control-plane cache');
+  assert.equal(payload.result.structuredContent.cache.workerRequestsMade, 0);
+  assert.equal(payload.result.structuredContent.agents[0].agentId, 'worker-01');
+  assert.equal(payload.result.structuredContent.agents[0].totals.totalTokens, 80);
+  assert.equal(payload.result.structuredContent.agents[0].quotaWindows[0].duration, '5h');
 });
 
 test('trusted-local control-plane MCP remains unavailable when no local token is configured', async (t) => {
@@ -674,6 +751,7 @@ test('audience-bound bearer tokens obey the same role and permission policy', as
     'cancel_agent_task',
     'get_agent_status',
     'get_agent_task',
+    'list_agent_usage',
     'list_agents',
     'submit_agent_task'
   ]);

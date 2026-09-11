@@ -2,7 +2,7 @@ import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { z } from 'zod';
 
-const READ_TOOLS = new Set(['list_agents', 'get_agent_status']);
+const READ_TOOLS = new Set(['list_agents', 'list_agent_usage', 'get_agent_status']);
 const TASK_TOOLS = new Set(['submit_agent_task', 'get_agent_task', 'cancel_agent_task']);
 const ALL_TOOLS = new Set([...READ_TOOLS, ...TASK_TOOLS]);
 
@@ -156,6 +156,8 @@ function canExposeTool(principal, policy, tool, allows, allowsMcpPrincipal) {
 
 export function createControlMcp(options = {}) {
   const listAgents = options.listAgents ?? (() => []);
+  const listAgentUsage = options.listAgentUsage;
+  if (typeof listAgentUsage !== 'function') throw new Error('Control-plane MCP requires the fleet usage cache');
   const getAgentStatus = options.getAgentStatus ?? (async () => { throw httpError('Agent status is unavailable', 503); });
   const delegation = options.delegation;
   if (!delegation) throw new Error('Control-plane MCP requires a delegation service');
@@ -183,6 +185,9 @@ export function createControlMcp(options = {}) {
     const policy = principal.type === 'agent' ? policies.get(principal.agentId) : null;
     const caller = callerFor(principal);
     const server = new McpServer({ name: 'agent-dock-control-plane', version: '0.1.0' });
+    const visibleAgents = async () => (await listAgents())
+      .filter((agent) => targetAllowed(principal, policy, agent.id))
+      .map(safeAgent);
 
     if (canExposeTool(principal, policy, 'list_agents', allows, allowsMcpPrincipal)) {
       server.registerTool('list_agents', {
@@ -191,9 +196,17 @@ export function createControlMcp(options = {}) {
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true }
       }, guarded(async () => {
-        const agents = (await listAgents()).filter((agent) => targetAllowed(principal, policy, agent.id)).map(safeAgent);
-        return toolResult({ agents });
+        return toolResult({ agents: await visibleAgents() });
       }));
+    }
+
+    if (canExposeTool(principal, policy, 'list_agent_usage', allows, allowsMcpPrincipal)) {
+      server.registerTool('list_agent_usage', {
+        title: 'List agent usage',
+        description: 'Read one normalized fleet usage snapshot from the control-plane cache. Unlike get_agent_status, this never contacts workers or refreshes providers; unlike get_agent_task, it reports cumulative agent telemetry rather than one delegated task.',
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true }
+      }, guarded(async () => toolResult(await listAgentUsage(await visibleAgents()))));
     }
 
     if (canExposeTool(principal, policy, 'get_agent_status', allows, allowsMcpPrincipal)) {

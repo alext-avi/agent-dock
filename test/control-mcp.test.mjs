@@ -78,6 +78,7 @@ test('agent MCP policies reject unknown tools and invalid limits', () => {
 });
 
 test('control-plane MCP exposes only policy-scoped delegation tools and targets', async (t) => {
+  let usageTargets = [];
   const delegation = createDelegationService({
     dispatch: async (task) => ({ status: 'succeeded', taskId: `worker-${task.id}`, output: `done:${task.prompt}` })
   });
@@ -85,7 +86,7 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
     publicOrigin: 'http://127.0.0.1:3000',
     agentPolicies: {
       caller: {
-        tools: ['list_agents', 'submit_agent_task', 'get_agent_task'],
+        tools: ['list_agents', 'list_agent_usage', 'submit_agent_task', 'get_agent_task'],
         targetAgentIds: ['target'],
         maxDepth: 2,
         maxConcurrent: 1
@@ -97,7 +98,16 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
     listAgents: () => [
       { id: 'target', name: 'Target', description: '', adapter: 'codex-cli', runtime: { state: 'running', managed: true, dedicated: true } },
       { id: 'hidden', name: 'Hidden', description: '', adapter: 'claude-code', runtime: { state: 'running', managed: true, dedicated: true } }
-    ]
+    ],
+    listAgentUsage: (visibleAgents) => {
+      usageTargets = visibleAgents.map((agent) => agent.id);
+      return {
+        schemaVersion: 1,
+        generatedAt: '2026-09-10T12:00:00.000Z',
+        cache: { strategy: 'opportunistic', staleAfterSeconds: 300, workerRequestsMade: 0 },
+        agents: visibleAgents.map((agent) => ({ agentId: agent.id, telemetry: { state: 'available' } }))
+      };
+    }
   });
   const server = createServer((req, res) => {
     const principal = JSON.parse(Buffer.from(req.headers['x-test-principal'], 'base64url').toString('utf8'));
@@ -119,10 +129,11 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
   };
 
   const listed = await rpc(`${base}/mcp`, principal, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
-  assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
+  assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agent_usage', 'list_agents', 'submit_agent_task']);
   assert.equal(listed.result.tools.find((tool) => tool.name === 'submit_agent_task').annotations.idempotentHint, true);
+  assert.equal(listed.result.tools.find((tool) => tool.name === 'list_agent_usage').annotations.readOnlyHint, true);
   const modernListed = await modernRpc(`${base}/mcp`, principal, 'tools/list');
-  assert.deepEqual(modernListed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agents', 'submit_agent_task']);
+  assert.deepEqual(modernListed.result.tools.map((tool) => tool.name).sort(), ['get_agent_task', 'list_agent_usage', 'list_agents', 'submit_agent_task']);
 
   const oversized = await fetch(`${base}/mcp`, {
     method: 'POST',
@@ -141,6 +152,13 @@ test('control-plane MCP exposes only policy-scoped delegation tools and targets'
     jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_agents', arguments: {} }
   });
   assert.deepEqual(visible.result.structuredContent.agents.map((agent) => agent.id), ['target']);
+
+  const usage = await rpc(`${base}/mcp`, principal, {
+    jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'list_agent_usage', arguments: {} }
+  });
+  assert.deepEqual(usageTargets, ['target'], 'authorization filtering must happen before reading usage');
+  assert.deepEqual(usage.result.structuredContent.agents.map((agent) => agent.agentId), ['target']);
+  assert.equal(usage.result.structuredContent.cache.workerRequestsMade, 0);
 
   const denied = await rpc(`${base}/mcp`, principal, {
     jsonrpc: '2.0', id: 3, method: 'tools/call', params: {

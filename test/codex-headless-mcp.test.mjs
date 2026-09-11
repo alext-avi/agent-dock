@@ -106,7 +106,13 @@ async function createMcpHarness({ dropFirstSubmitResponse = false } = {}) {
       name: 'Target',
       adapter: 'codex-cli',
       runtime: { state: 'running', managed: true, dedicated: true }
-    }]
+    }],
+    listAgentUsage: (visibleAgents) => ({
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      cache: { strategy: 'opportunistic', staleAfterSeconds: 300, workerRequestsMade: 0 },
+      agents: visibleAgents.map((agent) => ({ agentId: agent.id, telemetry: { state: 'unavailable' } }))
+    })
   });
 
   let droppedSubmitResponses = 0;
@@ -332,15 +338,16 @@ test('Codex headless denies an MCP write tool without explicit preauthorization'
   assert.ok(mcp.authHeaders.every((header) => header === `Bearer ${MCP_TOKEN}`));
 });
 
-test('Codex headless can list, submit, recover from a lost response, and poll with scoped approval', {
+test('Codex headless can read fleet usage, submit, recover from a lost response, and poll with scoped approval', {
   skip: availability.skip,
   timeout: 30_000
 }, async (t) => {
   const mcp = await createMcpHarness({ dropFirstSubmitResponse: true });
   const model = await createModelHarness(({ sequence }) => {
     if (sequence === 1) return functionCall(sequence, 'list_agents', {});
-    if (sequence === 2 || sequence === 3) return functionCall(sequence, 'submit_agent_task', TASK_INPUT);
-    if (sequence === 4) {
+    if (sequence === 2) return functionCall(sequence, 'list_agent_usage', {});
+    if (sequence === 3 || sequence === 4) return functionCall(sequence, 'submit_agent_task', TASK_INPUT);
+    if (sequence === 5) {
       assert.ok(mcp.taskId, 'the accepted submission should expose a durable task id before polling');
       return functionCall(sequence, 'get_agent_task', { taskId: mcp.taskId });
     }
@@ -358,6 +365,7 @@ test('Codex headless can list, submit, recover from a lost response, and poll wi
     .map((event) => event.item);
 
   assert.equal(calls.find((call) => call.tool === 'list_agents')?.status, 'completed');
+  assert.equal(calls.find((call) => call.tool === 'list_agent_usage')?.status, 'completed');
   assert.ok(calls.some((call) => call.tool === 'submit_agent_task' && call.status === 'completed'));
   assert.equal(calls.find((call) => call.tool === 'get_agent_task')?.status, 'completed');
   assert.equal(mcp.droppedSubmitResponses, 1);
@@ -366,9 +374,10 @@ test('Codex headless can list, submit, recover from a lost response, and poll wi
   const namespace = model.requests[0]?.tools?.find((tool) => tool.name === 'mcp__agent_dock');
   assert.deepEqual(
     namespace?.tools?.map((tool) => tool.name).sort(),
-    ['cancel_agent_task', 'get_agent_status', 'get_agent_task', 'list_agents', 'submit_agent_task']
+    ['cancel_agent_task', 'get_agent_status', 'get_agent_task', 'list_agent_usage', 'list_agents', 'submit_agent_task']
   );
   assert.match(result.stdout, /"idempotentReplay":true/);
+  assert.match(result.stdout, /"strategy":"opportunistic"/);
   assert.match(result.stdout, /"status":"succeeded"/);
   assert.ok(mcp.authHeaders.length > 0);
   assert.ok(mcp.authHeaders.every((header) => header === `Bearer ${MCP_TOKEN}`));

@@ -141,6 +141,7 @@ The registered safe tools are:
 | Tool | Capability |
 |---|---|
 | `list_agents` | List safe summaries of visible delegation targets |
+| `list_agent_usage` | Read one normalized, cached usage snapshot for visible agents without contacting workers |
 | `get_agent_status` | Read an allowed agent's wrapper status |
 | `submit_agent_task` | Dispatch work using a caller-generated idempotency key and return a durable control-plane task handle; a busy worker can finish `skipped_busy` |
 | `get_agent_task` | Poll an owned or assigned task and read its normalized result/usage |
@@ -151,8 +152,10 @@ Human MCP bearers need positive authorization: an explicit administrator/operato
 For example, this lets `researcher` inspect and delegate to two agents, with bounded fan-out and depth:
 
 ```dotenv
-MCP_AGENT_POLICIES_JSON={"researcher":{"tools":["list_agents","get_agent_status","submit_agent_task","get_agent_task","cancel_agent_task"],"targetAgentIds":["analyst","writer"],"maxDepth":3,"maxConcurrent":2}}
+MCP_AGENT_POLICIES_JSON={"researcher":{"tools":["list_agents","list_agent_usage","get_agent_status","submit_agent_task","get_agent_task","cancel_agent_task"],"targetAgentIds":["analyst","writer"],"maxDepth":3,"maxConcurrent":2}}
 ```
+
+`list_agent_usage` is deliberately a cache-only fleet read. It performs no worker or provider requests, and authorization filtering happens before the cache is read. Successful ordinary reads of a worker's status, usage, or usage-refresh endpoint replace that agent's cached snapshot; a failed read preserves the last successful values and marks them stale. A cold cache reports `unavailable`, explicit lack of vendor telemetry reports `unsupported`, and supported zero usage remains zero. Snapshots older than five minutes are reported as `stale` by default; configure the policy with `MCP_USAGE_STALE_AFTER_MS`. The response uses a stable provider-neutral schema with support flags, token totals, quota windows, account activity, optional monetary budget, compact durations such as `5h`, and reset labels.
 
 Delegated task records live in `/control-data/delegations.sqlite`. Handles, caller/target identity, trace lineage, result text, normalized usage, and terminal state survive a restart. Every MCP submission requires an `idempotencyKey` of 8-200 characters. Repeating the same key with the same caller and task input returns the original handle without dispatching again; reusing it for different input fails with `409`. Generate a fresh UUID or similarly unique value for each intended task and retain it until a definitive response is received. Tool-level failures return structured `error.code`, `error.status`, and `error.message` fields, so callers can distinguish authorization denial, conflict, rate limiting, and not-found responses from a transport failure with an unknown submission outcome. In-flight tasks are marked failed rather than replayed after a restart, preventing an autonomous side effect from being executed twice. An agent's parent is derived from its current inbound delegation rather than accepted from tool input, so depth and cycle checks survive real agent-to-agent hops. Ambiguous lineage, excessive depth, cycles, and per-caller concurrency overflow fail closed.
 

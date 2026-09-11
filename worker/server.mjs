@@ -14,6 +14,7 @@ import { createConversationStore, normalizeConversationId } from './conversation
 import { authorizeWorkerRequest } from './workload-auth.mjs';
 
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+const CLAUDE_AUTH_STATUS_TTL_MS = 30_000;
 
 function clean(text) {
   return text.replace(ANSI, '').replace(/\r/g, '');
@@ -47,7 +48,8 @@ async function readJson(req, limit = 128 * 1024) {
 
 function capture(command, args, options = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    const { spawnImpl = spawn, ...spawnOptions } = options;
+    const child = spawnImpl(command, args, { ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     const timer = setTimeout(() => child.kill('SIGTERM'), options.timeout ?? 10_000);
     child.stdout.on('data', (data) => { output += data; });
@@ -230,6 +232,11 @@ export function createWorkerServer(options = {}) {
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
   if (!['token', 'jwt', 'hybrid'].includes(config.authMode)) throw new Error('WORKER_AUTH_MODE must be token, jwt, or hybrid');
+  const spawnProcess = options.spawn ?? spawn;
+  const captureCommand = (command, args, captureOptions = {}) => capture(command, args, {
+    ...captureOptions,
+    spawnImpl: spawnProcess
+  });
 
   // The manifest states what the adapter implements; this states what this
   // instance actually has switched on. Claude Code has no supported quota
@@ -261,6 +268,11 @@ export function createWorkerServer(options = {}) {
     usage: initialUsage(),
     usagePollPromise: null,
     authRefreshPromise: null,
+    providerVersion: null,
+    providerVersionPromise: null,
+    claudeAuthStatus: null,
+    claudeAuthStatusPromise: null,
+    claudeCredentialMarker: null,
     demoAuthLastRefreshAt: new Date().toISOString(),
     providerLastCheckedAt: null
   };
@@ -300,7 +312,7 @@ export function createWorkerServer(options = {}) {
     statePath: config.mcpStatePath,
     configDir: config.mcpConfigDir,
     providerConfigPath: config.opencodeConfigPath,
-    run: capture,
+    run: captureCommand,
     demoMode: config.demoMode
   });
 
@@ -326,6 +338,9 @@ export function createWorkerServer(options = {}) {
     state.usage.retryAfterAt = Number.isFinite(stored) && stored > Date.now()
       ? Math.min(stored, ceiling)
       : null;
+    if (claudeUsageEnabled) {
+      state.claudeCredentialMarker = (await readClaudeCredentialState()).marker;
+    }
   }
 
   async function persistUsage() {
@@ -562,18 +577,104 @@ export function createWorkerServer(options = {}) {
     };
   }
 
-  async function readClaudeAuthStatus() {
-    const result = await capture('claude', ['auth', 'status'], { env: providerEnv, cwd: config.workspace, timeout: 15_000 });
+  function oauthExpiry(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const numeric = Number(value);
+    const milliseconds = Number.isFinite(numeric)
+      ? (numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+      : Date.parse(value);
+    return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
+  }
+
+  async function readClaudeCredentialState() {
+    const credentialPath = claudeCredentialPaths(config.claudeHome, providerEnv.CLAUDE_CONFIG_DIR)[0];
+    try {
+      const [raw, metadata] = await Promise.all([readFile(credentialPath, 'utf8'), stat(credentialPath)]);
+      const parsed = JSON.parse(raw);
+      const oauth = parsed?.claudeAiOauth;
+      const accessTokenStored = typeof oauth?.accessToken === 'string' && oauth.accessToken.length > 0;
+      const hasRefreshToken = typeof oauth?.refreshToken === 'string' && oauth.refreshToken.length > 0;
+      const accessTokenExpiresAt = oauthExpiry(oauth?.expiresAt);
+      const accessTokenExpired = accessTokenExpiresAt !== null && Date.parse(accessTokenExpiresAt) <= Date.now();
+      const credentialStored = accessTokenStored || hasRefreshToken;
+      // Claude Code owns refresh. A stale access token does not make the session
+      // logged out while its refresh token remains available: `claude -p` can
+      // rotate it, whereas a direct quota request cannot.
+      const authenticated = credentialStored && (hasRefreshToken || !accessTokenExpired);
+      return {
+        authenticated,
+        credentialStored,
+        hasRefreshToken,
+        accessTokenExpiresAt,
+        accessTokenExpired,
+        lastRefreshAt: new Date(metadata.mtimeMs).toISOString(),
+        // Process-local change detector only. No token or stable token hash is
+        // returned or persisted; inode/mtime/size and expiry are enough to
+        // notice Claude Code atomically replacing its credential file.
+        marker: `${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${accessTokenExpiresAt ?? ''}`,
+        error: null
+      };
+    } catch (error) {
+      return {
+        authenticated: false,
+        credentialStored: false,
+        hasRefreshToken: false,
+        accessTokenExpiresAt: null,
+        accessTokenExpired: false,
+        lastRefreshAt: null,
+        marker: error.code === 'ENOENT' ? 'missing' : `unreadable:${error.name}`,
+        error: error.code === 'ENOENT' ? null : clean(error.message).slice(-500)
+      };
+    }
+  }
+
+  async function readClaudeCredentialAuthStatus() {
+    const credential = await readClaudeCredentialState();
+    return {
+      authenticated: credential.authenticated,
+      credential,
+      detail: credential.authenticated
+        ? credential.accessTokenExpired
+          ? 'Claude Code session is refreshable; access token refresh is deferred to the next task'
+          : 'Claude Code credential is stored'
+        : credential.error ?? 'Not authenticated'
+    };
+  }
+
+  async function probeClaudeAuthStatus() {
+    const result = await captureCommand('claude', ['auth', 'status'], {
+      env: providerEnv,
+      cwd: config.workspace,
+      timeout: 15_000
+    });
     let status = null;
     try { status = JSON.parse(result.output); }
     catch { /* Older releases may return text despite the documented JSON default. */ }
-    const authenticated = result.code === 0 && (status ? Boolean(status.loggedIn ?? status.authenticated ?? status.isAuthenticated) : !/not logged in|logged out|authentication required/i.test(result.output));
+    const authenticated = result.code === 0 && (status
+      ? Boolean(status.loggedIn ?? status.authenticated ?? status.isAuthenticated)
+      : !/not logged in|logged out|authentication required/i.test(result.output));
     const method = status?.authMethod && status.authMethod !== 'none' ? status.authMethod : 'Claude Code';
     return { authenticated, status, detail: authenticated ? `Authenticated with ${method}` : 'Not authenticated' };
   }
 
+  async function observeClaudeCredentialRotation() {
+    if (!claudeUsageEnabled) return false;
+    const current = await readClaudeCredentialState();
+    const previous = state.claudeCredentialMarker;
+    state.claudeCredentialMarker = current.marker;
+    const rotated = previous !== null && current.marker !== previous;
+    if (!rotated || state.usage.pollErrorKind !== 'unauthenticated') return false;
+
+    // The backoff belonged to the credential that received the 401/403. Once
+    // Claude Code has replaced that credential, permit one immediate recovery
+    // read. The marker update above makes this a one-shot exception; normal
+    // polling floors apply again after this attempt.
+    state.usage.retryAfterAt = null;
+    return true;
+  }
+
   async function readOpenCodeAuthStatus() {
-    const result = await capture('opencode', ['auth', 'list'], { env: providerEnv, cwd: config.workspace, timeout: 15_000 });
+    const result = await captureCommand('opencode', ['auth', 'list'], { env: providerEnv, cwd: config.workspace, timeout: 15_000 });
     const empty = /(?:0\s+credentials|no\s+(?:stored\s+)?credentials|not\s+authenticated)/i.test(result.output);
     const providerLines = result.output
       .split('\n')
@@ -606,16 +707,16 @@ export function createWorkerServer(options = {}) {
     }
 
     if (config.adapterId === 'claude-code') {
-      const login = await readClaudeAuthStatus();
+      const credential = await readClaudeCredentialState();
       return {
-        authMode: login.status?.authMethod ?? login.status?.authMode ?? 'claude.ai',
+        authMode: 'claude.ai',
         storage: 'cli-managed',
-        credentialStored: login.authenticated,
-        hasRefreshToken: null,
+        credentialStored: credential.credentialStored,
+        hasRefreshToken: credential.hasRefreshToken,
         canForceRefresh: false,
-        lastRefreshAt: null,
-        accessTokenExpiresAt: null,
-        error: null
+        lastRefreshAt: credential.lastRefreshAt,
+        accessTokenExpiresAt: credential.accessTokenExpiresAt,
+        error: credential.error
       };
     }
 
@@ -685,7 +786,7 @@ export function createWorkerServer(options = {}) {
     }
 
     return new Promise((resolve, reject) => {
-      const child = spawn('codex', ['app-server', '--listen', 'stdio://'], {
+      const child = spawnProcess('codex', ['app-server', '--listen', 'stdio://'], {
         cwd: config.workspace,
         env: providerEnv,
         stdio: ['pipe', 'pipe', 'pipe']
@@ -812,6 +913,7 @@ export function createWorkerServer(options = {}) {
   async function refreshAccountUsage({ force = false } = {}) {
     await usageReady;
     if (state.usagePollPromise) return state.usagePollPromise;
+    const recoveringCredential = await observeClaudeCredentialRotation();
     const lastPoll = state.usage.lastPollAt ? Date.parse(state.usage.lastPollAt) : 0;
     // The dashboard polls /v1/status every few seconds per agent, and each
     // authenticated status read asks for a usage refresh, so this floor is what
@@ -820,7 +922,7 @@ export function createWorkerServer(options = {}) {
       ? Math.max(config.usagePollIntervalMs, config.claudeUsageIntervalMs)
       : config.usagePollIntervalMs;
     const bounded = !force || claudeUsageEnabled;
-    if (bounded && lastPoll && Date.now() - lastPoll < minimumInterval) return publicUsage();
+    if (!recoveringCredential && bounded && lastPoll && Date.now() - lastPoll < minimumInterval) return publicUsage();
 
     state.usagePollPromise = (async () => {
       if (config.adapterId === 'codex-cli') {
@@ -912,17 +1014,64 @@ export function createWorkerServer(options = {}) {
 
   async function authStatus() {
     if (config.demoMode) return { authenticated: true, detail: 'Demo mode' };
-    const result = config.adapterId === 'claude-code'
-      ? await readClaudeAuthStatus()
-      : config.adapterId === 'opencode'
+    // A second CLI probe during interactive login competes for the same auth
+    // state and can also overwrite waiting_for_user with an older stored
+    // credential. The live login transcript is authoritative until it exits.
+    if (state.loginProcess) return { authenticated: false, detail: 'Authentication is in progress' };
+    let result;
+    if (config.adapterId === 'claude-code') {
+      // A task owns the Claude process slot because it may rotate OAuth state.
+      // Status remains available from non-invasive worker-local credential
+      // metadata while that task is active.
+      if (state.activeJob) {
+        // Do not let an earlier probe veto a refreshable session: the supported
+        // task path is the component that can exchange the refresh token.
+        result = await readClaudeCredentialAuthStatus();
+      } else if (state.claudeAuthStatus && state.claudeAuthStatus.expiresAt > Date.now()) {
+        result = state.claudeAuthStatus.result;
+      } else {
+        if (!state.claudeAuthStatusPromise) {
+          state.claudeAuthStatusPromise = probeClaudeAuthStatus().then((probed) => {
+            state.claudeAuthStatus = { result: probed, expiresAt: Date.now() + CLAUDE_AUTH_STATUS_TTL_MS };
+            return probed;
+          });
+        }
+        try { result = await state.claudeAuthStatusPromise; }
+        finally { state.claudeAuthStatusPromise = null; }
+      }
+    } else {
+      result = config.adapterId === 'opencode'
         ? await readOpenCodeAuthStatus()
-        : await capture('codex', ['login', 'status'], { env: providerEnv, cwd: config.workspace });
+        : await captureCommand('codex', ['login', 'status'], { env: providerEnv, cwd: config.workspace });
+    }
     const authenticated = config.adapterId === 'codex-cli'
       ? result.code === 0 && !/not logged in/i.test(result.output)
       : result.authenticated;
     if (authenticated) state.auth.phase = 'authenticated';
     else if (!state.loginProcess && state.auth.phase !== 'failed') state.auth.phase = 'needs_auth';
     return { authenticated, detail: result.detail ?? result.output ?? 'No login status returned' };
+  }
+
+  async function providerVersion() {
+    if (config.demoMode) return { code: 0, output: `${adapterManifest.id} demo` };
+    if (state.providerVersion) return { code: 0, output: state.providerVersion };
+    // Even `--version` is another Claude process sharing the CLI home. It does
+    // not need credentials, but there is no reason to start it next to a task or
+    // browser login. The next idle status request will fill the cache.
+    if (config.adapterId === 'claude-code' && (state.activeJob || state.loginProcess)) {
+      return { code: 0, output: adapterManifest.displayName };
+    }
+    if (state.providerVersionPromise) return state.providerVersionPromise;
+    state.providerVersionPromise = captureCommand(
+      config.adapterId === 'claude-code' ? 'claude' : config.adapterId === 'opencode' ? 'opencode' : 'codex',
+      ['--version'],
+      { env: providerEnv }
+    ).then((result) => {
+      if (result.code === 0 && result.output) state.providerVersion = result.output;
+      return result;
+    });
+    try { return await state.providerVersionPromise; }
+    finally { state.providerVersionPromise = null; }
   }
 
   function publicAuthentication({ login = null, session = null } = {}) {
@@ -943,10 +1092,27 @@ export function createWorkerServer(options = {}) {
     };
   }
 
-  function startLogin() {
+  async function startLogin() {
     if (config.demoMode) return publicAuthentication();
+    if (state.activeJob) {
+      throw Object.assign(new Error('Wait for the active task to finish before starting authentication'), { status: 409 });
+    }
     if (state.loginProcess) return publicAuthentication();
+    // Claim login synchronously, before waiting for an older status lookup, so
+    // neither a task nor a second login can enter beside it.
+    const loginClaim = { claim: true };
+    state.loginProcess = loginClaim;
     state.auth = { phase: 'waiting_for_user', transcript: '', verificationUrl: null, userCode: null };
+    if (config.adapterId === 'claude-code') {
+      state.claudeAuthStatus = null;
+      try {
+        await Promise.all([state.claudeAuthStatusPromise, state.providerVersionPromise].filter(Boolean));
+      } catch (error) {
+        if (state.loginProcess === loginClaim) state.loginProcess = null;
+        state.auth.phase = 'failed';
+        throw error;
+      }
+    }
     const openCodeGitHub = config.adapterId === 'opencode' && config.opencodeAuthProvider === 'github-copilot';
     const command = config.adapterId === 'claude-code'
       ? 'claude'
@@ -958,11 +1124,18 @@ export function createWorkerServer(options = {}) {
           ? ['-qefc', 'opencode auth login --provider github-copilot', '/dev/null']
           : ['auth', 'login', '--provider', config.opencodeAuthProvider]
         : ['login', '--device-auth'];
-    const child = spawn(command, args, {
-      cwd: config.workspace,
-      env: providerEnv,
-      stdio: [['claude-code', 'opencode'].includes(config.adapterId) ? 'pipe' : 'ignore', 'pipe', 'pipe']
-    });
+    let child;
+    try {
+      child = spawnProcess(command, args, {
+        cwd: config.workspace,
+        env: providerEnv,
+        stdio: [['claude-code', 'opencode'].includes(config.adapterId) ? 'pipe' : 'ignore', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      if (state.loginProcess === loginClaim) state.loginProcess = null;
+      state.auth.phase = 'failed';
+      throw error;
+    }
     state.loginProcess = child;
     let openCodePromptStarted = false;
     let openCodeDeploymentSelected = false;
@@ -1005,12 +1178,14 @@ export function createWorkerServer(options = {}) {
     child.stderr.on('data', consume);
     child.once('error', (error) => {
       consume(`\n${error.message}`);
+      if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = 'failed';
       state.auth.verificationUrl = null;
       state.auth.userCode = null;
       state.loginProcess = null;
     });
     child.once('close', (code) => {
+      if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = code === 0 ? 'authenticated' : 'failed';
       state.auth.verificationUrl = null;
       state.auth.userCode = null;
@@ -1024,7 +1199,7 @@ export function createWorkerServer(options = {}) {
     if (config.adapterId !== 'claude-code') {
       throw Object.assign(new Error(`${adapterManifest.displayName} does not require a browser authorization code`), { status: 409 });
     }
-    if (!state.loginProcess || state.auth.phase !== 'waiting_for_user') {
+    if (!state.loginProcess || state.loginProcess.claim || state.auth.phase !== 'waiting_for_user') {
       throw Object.assign(new Error('Start Claude Code login before submitting an authorization code'), { status: 409 });
     }
     if (typeof code !== 'string' || !code.trim() || code.length > 8192 || /[\r\n]/.test(code)) {
@@ -1107,7 +1282,7 @@ export function createWorkerServer(options = {}) {
 
     const mcpContext = await mcpManager.taskContext(providerEnv);
 
-    const child = spawn('codex', args, {
+    const child = spawnProcess('codex', args, {
       cwd: config.workspace,
       env: mcpContext.env,
       stdio: ['pipe', 'pipe', 'pipe']
@@ -1164,7 +1339,7 @@ export function createWorkerServer(options = {}) {
     if (config.allowUnsandboxed) args.push('--dangerously-skip-permissions');
     else args.push('--permission-mode', 'dontAsk');
 
-    const child = spawn('claude', args, {
+    const child = spawnProcess('claude', args, {
       cwd: config.workspace,
       env: mcpContext.env,
       stdio: ['pipe', 'pipe', 'pipe']
@@ -1217,7 +1392,7 @@ export function createWorkerServer(options = {}) {
     if (config.allowUnsandboxed) args.push('--auto');
     args.push(fullPrompt);
 
-    const child = spawn('opencode', args, {
+    const child = spawnProcess('opencode', args, {
       cwd: config.workspace,
       env: mcpContext.env,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -1314,12 +1489,7 @@ export function createWorkerServer(options = {}) {
 
       if (req.method === 'GET' && route === '/v1/status') {
         await usageReady;
-        const [login, version] = await Promise.all([
-          authStatus(),
-          config.demoMode
-            ? Promise.resolve({ output: `${adapterManifest.id} demo` })
-            : capture(config.adapterId === 'claude-code' ? 'claude' : config.adapterId === 'opencode' ? 'opencode' : 'codex', ['--version'], { env: providerEnv })
-        ]);
+        const [login, version] = await Promise.all([authStatus(), providerVersion()]);
         if (login.authenticated && !state.activeJob) await refreshAccountUsage();
         const session = await authSessionMetadata();
         return json(res, 200, wrapperResponse({
@@ -1350,7 +1520,7 @@ export function createWorkerServer(options = {}) {
       }
 
       if (req.method === 'POST' && route === '/v1/auth/login') {
-        startLogin();
+        await startLogin();
         await new Promise((resolve) => setTimeout(resolve, 350));
         return json(res, 202, wrapperResponse({ authentication: publicAuthentication() }));
       }
@@ -1426,9 +1596,18 @@ export function createWorkerServer(options = {}) {
         // the loser's exchange written to a session nothing would reference again.
         state.activeJob = { id: null, status: 'claiming', claim: true };
         const release = () => { if (state.activeJob?.claim) state.activeJob = null; };
+        if (state.loginProcess) {
+          return release() ?? json(res, 409, wrapperResponse({ error: 'Finish the current authentication flow before running a task' }));
+        }
         let body;
         try { body = await readJson(req); }
         catch (error) { release(); throw error; }
+        // A status request may have started a bounded auth or one-time version
+        // lookup just before this task claimed the worker. Let it exit before
+        // Claude starts so the task remains the sole CLI process.
+        if (config.adapterId === 'claude-code') {
+          await Promise.all([state.claudeAuthStatusPromise, state.providerVersionPromise].filter(Boolean));
+        }
         const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
         const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : '';
         if (!prompt) return release() ?? json(res, 400, wrapperResponse({ error: 'prompt is required' }));

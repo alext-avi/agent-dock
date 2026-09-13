@@ -2574,8 +2574,14 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
     ? `Session expires ${timeUntil(session.accessTokenExpiresAt)}`
     : 'Session connected · expand for controls';
   const refreshing = refreshingAuth || workerRefreshing;
+  const canForceRefresh = session.canForceRefresh === true;
+  // Some harnesses (notably Claude Code) own refresh-token rotation internally
+  // and expose no supported command for forcing it. Do not present an inert
+  // button as the remedy; the login action above remains available to replace
+  // the CLI-managed session explicitly.
+  ui.refreshAuth.classList.toggle('hidden', !canForceRefresh);
   ui.refreshAuth.textContent = refreshing ? 'Refreshing session…' : 'Force session refresh';
-  ui.refreshAuth.disabled = refreshing || active || !session.canForceRefresh;
+  ui.refreshAuth.disabled = refreshing || active || !canForceRefresh;
   if (workerRefreshing) {
     ui.authRefreshMessage.textContent = `${currentHarnessName} is renewing the managed session…`;
     ui.authRefreshMessage.classList.remove('error');
@@ -2761,6 +2767,9 @@ function renderStatus(status) {
   // still considers present can be rejected upstream. When that happens the UI
   // asks the operator to sign in again, so the control has to allow it.
   const credentialRejected = status.usage?.pollErrorKind === 'unauthenticated';
+  const accessTokenExpiry = Date.parse(status.authentication?.session?.accessTokenExpiresAt ?? '');
+  const sessionExpired = Number.isFinite(accessTokenExpiry) && accessTokenExpiry <= Date.now();
+  const authNeedsAttention = !authenticated || credentialRejected || sessionExpired;
   ui.authBox.classList.toggle('authenticated', authenticated && !credentialRejected);
   ui.authTitle.textContent = authenticated ? `${currentHarnessName} session` : `Connect ${currentHarnessName}`;
   const browserOAuth = status.authentication?.method === 'browser_oauth';
@@ -2774,22 +2783,26 @@ function renderStatus(status) {
   const waiting = status.authentication?.phase === 'waiting_for_user';
   ui.authButton.textContent = waiting
     ? 'Waiting for sign-in'
-    : credentialRejected
-      ? 'Sign in again'
-      : authenticated
-        ? 'Connected'
+    : authenticated
+        ? 'Re-authenticate'
         : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
-  ui.authButton.disabled = waiting || (authenticated && !credentialRejected);
+  ui.authButton.disabled = waiting || active;
   ui.authBox.classList.toggle('rejected', credentialRejected);
-  if (!authenticated) {
+  if (authNeedsAttention) {
     ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user'
       ? (browserOAuth ? 'Waiting for browser authentication' : 'Waiting for device authentication')
-      : 'Authentication required';
-    if (ui.runtimeDetails.dataset.autoOpened !== 'true') {
+      : credentialRejected
+        ? 'Provider rejected the session · re-authentication required'
+        : sessionExpired
+          ? 'Session expired · re-authentication available'
+          : 'Authentication required';
+    // Open once when the session first enters a state that needs attention.
+    // Polling must not reopen it after an operator deliberately collapses it.
+    if (ui.runtimeDetails.dataset.authNeedsAttention !== 'true') {
       ui.runtimeDetails.open = true;
-      ui.runtimeDetails.dataset.autoOpened = 'true';
     }
   }
+  ui.runtimeDetails.dataset.authNeedsAttention = String(authNeedsAttention);
   renderAuth(status.authentication);
   renderAuthSession(status.authentication?.session, { authenticated, active, workerRefreshing: status.authentication?.refreshing });
   renderUsage(status.usage);

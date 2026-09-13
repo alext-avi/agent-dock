@@ -823,20 +823,23 @@ test('a credential the provider rejects offers a way to sign in again', async (t
   });
   await page.goto(`${isolated.url}/agents/${isolated.agents['claude-code'].id}`);
 
-  // Healthy: the harness holds a login and there is nothing to act on.
-  await page.waitForFunction(() => document.querySelector('#auth-button')?.textContent === 'Connected');
-  assert.equal(await page.locator('#auth-button').isDisabled(), true);
+  // Healthy: replacing a CLI-managed login remains an explicit operator action.
+  await page.waitForFunction(() => document.querySelector('#auth-button')?.textContent === 'Re-authenticate');
+  assert.equal(await page.locator('#auth-button').isDisabled(), false);
 
   // The provider rejects the token while the harness still reports a login.
   // Telling someone to sign in again with every control disabled is a dead end.
   isolated.claude.healthy = false;
   await page.waitForFunction(
-    () => document.querySelector('#auth-button')?.textContent === 'Sign in again',
+    () => document.querySelector('#auth-copy')?.textContent?.includes('rejected it'),
     null,
     { timeout: 15_000 }
   );
+  assert.equal(await page.locator('#auth-button').textContent(), 'Re-authenticate');
   assert.equal(await page.locator('#auth-button').isDisabled(), false, 'the only offered remedy was not clickable');
   assert.match(await page.locator('#auth-copy').textContent(), /rejected it/);
+  assert.equal(await page.locator('#runtime-details').getAttribute('open'), '', 'the remedy stayed hidden in a collapsed disclosure');
+  assert.equal(await page.locator('#refresh-auth').isVisible(), false, 'an unsupported force-refresh action was presented as a disabled remedy');
 });
 
 test('image drift is shown only for a managed runtime that is behind', async (t) => {

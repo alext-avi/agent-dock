@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { createWorkerServer } from '../worker/server.mjs';
 import {
@@ -37,6 +38,65 @@ async function claudeHomeWithCredential(t, credential = { claudeAiOauth: { acces
   await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify(credential));
   t.after(() => rm(home, { recursive: true, force: true }));
   return home;
+}
+
+function controlledClaudeSpawner({ authenticated = true } = {}) {
+  const calls = [];
+  let finishTask = null;
+  let announceTask;
+  const taskStarted = new Promise((resolve) => { announceTask = resolve; });
+
+  function makeChild() {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.killed = false;
+    child.kill = () => {
+      if (child.killed) return;
+      child.killed = true;
+      setImmediate(() => child.emit('close', 143));
+    };
+    child.stdin = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    return child;
+  }
+
+  return {
+    calls,
+    taskStarted,
+    spawn(command, args, options) {
+      calls.push({ command, args: [...args], options });
+      const child = makeChild();
+      if (command !== 'claude') {
+        setImmediate(() => child.emit('error', new Error(`Unexpected command: ${command}`)));
+        return child;
+      }
+      if (args.length === 1 && args[0] === '--version') {
+        setImmediate(() => {
+          child.stdout.write('Claude Code test-version\n');
+          child.emit('close', 0);
+        });
+        return child;
+      }
+      if (args[0] === '-p') {
+        finishTask = () => setImmediate(() => child.emit('close', 0));
+        announceTask();
+        return child;
+      }
+      if (args[0] === 'auth' && args[1] === 'status') {
+        setImmediate(() => {
+          child.stdout.write(`${JSON.stringify({ loggedIn: authenticated, authMethod: authenticated ? 'oauth' : 'none' })}\n`);
+          child.emit('close', authenticated ? 0 : 1);
+        });
+        return child;
+      }
+      setImmediate(() => child.emit('error', new Error(`Unexpected Claude arguments: ${args.join(' ')}`)));
+      return child;
+    },
+    finishTask() {
+      if (!finishTask) throw new Error('No fake Claude task is running');
+      finishTask();
+    }
+  };
 }
 
 test('Claude usage normalization prefers limits[] and drops unrecognized buckets', async () => {
@@ -192,6 +252,142 @@ test('Claude credential reading fails closed on an unfamiliar shape', async (t) 
     () => readClaudeOAuthToken(['/definitely/not/here/.credentials.json']),
     (error) => error.kind === 'malformed'
   );
+});
+
+test('Claude tasks own token refresh without competing auth-status subprocesses', async (t) => {
+  const token = 'claude-auth-lifecycle';
+  const expiredAt = Date.now() - 60_000;
+  const home = await claudeHomeWithCredential(t, {
+    claudeAiOauth: {
+      accessToken: ACCESS_TOKEN,
+      refreshToken: 'refresh-test-do-not-disclose',
+      expiresAt: expiredAt
+    }
+  });
+  const fake = controlledClaudeSpawner();
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    workspace: process.cwd(),
+    dataPath: null,
+    mcpStatePath: null,
+    mcpConfigDir: join(home, 'mcp'),
+    claudeHome: home,
+    spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}` };
+
+  // Start cold, without asking the CLI whether it is logged in. The refresh
+  // token in the private credential file is enough to let Claude Code own its
+  // supported refresh path when the task process starts.
+  const response = await fetch(`${workerUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'refresh safely' })
+  });
+  assert.equal(response.status, 200);
+  await fake.taskStarted;
+  assert.deepEqual(fake.calls.map((call) => call.args[0]), ['-p']);
+
+  // Live status polling during the task must be file-only: neither an auth
+  // probe nor even a version subprocess gets to share Claude's auth home.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const status = await (await fetch(`${workerUrl}/v1/status`, { headers })).json();
+    assert.equal(status.authentication.authenticated, true);
+    assert.equal(status.authentication.session.hasRefreshToken, true);
+    assert.equal(status.authentication.session.accessTokenExpiresAt, new Date(expiredAt).toISOString());
+    assert.equal(status.task.active.status, 'running');
+  }
+  assert.equal(fake.calls.length, 1, 'status polling spawned a competing Claude process');
+  const loginWhileBusy = await fetch(`${workerUrl}/v1/auth/login`, { method: 'POST', headers });
+  assert.equal(loginWhileBusy.status, 409, 'interactive login started beside an active Claude task');
+  assert.equal(fake.calls.length, 1, 'the rejected login still spawned a Claude process');
+
+  fake.finishTask();
+  await response.text();
+
+  // The first idle status performs and caches one supported CLI auth probe and
+  // the immutable container CLI version. Repeated live polls stay file/cache
+  // only for the bounded TTL.
+  const idleStatuses = await Promise.all(Array.from({ length: 4 }, async () => (
+    await (await fetch(`${workerUrl}/v1/status`, { headers })).json()
+  )));
+  for (const status of idleStatuses) {
+    assert.equal(status.agent.version, 'Claude Code test-version');
+  }
+  await fetch(`${workerUrl}/v1/status`, { headers });
+  assert.equal(fake.calls.filter((call) => call.args[0] === '--version').length, 1);
+  assert.equal(fake.calls.filter((call) => call.args[0] === 'auth' && call.args[1] === 'status').length, 1);
+});
+
+test('a refreshable Claude credential can start a task after a stale negative auth probe', async (t) => {
+  const token = 'claude-stale-auth-probe';
+  const home = await claudeHomeWithCredential(t, {
+    claudeAiOauth: {
+      accessToken: ACCESS_TOKEN,
+      refreshToken: 'refresh-test-do-not-disclose',
+      expiresAt: Date.now() - 60_000
+    }
+  });
+  const fake = controlledClaudeSpawner({ authenticated: false });
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    workspace: process.cwd(),
+    dataPath: null,
+    mcpStatePath: null,
+    mcpConfigDir: join(home, 'mcp'),
+    claudeHome: home,
+    spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}` };
+
+  const probed = await (await fetch(`${workerUrl}/v1/status`, { headers })).json();
+  assert.equal(probed.authentication.authenticated, false);
+
+  const response = await fetch(`${workerUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'let the task refresh' })
+  });
+  assert.equal(response.status, 200);
+  await fake.taskStarted;
+  fake.finishTask();
+  await response.text();
+  assert.equal(fake.calls.filter((call) => call.args[0] === 'auth').length, 1);
+  assert.equal(fake.calls.filter((call) => call.args[0] === '-p').length, 1);
+});
+
+test('an expired Claude access token without a refresh token cannot start a task', async (t) => {
+  const token = 'claude-expired-unrefreshable';
+  const home = await claudeHomeWithCredential(t, {
+    claudeAiOauth: { accessToken: ACCESS_TOKEN, expiresAt: Date.now() - 60_000 }
+  });
+  const fake = controlledClaudeSpawner();
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    workspace: process.cwd(),
+    dataPath: null,
+    mcpStatePath: null,
+    mcpConfigDir: join(home, 'mcp'),
+    claudeHome: home,
+    spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+
+  const response = await fetch(`${workerUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'must not run' })
+  });
+  assert.equal(response.status, 409);
+  assert.equal(fake.calls.length, 0);
 });
 
 test('Claude usage fetch classifies every failure of an undocumented endpoint', async (t) => {
@@ -588,6 +784,122 @@ test('a failed poll keeps the last good windows and marks them stale', async (t)
     ['session', 'weekly_all', 'weekly_scoped:fable']
   );
   assert.equal(degraded.usage.lastSuccessAt, good.usage.lastSuccessAt, 'a failed poll must not advance data freshness');
+});
+
+test('Claude credential rotation gets one immediate quota recovery attempt', async (t) => {
+  const token = 'claude-usage-rotation';
+  const oldAccessToken = 'old-access-test-do-not-disclose';
+  const newAccessToken = 'new-access-test-do-not-disclose';
+  const home = await claudeHomeWithCredential(t, {
+    claudeAiOauth: {
+      accessToken: oldAccessToken,
+      refreshToken: 'refresh-test-do-not-disclose',
+      expiresAt: Date.now() - 60_000
+    }
+  });
+  const payload = await fixture('claude-usage-limits');
+  let calls = 0;
+  const fake = controlledClaudeSpawner();
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    workspace: process.cwd(),
+    dataPath: null,
+    mcpStatePath: null,
+    mcpConfigDir: join(home, 'mcp'),
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 60_000,
+    spawn: fake.spawn,
+    claudeUsageFetch: (_url, init) => {
+      calls += 1;
+      return init.headers.authorization === `Bearer ${newAccessToken}`
+        ? jsonResponse(payload)
+        : jsonResponse({ error: 'expired' }, { status: 401 });
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}` };
+
+  const rejected = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+  assert.equal(calls, 1);
+  assert.equal(rejected.usage.pollErrorKind, 'unauthenticated');
+  assert.equal(rejected.usage.nextAttemptReason, 'provider-backoff');
+
+  const taskResponse = await fetch(`${workerUrl}/v1/tasks`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'rotate the credential through Claude Code' })
+  });
+  assert.equal(taskResponse.status, 200);
+  await fake.taskStarted;
+
+  // Model the atomic credential replacement Claude Code performs inside its
+  // supported task path when it exchanges the refresh token.
+  await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({
+    claudeAiOauth: {
+      accessToken: newAccessToken,
+      refreshToken: 'rotated-refresh-test-do-not-disclose',
+      expiresAt: Date.now() + 3_600_000
+    }
+  }));
+  fake.finishTask();
+  await taskResponse.text();
+
+  const recovered = await (await fetch(`${workerUrl}/v1/usage`, { headers })).json();
+  assert.equal(calls, 2, 'the rotated credential did not bypass its predecessor\'s backoff');
+  assert.equal(recovered.usage.pollError, null);
+  assert.equal(recovered.usage.pollErrorKind, null);
+  assert.ok(recovered.usage.lastSuccessAt);
+  assert.equal(recovered.usage.quotaWindows.length, 3);
+
+  // The exception is one-shot. Once the new credential succeeds, the normal
+  // floor immediately governs it again.
+  await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+  assert.equal(calls, 2, 'credential recovery disabled the normal quota floor');
+
+  const serialized = JSON.stringify(recovered);
+  assert.ok(!serialized.includes(oldAccessToken));
+  assert.ok(!serialized.includes(newAccessToken));
+  assert.ok(!serialized.includes('rotated-refresh'));
+});
+
+test('credential rotation does not override a provider throttling backoff', async (t) => {
+  const token = 'claude-usage-throttle-rotation';
+  const home = await claudeHomeWithCredential(t, {
+    claudeAiOauth: { accessToken: ACCESS_TOKEN, refreshToken: 'refresh-one', expiresAt: Date.now() + 60_000 }
+  });
+  let calls = 0;
+  const worker = createWorkerServer({
+    token,
+    adapter: 'claude-code',
+    demoMode: true,
+    workspace: process.cwd(),
+    dataPath: null,
+    claudeHome: home,
+    claudeOAuthUsage: true,
+    usagePollIntervalMs: 0,
+    claudeUsageIntervalMs: 0,
+    claudeUsageFetch: () => {
+      calls += 1;
+      return jsonResponse({ error: 'slow down' }, { status: 429, headers: { 'retry-after': '600' } });
+    }
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}` };
+
+  await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers });
+  await writeFile(join(home, '.claude', '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { accessToken: 'rotated-access', refreshToken: 'refresh-two', expiresAt: Date.now() + 120_000 }
+  }));
+  const held = await (await fetch(`${workerUrl}/v1/usage/refresh`, { method: 'POST', headers })).json();
+
+  assert.equal(calls, 1);
+  assert.equal(held.usage.pollErrorKind, 'throttled');
+  assert.equal(held.usage.nextAttemptReason, 'provider-backoff');
 });
 
 test('a failing telemetry source keeps local request history intact', async (t) => {

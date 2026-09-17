@@ -141,6 +141,7 @@ flowchart LR
 - Device authentication is initiated by the unmodified Codex CLI and surfaced as a URL/code.
 - The card shows safe session metadata, including access-token expiry and last refresh time, without returning credentials to the control plane.
 - A user can force Codex's supported managed-session refresh through app-server; this does not run a model turn.
+- A manual, vendor-neutral "check & renew session" action exists beside the durable session controls. It is never invoked by polling and runs only when a user clicks it. For Claude Code, which owns refresh internally and exposes no dedicated refresh endpoint, it runs one deliberately tiny `claude -p` request with a fixed prompt and safe non-interactive flags to exercise the CLI's supported OAuth refresh path, and normalizes the outcome as renewed, current, quota exhausted, needing re-authentication, or check failed; an adapter with no such path (Codex, OpenCode) answers with a normalized unsupported result rather than a Claude-specific control-plane endpoint. Only safe credential metadata is inspected before and after the request — never a raw token.
 - The adapters convert `codex exec --json`, `claude -p --output-format stream-json`, and `opencode run --format json` output into canonical, vendor-neutral task events.
 - The agent can create durable artifacts in its isolated workspace.
 - Each completed request records input, cached-input, output, total-token, duration, and outcome metrics in the `agent-data` volume.
@@ -190,6 +191,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `POST` | `/api/v1/agents/:id/auth/login` | Start the adapter's interactive login flow |
 | `POST` | `/api/v1/agents/:id/auth/complete` | Forward a provider-issued one-time browser authorization code to a waiting CLI |
 | `POST` | `/api/v1/agents/:id/auth/refresh` | Ask the adapter to refresh its managed session |
+| `POST` | `/api/v1/agents/:id/auth/session-check` | Manually check/renew the provider session with one minimal request; never invoked by polling |
 | `POST` | `/api/v1/agents/:id/tasks` | Run `{ "prompt": "..." }` with saved durable instructions; returns canonical NDJSON |
 | `POST` | `/api/v1/agents/:id/tasks/cancel` | Safely cancel `{ "taskId": "..." }` only if it is still active and the worker advertises targeted cancellation |
 | `GET` | `/api/v1/agents/:id/workspace` | List worker artifacts (not their contents) |

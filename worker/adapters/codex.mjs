@@ -6,7 +6,10 @@ export const codexAdapterManifest = Object.freeze({
   provider: 'openai',
   displayName: 'Codex',
   capabilities: {
-    authentication: { methods: ['device_code'], refresh: true },
+    // No manual session-check request path: Codex's own `refresh: true`
+    // already covers forcing a renewal, so this stays unsupported rather than
+    // duplicating it.
+    authentication: { methods: ['device_code'], refresh: true, sessionCheck: { supported: false, mayConsumeUsage: false } },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     mcp: codexMcpCapabilities,
     usage: { requestTokens: true, accountActivity: true, quotaWindows: true },

@@ -15,7 +15,7 @@ export const opencodeAdapterManifest = Object.freeze({
   provider: 'multi-provider',
   displayName: 'OpenCode',
   capabilities: {
-    authentication: { methods: ['provider_device_code'], refresh: false },
+    authentication: { methods: ['provider_device_code'], refresh: false, sessionCheck: { supported: false, mayConsumeUsage: false } },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     providers: { list: true, discovery: true, localConnections: true },
     models: { discovery: true, selection: true, orderedFallback: false },

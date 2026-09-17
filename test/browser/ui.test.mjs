@@ -842,6 +842,35 @@ test('a credential the provider rejects offers a way to sign in again', async (t
   assert.equal(await page.locator('#refresh-auth').isVisible(), false, 'an unsupported force-refresh action was presented as a disabled remedy');
 });
 
+test('the Claude session check is explicit, warns about usage, and stays hidden for unsupported adapters', async (t) => {
+  const claude = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+
+  let checks = 0;
+  await page.route(`**/api/v1/agents/${claude.id}/auth/session-check`, async (route) => {
+    checks += 1;
+    await route.continue();
+  });
+  await page.goto(`${app.url}/agents/${claude.id}`);
+  const button = page.locator('#session-check');
+  await button.waitFor({ state: 'visible' });
+  assert.match(await button.locator('xpath=..').textContent(), /may consume.*subscription usage/i);
+
+  // Live status polling must never turn this paid provider operation into an
+  // implicit background check.
+  await page.waitForTimeout(3_500);
+  assert.equal(checks, 0);
+
+  await button.click();
+  await page.waitForFunction(() => document.querySelector('#session-check-message')?.textContent?.includes('Demo mode'));
+  assert.equal(checks, 1);
+
+  await page.goto(`${app.url}/agents/${app.agents['codex-cli'].id}`);
+  await page.waitForFunction(() => document.querySelector('#agent-name')?.textContent === 'Codex');
+  assert.equal(await page.locator('#session-check').isVisible(), false);
+});
+
 test('image drift is shown only for a managed runtime that is behind', async (t) => {
   // The tag does not move when an image is rebuilt, so drift is decided by the
   // image id. Bumping it is what a rebuild looks like to the control plane.

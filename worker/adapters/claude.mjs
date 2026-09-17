@@ -6,7 +6,14 @@ export const claudeAdapterManifest = Object.freeze({
   provider: 'anthropic',
   displayName: 'Claude Code',
   capabilities: {
-    authentication: { methods: ['browser_oauth'], refresh: false },
+    authentication: {
+      methods: ['browser_oauth'],
+      refresh: false,
+      // A manual, user-triggered probe distinct from `refresh`: it exercises
+      // Claude Code's supported OAuth refresh path with one tiny `claude -p`
+      // request rather than any endpoint this wrapper could call directly.
+      sessionCheck: { supported: true, mayConsumeUsage: true }
+    },
     tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
     mcp: claudeMcpCapabilities,
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },

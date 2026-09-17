@@ -205,6 +205,9 @@ const ui = {
   authLastRefreshDetail: $('#auth-last-refresh-detail'),
   refreshAuth: $('#refresh-auth'),
   authRefreshMessage: $('#auth-refresh-message'),
+  sessionCheck: $('#session-check'),
+  sessionCheckHint: $('#session-check-hint'),
+  sessionCheckMessage: $('#session-check-message'),
   quotaWindows: $('#quota-windows'),
   lastRequestTokens: $('#last-request-tokens'),
   lastRequestTime: $('#last-request-time'),
@@ -290,6 +293,7 @@ let activeTestRunToken = null;
 let followTranscript = true;
 let authPolling = null;
 let refreshingAuth = false;
+let sessionCheckInFlight = false;
 let currentAgent = null;
 let currentHarnessName = 'Agent';
 let dashboardAgents = [];
@@ -2556,10 +2560,17 @@ function renderAuth(auth = {}) {
   ui.authTranscript.textContent = auth.challenge?.instructions || 'Waiting for the device login instructions…';
 }
 
-function renderAuthSession(session = {}, { authenticated = false, active = false, workerRefreshing = false } = {}) {
+function renderAuthSession(session = {}, {
+  authenticated = false,
+  active = false,
+  workerRefreshing = false,
+  sessionCheckSupported = false,
+  sessionCheckMayConsumeUsage = false
+} = {}) {
   ui.authSession.classList.toggle('hidden', !authenticated);
   if (!authenticated) {
     ui.authRefreshMessage.textContent = '';
+    ui.sessionCheckMessage.textContent = '';
     return;
   }
   const expiry = session.accessTokenExpiresAt ? new Date(session.accessTokenExpiresAt) : null;
@@ -2581,7 +2592,7 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
   // the CLI-managed session explicitly.
   ui.refreshAuth.classList.toggle('hidden', !canForceRefresh);
   ui.refreshAuth.textContent = refreshing ? 'Refreshing session…' : 'Force session refresh';
-  ui.refreshAuth.disabled = refreshing || active || !canForceRefresh;
+  ui.refreshAuth.disabled = refreshing || active || sessionCheckInFlight || !canForceRefresh;
   if (workerRefreshing) {
     ui.authRefreshMessage.textContent = `${currentHarnessName} is renewing the managed session…`;
     ui.authRefreshMessage.classList.remove('error');
@@ -2589,6 +2600,14 @@ function renderAuthSession(session = {}, { authenticated = false, active = false
     ui.authRefreshMessage.textContent = session.error;
     ui.authRefreshMessage.classList.add('error');
   }
+  // A manual, deliberately rare request: never wired into polling, and hidden
+  // entirely for adapters (Codex, OpenCode) that do not advertise it.
+  ui.sessionCheck.classList.toggle('hidden', !sessionCheckSupported);
+  ui.sessionCheckHint.textContent = sessionCheckMayConsumeUsage
+    ? 'Sends one minimal provider request; may consume a small amount of subscription usage.'
+    : 'Checks the provider-managed session without consuming model usage.';
+  if (!sessionCheckInFlight) ui.sessionCheck.textContent = 'Check & renew session';
+  ui.sessionCheck.disabled = !sessionCheckSupported || active || refreshing || sessionCheckInFlight;
 }
 
 function renderQuotaRow(label, window, stale = false) {
@@ -2804,7 +2823,13 @@ function renderStatus(status) {
   }
   ui.runtimeDetails.dataset.authNeedsAttention = String(authNeedsAttention);
   renderAuth(status.authentication);
-  renderAuthSession(status.authentication?.session, { authenticated, active, workerRefreshing: status.authentication?.refreshing });
+  renderAuthSession(status.authentication?.session, {
+    authenticated,
+    active: active || status.authentication?.checking === true,
+    workerRefreshing: status.authentication?.refreshing,
+    sessionCheckSupported: status.capabilities?.authentication?.sessionCheck?.supported === true,
+    sessionCheckMayConsumeUsage: status.capabilities?.authentication?.sessionCheck?.mayConsumeUsage === true
+  });
   renderUsage(status.usage);
 }
 
@@ -2933,6 +2958,33 @@ async function refreshAuthentication() {
     await refreshStatus();
     ui.authRefreshMessage.textContent = message;
     ui.authRefreshMessage.classList.toggle('error', failed);
+  }
+}
+
+// Manual only: never called from status polling or any live-update loop. The
+// worker's own detail text already distinguishes renewed/current/quota/reauth
+// outcomes, so it is shown as-is rather than re-derived here.
+async function checkSession() {
+  if (sessionCheckInFlight || refreshingAuth || running) return;
+  sessionCheckInFlight = true;
+  ui.sessionCheck.disabled = true;
+  ui.sessionCheck.textContent = 'Checking session…';
+  ui.sessionCheckMessage.textContent = `Sending one minimal request to ${currentHarnessName}…`;
+  ui.sessionCheckMessage.classList.remove('error');
+  let message = '';
+  let failed = false;
+  try {
+    const result = await api(agentApi('auth/session-check'), { method: 'POST', body: '{}' });
+    message = result.sessionCheck?.detail ?? 'Session check completed.';
+    failed = ['reauth_required', 'check_failed'].includes(result.sessionCheck?.result);
+  } catch (error) {
+    failed = true;
+    message = error.message;
+  } finally {
+    sessionCheckInFlight = false;
+    await refreshStatus();
+    ui.sessionCheckMessage.textContent = message;
+    ui.sessionCheckMessage.classList.toggle('error', failed);
   }
 }
 
@@ -3507,6 +3559,7 @@ ui.newConversation.addEventListener('click', startNewTestConversation);
 ui.conversation.addEventListener('scroll', handleTranscriptScroll);
 ui.refreshUsage.addEventListener('click', refreshUsage);
 ui.refreshAuth.addEventListener('click', refreshAuthentication);
+ui.sessionCheck.addEventListener('click', checkSession);
 ui.signOut.addEventListener('click', signOut);
 ui.accessPolicyButton.addEventListener('click', () => ui.accessPolicyDialog.showModal());
 $('#close-access-policy').addEventListener('click', () => ui.accessPolicyDialog.close());

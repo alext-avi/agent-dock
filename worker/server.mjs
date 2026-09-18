@@ -127,6 +127,7 @@ const LEGACY_ROUTES = new Map([
   ['/providers', '/v1/providers'],
   ['/auth/start', '/v1/auth/login'],
   ['/auth/complete', '/v1/auth/complete'],
+  ['/auth/cancel', '/v1/auth/cancel'],
   ['/auth/refresh', '/v1/auth/refresh'],
   ['/workspace', '/v1/workspace'],
   ['/usage', '/v1/usage'],
@@ -1240,7 +1241,7 @@ export function createWorkerServer(options = {}) {
     if (state.loginProcess) return publicAuthentication();
     // Claim login synchronously, before waiting for an older status lookup, so
     // neither a task nor a second login can enter beside it.
-    const loginClaim = { claim: true };
+    const loginClaim = { claim: true, cancelled: false };
     state.loginProcess = loginClaim;
     state.auth = { phase: 'waiting_for_user', transcript: '', verificationUrl: null, userCode: null };
     if (config.adapterId === 'claude-code') {
@@ -1248,9 +1249,18 @@ export function createWorkerServer(options = {}) {
       try {
         await Promise.all([state.claudeAuthStatusPromise, state.providerVersionPromise].filter(Boolean));
       } catch (error) {
-        if (state.loginProcess === loginClaim) state.loginProcess = null;
-        state.auth.phase = 'failed';
-        throw error;
+        if (state.loginProcess === loginClaim) {
+          state.loginProcess = null;
+          state.auth.phase = 'failed';
+          throw error;
+        }
+        return publicAuthentication({ login: await authStatus(), session: await authSessionMetadata() });
+      }
+      // Cancellation can arrive while this login claim is waiting for an older
+      // Claude status/version process. Do not spawn a login after the operator
+      // has already cancelled it.
+      if (state.loginProcess !== loginClaim || loginClaim.cancelled) {
+        return publicAuthentication({ login: await authStatus(), session: await authSessionMetadata() });
       }
     }
     const openCodeGitHub = config.adapterId === 'opencode' && config.opencodeAuthProvider === 'github-copilot';
@@ -1280,6 +1290,7 @@ export function createWorkerServer(options = {}) {
     let openCodePromptStarted = false;
     let openCodeDeploymentSelected = false;
     const consume = (chunk) => {
+      if (state.loginProcess !== child) return;
       const cleanedChunk = clean(chunk.toString('utf8'));
       const repetitiveOpenCodeSpinner = config.adapterId === 'opencode'
         && state.auth.verificationUrl
@@ -1317,6 +1328,7 @@ export function createWorkerServer(options = {}) {
     child.stdout.on('data', consume);
     child.stderr.on('data', consume);
     child.once('error', (error) => {
+      if (state.loginProcess !== child) return;
       consume(`\n${error.message}`);
       if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = 'failed';
@@ -1325,6 +1337,7 @@ export function createWorkerServer(options = {}) {
       state.loginProcess = null;
     });
     child.once('close', (code) => {
+      if (state.loginProcess !== child) return;
       if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = code === 0 ? 'authenticated' : 'failed';
       state.auth.verificationUrl = null;
@@ -1345,8 +1358,49 @@ export function createWorkerServer(options = {}) {
     if (typeof code !== 'string' || !code.trim() || code.length > 8192 || /[\r\n]/.test(code)) {
       throw Object.assign(new Error('code must be a single non-empty line'), { status: 400 });
     }
-    state.loginProcess.stdin.end(`${code.trim()}\n`);
+    if (!state.loginProcess.stdin?.writable || state.loginProcess.stdin.destroyed) {
+      throw Object.assign(new Error('The authentication process is no longer accepting a code; cancel it and start again'), { status: 409 });
+    }
+    // Claude can reject a mistyped or partially copied code and prompt again.
+    // Keep stdin open so the operator can correct it without restarting the
+    // whole OAuth flow.
+    state.loginProcess.stdin.write(`${code.trim()}\n`);
     return publicAuthentication();
+  }
+
+  async function cancelLogin() {
+    const current = state.loginProcess;
+    if (!current) {
+      throw Object.assign(new Error('No authentication flow is in progress'), { status: 409 });
+    }
+    if (current.claim) current.cancelled = true;
+    state.loginProcess = null;
+    if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
+    state.auth = { phase: 'unknown', transcript: '', verificationUrl: null, userCode: null };
+    if (!current.claim) {
+      // Do not immediately start an auth-status probe beside the login process
+      // we are cancelling. Wait briefly for a clean exit, then escalate so an
+      // uncooperative CLI cannot retain the provider-process slot forever.
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(forceTimer);
+          clearTimeout(giveUpTimer);
+          resolve();
+        };
+        const forceTimer = setTimeout(() => current.kill('SIGKILL'), 1_000);
+        const giveUpTimer = setTimeout(finish, 2_000);
+        forceTimer.unref?.();
+        giveUpTimer.unref?.();
+        current.once('close', finish);
+        current.once('error', finish);
+        current.kill('SIGTERM');
+      });
+    }
+    const login = await authStatus();
+    return publicAuthentication({ login, session: await authSessionMetadata() });
   }
 
   // A provider names the session in its own error output when a resume fails, and
@@ -1668,6 +1722,10 @@ export function createWorkerServer(options = {}) {
       if (req.method === 'POST' && route === '/v1/auth/complete') {
         const body = await readJson(req, 16 * 1024);
         return json(res, 202, wrapperResponse({ authentication: completeLogin(body.code) }));
+      }
+
+      if (req.method === 'POST' && route === '/v1/auth/cancel') {
+        return json(res, 200, wrapperResponse({ authentication: await cancelLogin() }));
       }
 
       if (req.method === 'POST' && route === '/v1/auth/refresh') {

@@ -294,6 +294,7 @@ let followTranscript = true;
 let authPolling = null;
 let refreshingAuth = false;
 let sessionCheckInFlight = false;
+let loginInProgress = false;
 let currentAgent = null;
 let currentHarnessName = 'Agent';
 let dashboardAgents = [];
@@ -2800,12 +2801,13 @@ function renderStatus(status) {
       ? `The worker starts ${currentHarnessName}'s browser OAuth flow. Agent Dock forwards only the provider's one-time completion code and never stores it.`
       : `The worker starts ${currentHarnessName}'s device flow. This UI displays only the sign-in URL and one-time code.`;
   const waiting = status.authentication?.phase === 'waiting_for_user';
+  loginInProgress = waiting;
   ui.authButton.textContent = waiting
-    ? 'Waiting for sign-in'
+    ? 'Cancel sign-in'
     : authenticated
         ? 'Re-authenticate'
         : status.authentication?.method === 'browser_oauth' ? 'Start browser login' : 'Start device login';
-  ui.authButton.disabled = waiting || active;
+  ui.authButton.disabled = active;
   ui.authBox.classList.toggle('rejected', credentialRejected);
   if (authNeedsAttention) {
     ui.runtimeDetailsHint.textContent = status.authentication?.phase === 'waiting_for_user'
@@ -2892,6 +2894,7 @@ async function refreshAgentLive() {
 }
 
 async function startAuth() {
+  if (loginInProgress) return cancelAuthentication();
   ui.authButton.disabled = true;
   ui.runtimeDetails.open = true;
   try {
@@ -2905,6 +2908,26 @@ async function startAuth() {
   }
 }
 
+async function cancelAuthentication() {
+  ui.authButton.disabled = true;
+  ui.authButton.textContent = 'Cancelling sign-in…';
+  try {
+    const result = await api(agentApi('auth/cancel'), { method: 'POST', body: '{}' });
+    loginInProgress = false;
+    renderAuth(result.authentication);
+    if (authPolling) {
+      clearInterval(authPolling);
+      authPolling = null;
+    }
+    await refreshStatus();
+  } catch (error) {
+    ui.authRefreshMessage.textContent = error.message;
+    ui.authRefreshMessage.classList.add('error');
+    ui.authButton.disabled = false;
+    ui.authButton.textContent = 'Cancel sign-in';
+  }
+}
+
 async function completeAuthentication(event) {
   event.preventDefault();
   const code = ui.authCompletionCode.value.trim();
@@ -2915,7 +2938,7 @@ async function completeAuthentication(event) {
     const result = await api(agentApi('auth/complete'), { method: 'POST', body: JSON.stringify({ code }) });
     ui.authCompletionCode.value = '';
     renderAuth(result.authentication);
-    ui.authCompleteMessage.textContent = 'Code accepted; waiting for Claude Code to confirm the session…';
+    ui.authCompleteMessage.textContent = 'Code sent to Claude Code. If it is rejected, paste the corrected full code or cancel sign-in.';
     if (!authPolling) authPolling = setInterval(refreshStatus, 1800);
   } catch (error) {
     ui.authCompleteMessage.textContent = error.message;

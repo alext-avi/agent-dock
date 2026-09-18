@@ -373,6 +373,7 @@ test('route policy explicitly separates reads, execution, and privileged mutatio
   assert.equal(permission('PATCH', '/api/v1/agents/example'), 'agents:manage');
   assert.equal(permission('POST', '/api/v1/agents/example/tasks'), 'tasks:execute');
   assert.equal(permission('POST', '/api/v1/agents/example/auth/login'), 'provider-auth:manage');
+  assert.equal(permission('POST', '/api/v1/agents/example/auth/cancel'), 'provider-auth:manage');
   assert.equal(permission('POST', '/api/v1/agents/example/auth/session-check'), 'provider-auth:manage');
   assert.equal(permission('POST', '/api/v1/auth/session-check'), 'provider-auth:manage');
   assert.equal(permission('POST', '/api/v1/agents/example/usage/refresh'), 'usage:refresh');

@@ -190,6 +190,7 @@ The control plane exposes fleet CRUD plus a consistent set of runtime operations
 | `GET` | `/api/v1/agents/:id/providers` | Safe provider-connection health and discoverable model metadata; never credentials or private endpoint URLs |
 | `POST` | `/api/v1/agents/:id/auth/login` | Start the adapter's interactive login flow |
 | `POST` | `/api/v1/agents/:id/auth/complete` | Forward a provider-issued one-time browser authorization code to a waiting CLI |
+| `POST` | `/api/v1/agents/:id/auth/cancel` | Cancel an abandoned interactive login without deleting the worker's stored session |
 | `POST` | `/api/v1/agents/:id/auth/refresh` | Ask the adapter to refresh its managed session |
 | `POST` | `/api/v1/agents/:id/auth/session-check` | Manually check/renew the provider session with one minimal request; never invoked by polling |
 | `POST` | `/api/v1/agents/:id/tasks` | Run `{ "prompt": "..." }` with saved durable instructions; returns canonical NDJSON |

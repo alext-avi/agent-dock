@@ -871,6 +871,50 @@ test('the Claude session check is explicit, warns about usage, and stays hidden 
   assert.equal(await page.locator('#session-check').isVisible(), false);
 });
 
+test('an interactive provider login can be cancelled from the authentication card', async (t) => {
+  const claude = app.agents['claude-code'];
+  const page = await browser.newPage();
+  t.after(() => page.close());
+  let cancellations = 0;
+  let resolveCancellation;
+  const cancellationObserved = new Promise((resolve) => { resolveCancellation = resolve; });
+
+  await page.route(`**/api/v1/agents/${claude.id}/status`, async (route) => {
+    const upstream = await route.fetch();
+    const status = await upstream.json();
+    status.authentication = {
+      ...status.authentication,
+      authenticated: false,
+      phase: 'waiting_for_user',
+      detail: 'Authentication is in progress',
+      challenge: {
+        verificationUri: 'https://provider.example.test/authorize',
+        userCode: null,
+        requiresInput: true,
+        instructions: 'Paste the full code returned by the provider.'
+      }
+    };
+    status.usage = { ...status.usage, pollError: null, pollErrorKind: null };
+    await route.fulfill({ response: upstream, json: status });
+  });
+  await page.route(`**/api/v1/agents/${claude.id}/auth/cancel`, async (route) => {
+    cancellations += 1;
+    resolveCancellation();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ authentication: { authenticated: true, phase: 'authenticated', challenge: {} } })
+    });
+  });
+
+  await page.goto(`${app.url}/agents/${claude.id}`);
+  await page.waitForFunction(() => document.querySelector('#auth-button')?.textContent === 'Cancel sign-in');
+  assert.equal(await page.locator('#auth-button').isDisabled(), false);
+  await page.click('#auth-button');
+  await cancellationObserved;
+  assert.equal(cancellations, 1);
+});
+
 test('image drift is shown only for a managed runtime that is behind', async (t) => {
   // The tag does not move when an image is rebuilt, so drift is decided by the
   // image id. Bumping it is what a rebuild looks like to the control plane.

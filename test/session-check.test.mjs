@@ -416,6 +416,90 @@ test('a session check is refused while an interactive login is in progress', asy
   assert.equal(fake.calls.filter((c) => c.args[0] === '-p').length, 0, 'a login in progress must not let a check spawn a Claude process');
 });
 
+test('Claude login keeps stdin open so an invalid authorization code can be corrected', async (t) => {
+  const token = 'login-code-retry';
+  const home = await claudeHomeWithCredential(t, { claudeAiOauth: { accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN } });
+  const fake = fakeClaudeSpawn({ holdLogin: true });
+  const worker = createWorkerServer({
+    token, adapter: 'claude-code', workspace: process.cwd(), dataPath: null,
+    mcpStatePath: null, mcpConfigDir: join(home, 'mcp'), claudeHome: home, spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+  assert.equal((await fetch(`${workerUrl}/v1/auth/login`, { method: 'POST', headers })).status, 202);
+  const loginChild = fake.calls.find((call) => call.args[0] === 'auth' && call.args[1] === 'login').child;
+
+  const first = await fetch(`${workerUrl}/v1/auth/complete`, {
+    method: 'POST', headers, body: JSON.stringify({ code: 'mistyped-code' })
+  });
+  assert.equal(first.status, 202);
+  loginChild.stderr.write('Invalid code. Please make sure the full code was copied.\n');
+  assert.equal(loginChild.stdin.writableEnded, false, 'the first code submission closed Claude stdin');
+
+  const second = await fetch(`${workerUrl}/v1/auth/complete`, {
+    method: 'POST', headers, body: JSON.stringify({ code: 'corrected-full-code' })
+  });
+  assert.equal(second.status, 202);
+  assert.equal(loginChild.stdinText(), 'mistyped-code\ncorrected-full-code\n');
+
+  loginChild.emit('close', 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  const status = await (await fetch(`${workerUrl}/v1/status`, { headers })).json();
+  assert.equal(status.authentication.authenticated, true);
+  assert.equal(status.authentication.phase, 'authenticated');
+});
+
+test('an abandoned provider login can be cancelled without invalidating the stored session', async (t) => {
+  const token = 'login-cancel';
+  const home = await claudeHomeWithCredential(t, { claudeAiOauth: { accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN } });
+  const fake = fakeClaudeSpawn({ holdLogin: true });
+  const worker = createWorkerServer({
+    token, adapter: 'claude-code', workspace: process.cwd(), dataPath: null,
+    mcpStatePath: null, mcpConfigDir: join(home, 'mcp'), claudeHome: home, spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+  assert.equal((await fetch(`${workerUrl}/v1/auth/login`, { method: 'POST', headers })).status, 202);
+  const loginChild = fake.calls.find((call) => call.args[0] === 'auth' && call.args[1] === 'login').child;
+  const cancelled = await fetch(`${workerUrl}/v1/auth/cancel`, { method: 'POST', headers, body: '{}' });
+  assert.equal(cancelled.status, 200);
+  const body = await cancelled.json();
+  assert.equal(loginChild.killed, true);
+  assert.equal(body.authentication.authenticated, true);
+  assert.equal(body.authentication.phase, 'authenticated');
+
+  const status = await (await fetch(`${workerUrl}/v1/status`, { headers })).json();
+  assert.equal(status.authentication.authenticated, true);
+  assert.equal(status.authentication.challenge.requiresInput, false);
+});
+
+test('the control plane proxies interactive-login cancellation through the vendor-neutral auth route', async (t) => {
+  const token = 'login-cancel-control-plane';
+  const home = await claudeHomeWithCredential(t, { claudeAiOauth: { accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN } });
+  const fake = fakeClaudeSpawn({ holdLogin: true });
+  const worker = createWorkerServer({
+    token, adapter: 'claude-code', workspace: process.cwd(), dataPath: null,
+    mcpStatePath: null, mcpConfigDir: join(home, 'mcp'), claudeHome: home, spawn: fake.spawn
+  });
+  const workerUrl = await listen(worker);
+  const control = createControlPlane({ workerUrl, workerToken: token, claudeWorkerUrl: workerUrl, claudeWorkerToken: token, dataPath: null });
+  const controlUrl = await listen(control);
+  t.after(() => Promise.all([
+    new Promise((resolve) => control.close(resolve)),
+    new Promise((resolve) => worker.close(resolve))
+  ]));
+
+  const login = await fetch(`${controlUrl}/api/v1/agents/worker-01/auth/login`, { method: 'POST' });
+  assert.equal(login.status, 202);
+  const cancelled = await fetch(`${controlUrl}/api/v1/agents/worker-01/auth/cancel`, { method: 'POST' });
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).authentication.authenticated, true);
+});
+
 test('two concurrent session checks do not both spawn a Claude process', async (t) => {
   const token = 'session-check-concurrent';
   const home = await claudeHomeWithCredential(t, { claudeAiOauth: { accessToken: ACCESS_TOKEN, refreshToken: REFRESH_TOKEN } });

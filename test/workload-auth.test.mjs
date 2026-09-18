@@ -61,6 +61,7 @@ test('control-plane routes mint only the corresponding wrapper scope', () => {
   assert.equal(workloadScopeForRequest('/v1/workspace', 'GET'), 'wrapper:workspace:read');
   assert.equal(workloadScopeForRequest('/v1/tasks', 'POST'), 'wrapper:task');
   assert.equal(workloadScopeForRequest('/v1/auth/login', 'POST'), 'wrapper:auth');
+  assert.equal(workloadScopeForRequest('/v1/auth/cancel', 'POST'), 'wrapper:auth');
   assert.equal(workloadScopeForRequest('/v1/mcp', 'PUT'), 'wrapper:mcp');
   assert.equal(workloadScopeForRequest('/v1/usage/refresh', 'POST'), 'wrapper:usage:refresh');
   assert.throws(

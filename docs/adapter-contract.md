@@ -16,6 +16,7 @@ Current protocol version: `agent-wrapper/v1`.
 | `PUT` | `/v1/mcp` | Atomically replace the worker's complete managed MCP desired state |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
 | `POST` | `/v1/auth/complete` | Submit a provider-issued one-time browser authorization code when the adapter requires it |
+| `POST` | `/v1/auth/cancel` | Cancel the current interactive authentication flow without deleting stored provider credentials |
 | `POST` | `/v1/auth/refresh` | Ask the adapter to refresh or validate its managed session |
 | `POST` | `/v1/auth/session-check` | Manually check/renew the provider session with one minimal request; never invoked by polling |
 | `GET` | `/v1/workspace` | List durable workspace artifacts |
@@ -64,7 +65,7 @@ One provider asymmetry is worth recording because it is not visible from the fla
 
 - `agent`: logical agent ID, adapter identity, provider name, display name, runtime version, and start time.
 - `capabilities`: auth methods, refresh support, manual session-check support, task streaming/cancellation, usage sources, and workspace operations actually implemented by the adapter.
-- `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded once to the waiting CLI process and is never logged or persisted.
+- `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded to the waiting CLI process and is never logged or persisted. The input remains open until the CLI accepts a code or the operator calls `/v1/auth/cancel`, so a rejected or partially copied code can be corrected without wedging the worker.
 - `task.active`: the active task ID/status or `null`.
 - `execution`: the isolation boundary and workspace path.
 - `usage`: normalized request totals/history, `quotaWindows[]`, an optional `account` activity summary, `pollErrorKind` classifying why an account-usage source last failed, and `lastSuccessAt` recording when the quota data itself was last read successfully. `lastPollAt` advances on failed and skipped attempts, so it cannot be used to judge how old a reading is.

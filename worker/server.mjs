@@ -16,6 +16,31 @@ import { authorizeWorkerRequest } from './workload-auth.mjs';
 const ANSI = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 const CLAUDE_AUTH_STATUS_TTL_MS = 30_000;
 
+// A deliberately tiny, deterministic prompt: the manual session-check operation
+// exists only to exercise Claude Code's supported OAuth refresh path, never to
+// do real work.
+const CLAUDE_SESSION_CHECK_PROMPT = 'Reply with the single word "ok" and nothing else.';
+const CLAUDE_SESSION_CHECK_TIMEOUT_MS = 60_000;
+// Fixed and minimal: no tools, no MCP servers, no injected instructions, no
+// session persistence, and no interactive permission prompts. Deliberately
+// never --bare, because --bare bypasses the OAuth/keychain credential path this
+// operation exists to exercise.
+const CLAUDE_SESSION_CHECK_ARGS = [
+  '-p',
+  '--output-format', 'json',
+  '--safe-mode',
+  '--strict-mcp-config',
+  '--tools', '',
+  '--permission-mode', 'dontAsk',
+  '--no-session-persistence',
+  '--disable-slash-commands'
+];
+// Best-effort classification of a failed check from Claude's own text. An
+// unrecognized failure falls to check_failed rather than guessing a specific
+// cause: a wrong classification would mislead the operator on how to respond.
+const CLAUDE_SESSION_CHECK_QUOTA_PATTERN = /(?:usage|rate|message)\s*limit|rate_limit|quota (?:exceeded|exhausted)|too many requests|(?:hit|reached|exceeded)\s+(?:your|the)\s+limit/i;
+const CLAUDE_SESSION_CHECK_REAUTH_PATTERN = /not logged in|logged out|invalid (?:api key|[^\n]*(?:token|credential))|unauthorized|please run\s*\/?login|re-?authenticate|authentication(?:_error| failed)|oauth token (?:has )?expired|expired (?:oauth )?(?:token|credential)/i;
+
 function clean(text) {
   return text.replace(ANSI, '').replace(/\r/g, '');
 }
@@ -48,20 +73,32 @@ async function readJson(req, limit = 128 * 1024) {
 
 function capture(command, args, options = {}) {
   return new Promise((resolve) => {
-    const { spawnImpl = spawn, ...spawnOptions } = options;
-    const child = spawnImpl(command, args, { ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'] });
+    const { spawnImpl = spawn, input, timeout = 10_000, ...spawnOptions } = options;
+    const child = spawnImpl(command, args, { ...spawnOptions, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     let output = '';
-    const timer = setTimeout(() => child.kill('SIGTERM'), options.timeout ?? 10_000);
+    let timedOut = false;
+    let killTimer = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      // A provider process that ignores SIGTERM must not hold the worker's
+      // exclusive process slot forever.
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+      killTimer.unref?.();
+    }, timeout);
     child.stdout.on('data', (data) => { output += data; });
     child.stderr.on('data', (data) => { output += data; });
     child.once('error', (error) => {
       clearTimeout(timer);
-      resolve({ code: -1, output: clean(`${output}\n${error.message}`).trim() });
+      clearTimeout(killTimer);
+      resolve({ code: -1, output: clean(`${output}\n${error.message}`).trim(), timedOut });
     });
     child.once('close', (code) => {
       clearTimeout(timer);
-      resolve({ code: code ?? -1, output: clean(output).trim() });
+      clearTimeout(killTimer);
+      resolve({ code: code ?? -1, output: clean(output).trim(), timedOut });
     });
+    if (input !== undefined) child.stdin.end(input);
   });
 }
 
@@ -90,6 +127,7 @@ const LEGACY_ROUTES = new Map([
   ['/providers', '/v1/providers'],
   ['/auth/start', '/v1/auth/login'],
   ['/auth/complete', '/v1/auth/complete'],
+  ['/auth/cancel', '/v1/auth/cancel'],
   ['/auth/refresh', '/v1/auth/refresh'],
   ['/workspace', '/v1/workspace'],
   ['/usage', '/v1/usage'],
@@ -228,7 +266,11 @@ export function createWorkerServer(options = {}) {
     // so agents sharing one account multiply it.
     claudeUsageIntervalMs: positiveInterval(options.claudeUsageIntervalMs ?? process.env.CLAUDE_OAUTH_USAGE_INTERVAL_MS, 1_800_000),
     claudeUsageEndpoint: options.claudeUsageEndpoint ?? process.env.CLAUDE_OAUTH_USAGE_ENDPOINT ?? undefined,
-    claudeUsageFetch: options.claudeUsageFetch ?? undefined
+    claudeUsageFetch: options.claudeUsageFetch ?? undefined,
+    sessionCheckTimeoutMs: positiveInterval(
+      options.sessionCheckTimeoutMs ?? process.env.SESSION_CHECK_TIMEOUT_MS,
+      CLAUDE_SESSION_CHECK_TIMEOUT_MS
+    )
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
   if (!['token', 'jwt', 'hybrid'].includes(config.authMode)) throw new Error('WORKER_AUTH_MODE must be token, jwt, or hybrid');
@@ -981,6 +1023,104 @@ export function createWorkerServer(options = {}) {
     finally { state.authRefreshPromise = null; }
   }
 
+  // The Claude half of the manual session-check operation: one minimal `claude
+  // -p` request, run only to exercise the CLI's supported OAuth refresh path.
+  // Only safe metadata (expiry/presence/state) is inspected before and after —
+  // never a raw token, a token hash, or the provider's raw response.
+  async function checkClaudeSession(checkedAt) {
+    const before = await readClaudeCredentialState();
+    if (!before.credentialStored) {
+      return {
+        result: 'reauth_required',
+        detail: 'No Claude Code credential is stored; sign in before checking the session',
+        checkedAt,
+        session: await authSessionMetadata()
+      };
+    }
+
+    const probe = await captureCommand('claude', CLAUDE_SESSION_CHECK_ARGS, {
+      env: providerEnv,
+      cwd: config.workspace,
+      timeout: config.sessionCheckTimeoutMs,
+      input: CLAUDE_SESSION_CHECK_PROMPT
+    });
+    const after = await readClaudeCredentialState();
+    // The cached probe cannot be trusted to still reflect what this request just
+    // observed; the next status read should look again rather than reuse it.
+    state.claudeAuthStatus = null;
+
+    let parsed = null;
+    try { parsed = JSON.parse(probe.output); }
+    catch { /* Failure output is not always the documented JSON envelope. */ }
+    const succeeded = probe.code === 0 && parsed?.is_error === false;
+
+    let result;
+    let detail;
+    if (succeeded) {
+      result = after.marker !== before.marker ? 'renewed' : 'current';
+      detail = result === 'renewed'
+        ? 'Claude Code rotated the session credential while completing this check'
+        : 'Claude Code session is current; no renewal was needed';
+    } else if (CLAUDE_SESSION_CHECK_QUOTA_PATTERN.test(probe.output)) {
+      result = 'quota_exhausted';
+      detail = 'Claude reported the subscription usage limit was reached';
+    } else if (CLAUDE_SESSION_CHECK_REAUTH_PATTERN.test(probe.output) || !after.credentialStored) {
+      result = 'reauth_required';
+      detail = 'Claude Code could not renew the session; sign in again';
+    } else {
+      result = 'check_failed';
+      detail = probe.timedOut
+        ? 'The session check did not complete before its timeout'
+        : 'Claude returned an unexpected response while checking the session';
+    }
+
+    return { result, detail, checkedAt, session: await authSessionMetadata() };
+  }
+
+  // Manual, vendor-neutral session check/renew. Serialized through the same
+  // exclusive provider-process slot as tasks and login, never invoked by
+  // polling, and only ever run when a caller explicitly asks for it.
+  async function sessionCheckOperation() {
+    const checkedAt = new Date().toISOString();
+    const capability = capabilities.authentication.sessionCheck;
+    if (!capability?.supported) {
+      return {
+        result: 'unsupported',
+        detail: `${adapterManifest.displayName} does not support a manual session check`,
+        checkedAt,
+        session: null
+      };
+    }
+    if (config.demoMode) {
+      return {
+        result: 'current',
+        detail: 'Demo mode does not exercise a live provider request',
+        checkedAt,
+        session: await authSessionMetadata()
+      };
+    }
+    if (state.activeJob) {
+      throw Object.assign(new Error('Wait for the active task to finish before checking the session'), { status: 409 });
+    }
+    if (state.loginProcess) {
+      throw Object.assign(new Error('Finish the current authentication flow before checking the session'), { status: 409 });
+    }
+    // Claim the slot before the first await, exactly as /v1/tasks does: two
+    // concurrent requests must not both pass the checks above and both spawn a
+    // Claude process.
+    const sessionClaim = { id: null, status: 'checking-session', claim: true, operation: 'session-check' };
+    state.activeJob = sessionClaim;
+    const release = () => { if (state.activeJob === sessionClaim) state.activeJob = null; };
+    try {
+      // Let a status-triggered auth probe or version lookup exit first, so this
+      // remains the sole CLI process sharing Claude's auth home.
+      await Promise.all([state.claudeAuthStatusPromise, state.providerVersionPromise].filter(Boolean));
+      return await checkClaudeSession(checkedAt);
+    } finally {
+      release();
+    }
+  }
+
   function observeUsage(job, event) {
     if (event?.type === 'usage.observed' && event.data?.request) job.tokenUsage = normalizeTokenUsage(event.data.request);
   }
@@ -1082,6 +1222,7 @@ export function createWorkerServer(options = {}) {
       method: config.adapterId === 'claude-code' ? 'browser_oauth' : config.adapterId === 'opencode' ? 'provider_device_code' : 'device_code',
       detail: login?.detail ?? null,
       refreshing: Boolean(state.authRefreshPromise),
+      checking: state.activeJob?.operation === 'session-check',
       session,
       challenge: {
         verificationUri: authenticated ? null : state.auth.verificationUrl,
@@ -1100,7 +1241,7 @@ export function createWorkerServer(options = {}) {
     if (state.loginProcess) return publicAuthentication();
     // Claim login synchronously, before waiting for an older status lookup, so
     // neither a task nor a second login can enter beside it.
-    const loginClaim = { claim: true };
+    const loginClaim = { claim: true, cancelled: false };
     state.loginProcess = loginClaim;
     state.auth = { phase: 'waiting_for_user', transcript: '', verificationUrl: null, userCode: null };
     if (config.adapterId === 'claude-code') {
@@ -1108,9 +1249,18 @@ export function createWorkerServer(options = {}) {
       try {
         await Promise.all([state.claudeAuthStatusPromise, state.providerVersionPromise].filter(Boolean));
       } catch (error) {
-        if (state.loginProcess === loginClaim) state.loginProcess = null;
-        state.auth.phase = 'failed';
-        throw error;
+        if (state.loginProcess === loginClaim) {
+          state.loginProcess = null;
+          state.auth.phase = 'failed';
+          throw error;
+        }
+        return publicAuthentication({ login: await authStatus(), session: await authSessionMetadata() });
+      }
+      // Cancellation can arrive while this login claim is waiting for an older
+      // Claude status/version process. Do not spawn a login after the operator
+      // has already cancelled it.
+      if (state.loginProcess !== loginClaim || loginClaim.cancelled) {
+        return publicAuthentication({ login: await authStatus(), session: await authSessionMetadata() });
       }
     }
     const openCodeGitHub = config.adapterId === 'opencode' && config.opencodeAuthProvider === 'github-copilot';
@@ -1140,6 +1290,7 @@ export function createWorkerServer(options = {}) {
     let openCodePromptStarted = false;
     let openCodeDeploymentSelected = false;
     const consume = (chunk) => {
+      if (state.loginProcess !== child) return;
       const cleanedChunk = clean(chunk.toString('utf8'));
       const repetitiveOpenCodeSpinner = config.adapterId === 'opencode'
         && state.auth.verificationUrl
@@ -1177,6 +1328,7 @@ export function createWorkerServer(options = {}) {
     child.stdout.on('data', consume);
     child.stderr.on('data', consume);
     child.once('error', (error) => {
+      if (state.loginProcess !== child) return;
       consume(`\n${error.message}`);
       if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = 'failed';
@@ -1185,6 +1337,7 @@ export function createWorkerServer(options = {}) {
       state.loginProcess = null;
     });
     child.once('close', (code) => {
+      if (state.loginProcess !== child) return;
       if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
       state.auth.phase = code === 0 ? 'authenticated' : 'failed';
       state.auth.verificationUrl = null;
@@ -1205,8 +1358,49 @@ export function createWorkerServer(options = {}) {
     if (typeof code !== 'string' || !code.trim() || code.length > 8192 || /[\r\n]/.test(code)) {
       throw Object.assign(new Error('code must be a single non-empty line'), { status: 400 });
     }
-    state.loginProcess.stdin.end(`${code.trim()}\n`);
+    if (!state.loginProcess.stdin?.writable || state.loginProcess.stdin.destroyed) {
+      throw Object.assign(new Error('The authentication process is no longer accepting a code; cancel it and start again'), { status: 409 });
+    }
+    // Claude can reject a mistyped or partially copied code and prompt again.
+    // Keep stdin open so the operator can correct it without restarting the
+    // whole OAuth flow.
+    state.loginProcess.stdin.write(`${code.trim()}\n`);
     return publicAuthentication();
+  }
+
+  async function cancelLogin() {
+    const current = state.loginProcess;
+    if (!current) {
+      throw Object.assign(new Error('No authentication flow is in progress'), { status: 409 });
+    }
+    if (current.claim) current.cancelled = true;
+    state.loginProcess = null;
+    if (config.adapterId === 'claude-code') state.claudeAuthStatus = null;
+    state.auth = { phase: 'unknown', transcript: '', verificationUrl: null, userCode: null };
+    if (!current.claim) {
+      // Do not immediately start an auth-status probe beside the login process
+      // we are cancelling. Wait briefly for a clean exit, then escalate so an
+      // uncooperative CLI cannot retain the provider-process slot forever.
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(forceTimer);
+          clearTimeout(giveUpTimer);
+          resolve();
+        };
+        const forceTimer = setTimeout(() => current.kill('SIGKILL'), 1_000);
+        const giveUpTimer = setTimeout(finish, 2_000);
+        forceTimer.unref?.();
+        giveUpTimer.unref?.();
+        current.once('close', finish);
+        current.once('error', finish);
+        current.kill('SIGTERM');
+      });
+    }
+    const login = await authStatus();
+    return publicAuthentication({ login, session: await authSessionMetadata() });
   }
 
   // A provider names the session in its own error output when a resume fails, and
@@ -1507,7 +1701,7 @@ export function createWorkerServer(options = {}) {
           capabilities,
           authentication: publicAuthentication({ login, session }),
           task: {
-            active: state.activeJob
+            active: state.activeJob && state.activeJob.operation !== 'session-check'
               ? { id: state.activeJob.id, status: state.activeJob.status, startedAt: state.activeJob.startedAt, model: state.activeJob.model ?? null }
               : null
           },
@@ -1530,6 +1724,10 @@ export function createWorkerServer(options = {}) {
         return json(res, 202, wrapperResponse({ authentication: completeLogin(body.code) }));
       }
 
+      if (req.method === 'POST' && route === '/v1/auth/cancel') {
+        return json(res, 200, wrapperResponse({ authentication: await cancelLogin() }));
+      }
+
       if (req.method === 'POST' && route === '/v1/auth/refresh') {
         if (state.activeJob) return json(res, 409, wrapperResponse({ error: 'Wait for the active task to finish before refreshing authentication' }));
         if (state.loginProcess) return json(res, 409, wrapperResponse({ error: 'Finish the current device login before refreshing authentication' }));
@@ -1548,6 +1746,10 @@ export function createWorkerServer(options = {}) {
           error.status ??= 502;
           throw error;
         }
+      }
+
+      if (req.method === 'POST' && route === '/v1/auth/session-check') {
+        return json(res, 200, wrapperResponse({ sessionCheck: await sessionCheckOperation() }));
       }
 
       if (req.method === 'GET' && route === '/v1/conversations') {
@@ -1680,6 +1882,9 @@ export function createWorkerServer(options = {}) {
 
       if (req.method === 'POST' && route === '/v1/tasks/cancel') {
         if (!state.activeJob) return json(res, 404, wrapperResponse({ error: 'No active task' }));
+        if (state.activeJob.operation === 'session-check') {
+          return json(res, 409, wrapperResponse({ error: 'The provider is checking its session; there is no active task to cancel' }));
+        }
         const body = await readJson(req, 16 * 1024);
         if (body.taskId !== undefined && body.taskId !== state.activeJob.id) {
           return json(res, 409, wrapperResponse({ error: 'The requested task is no longer active' }));

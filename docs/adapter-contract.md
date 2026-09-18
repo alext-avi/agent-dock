@@ -16,7 +16,9 @@ Current protocol version: `agent-wrapper/v1`.
 | `PUT` | `/v1/mcp` | Atomically replace the worker's complete managed MCP desired state |
 | `POST` | `/v1/auth/login` | Start the adapter's supported interactive authentication flow |
 | `POST` | `/v1/auth/complete` | Submit a provider-issued one-time browser authorization code when the adapter requires it |
+| `POST` | `/v1/auth/cancel` | Cancel the current interactive authentication flow without deleting stored provider credentials |
 | `POST` | `/v1/auth/refresh` | Ask the adapter to refresh or validate its managed session |
+| `POST` | `/v1/auth/session-check` | Manually check/renew the provider session with one minimal request; never invoked by polling |
 | `GET` | `/v1/workspace` | List durable workspace artifacts |
 | `GET` | `/v1/usage` | Read cached request and account usage |
 | `POST` | `/v1/usage/refresh` | Ask the adapter to refresh available usage sources |
@@ -62,8 +64,8 @@ One provider asymmetry is worth recording because it is not visible from the fla
 `GET /v1/status` returns these stable top-level concepts:
 
 - `agent`: logical agent ID, adapter identity, provider name, display name, runtime version, and start time.
-- `capabilities`: auth methods, refresh support, task streaming/cancellation, usage sources, and workspace operations actually implemented by the adapter.
-- `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded once to the waiting CLI process and is never logged or persisted.
+- `capabilities`: auth methods, refresh support, manual session-check support, task streaming/cancellation, usage sources, and workspace operations actually implemented by the adapter.
+- `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded to the waiting CLI process and is never logged or persisted. The input remains open until the CLI accepts a code or the operator calls `/v1/auth/cancel`, so a rejected or partially copied code can be corrected without wedging the worker.
 - `task.active`: the active task ID/status or `null`.
 - `execution`: the isolation boundary and workspace path.
 - `usage`: normalized request totals/history, `quotaWindows[]`, an optional `account` activity summary, `pollErrorKind` classifying why an account-usage source last failed, and `lastSuccessAt` recording when the quota data itself was last read successfully. `lastPollAt` advances on failed and skipped attempts, so it cannot be used to judge how old a reading is.
@@ -114,6 +116,16 @@ Adapters keep the last successfully observed windows when a poll fails, and cons
 
 A provider with no documented usage interface may expose one behind an explicit opt-in. Such a source must default to off, advertise `usage.quotaWindowSource` so consumers can label it, fail closed on any unfamiliar credential or response shape rather than guessing, and bound its polling with a floor of its own that a forced refresh cannot bypass. Where a provider's schema is migrating, an adapter reads every shape it recognizes and merges them: returning only the first shape it finds is a confident partial reading, which is worse than failing, because the fail-closed check cannot see it. `capabilities.usage.quotaWindows` reflects what the running instance actually has enabled, not merely what the adapter could do. The Claude Code adapter's OAuth usage source is the current example; see `worker/adapters/claude-usage.mjs`.
 
+## Manual session check
+
+`POST /v1/auth/session-check` is a manual, user-triggered probe distinct from `/v1/auth/refresh`: instead of calling a dedicated refresh endpoint, it exercises the adapter's supported request path with one deliberately tiny, fixed request and observes whether the session was renewed. It must never run from status polling or any live-update loop, and it is serialized through the same exclusive provider-process slot as `/v1/tasks` and `/v1/auth/login` — it rejects with 409 while either is active, exactly as they reject while it is active.
+
+An adapter advertises `capabilities.authentication.sessionCheck: { supported, mayConsumeUsage }`. An unsupported adapter still answers 200 with a normalized `unsupported` result rather than an error, because "this adapter cannot do this" is a legitimate outcome a caller needs to render, not a failure. `mayConsumeUsage` tells a caller whether invoking this operation can spend real subscription quota, so a UI can warn before the request is sent.
+
+The response is `{ sessionCheck: { result, detail, checkedAt, session } }`, where `result` is one of `renewed`, `current`, `quota_exhausted`, `reauth_required`, `check_failed`, or `unsupported`, and `detail` is safe, human-readable text explaining the outcome. `session` is the same safe session metadata shape returned elsewhere — never a raw token, a token hash, or the provider's raw response. An adapter classifies failures from what its own request actually reported; an ambiguous or unrecognized failure must fall to `check_failed` rather than guessing between quota exhaustion and a re-authentication requirement.
+
+The Claude Code adapter is the current example: it runs one `claude -p` request with a fixed minimal prompt and safe non-interactive flags (`--safe-mode`, `--strict-mcp-config`, `--tools` empty, `--permission-mode dontAsk`, `--no-session-persistence`, `--disable-slash-commands`), loading no MCP servers, no injected agent instructions, and no existing conversation, and never `--bare`, because `--bare` bypasses the OAuth/keychain credential path this operation exists to exercise. It compares only safe credential metadata (a filesystem change marker, expiry, and presence flags) from before and after the request to tell `renewed` apart from `current`.
+
 ## Adapter responsibilities
 
 A new adapter must implement the following behaviors behind the wrapper:
@@ -123,6 +135,7 @@ A new adapter must implement the following behaviors behind the wrapper:
 3. Determine authentication state without returning credentials.
 4. Start its supported login flow and normalize any user-facing challenge.
 5. Refresh authentication when supported, or advertise `refresh: false`.
+5a. Support a manual session check when the provider has a request path worth exercising, or advertise `sessionCheck: { supported: false }`; never run it from polling.
 6. Run one task, accept optional profile instructions, stream provider output, and translate it into canonical events.
 7. Discover safe provider/model metadata and translate a supported model policy into harness arguments.
 8. Cancel the active provider process.

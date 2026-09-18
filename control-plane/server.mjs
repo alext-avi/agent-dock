@@ -1603,7 +1603,7 @@ export function createControlPlane(options = {}) {
       if (req.method === 'DELETE' && id) return proxyJson(req, res, agent, `/v1/conversations/${encodeURIComponent(id)}`);
       return false;
     }
-    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/refresh|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
+    const match = url.pathname.match(/^\/api\/v1\/agents\/([^/]+)\/(status|providers|auth\/login|auth\/complete|auth\/cancel|auth\/refresh|auth\/session-check|workspace|usage|usage\/refresh|tasks|tasks\/cancel|runtime\/refresh)$/);
     if (!match) return false;
     const agent = requireAgent(decodeURIComponent(match[1]));
     const operation = match[2];
@@ -1611,7 +1611,11 @@ export function createControlPlane(options = {}) {
     if (req.method === 'GET' && operation === 'providers') return proxyJson(req, res, agent, '/v1/providers', 30_000);
     if (req.method === 'POST' && operation === 'auth/login') return proxyJson(req, res, agent, '/v1/auth/login');
     if (req.method === 'POST' && operation === 'auth/complete') return proxyJson(req, res, agent, '/v1/auth/complete');
+    if (req.method === 'POST' && operation === 'auth/cancel') return proxyJson(req, res, agent, '/v1/auth/cancel');
     if (req.method === 'POST' && operation === 'auth/refresh') return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);
+    // Deliberately longer than the other auth timeouts: this proxies one real
+    // `claude -p` request, bounded worker-side at CLAUDE_SESSION_CHECK_TIMEOUT_MS.
+    if (req.method === 'POST' && operation === 'auth/session-check') return proxyJson(req, res, agent, '/v1/auth/session-check', 90_000);
     if (req.method === 'GET' && operation === 'workspace') return proxyJson(req, res, agent, '/v1/workspace');
     if (req.method === 'GET' && operation === 'usage') return proxyJson(req, res, agent, '/v1/usage');
     if (req.method === 'POST' && operation === 'usage/refresh') return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);
@@ -1793,7 +1797,9 @@ export function createControlPlane(options = {}) {
       if (req.method === 'GET' && ['/api/v1/providers', '/api/providers'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/providers', 30_000);
       if (req.method === 'POST' && ['/api/v1/auth/login', '/api/auth/start'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/login');
       if (req.method === 'POST' && ['/api/v1/auth/complete', '/api/auth/complete'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/complete');
+      if (req.method === 'POST' && ['/api/v1/auth/cancel', '/api/auth/cancel'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/cancel');
       if (req.method === 'POST' && ['/api/v1/auth/refresh', '/api/auth/refresh'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/auth/refresh', 30_000);
+      if (req.method === 'POST' && url.pathname === '/api/v1/auth/session-check') return proxyJson(req, res, agent, '/v1/auth/session-check', 90_000);
       if (req.method === 'GET' && ['/api/v1/workspace', '/api/workspace'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/workspace');
       if (req.method === 'GET' && ['/api/v1/usage', '/api/usage'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/usage');
       if (req.method === 'POST' && ['/api/v1/usage/refresh', '/api/usage/refresh'].includes(url.pathname)) return proxyJson(req, res, agent, '/v1/usage/refresh', 30_000);

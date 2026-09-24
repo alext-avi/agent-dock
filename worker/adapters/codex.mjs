@@ -10,7 +10,14 @@ export const codexAdapterManifest = Object.freeze({
     // already covers forcing a renewal, so this stays unsupported rather than
     // duplicating it.
     authentication: { methods: ['device_code'], refresh: true, sessionCheck: { supported: false, mayConsumeUsage: false } },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true, runtimeLimits: true },
+    // `codex exec` exposes no turn cap, no child-command timeout, and no
+    // subagent concurrency or depth control, so none is claimed. Codex tasks are
+    // still bounded: the wrapper's wall-clock and idle timeouts and its
+    // graceful-then-forced process-tree termination apply to every adapter.
+    // Reporting nothing here is the honest answer; the alternative is an
+    // operator believing a turn cap is in force when nothing enforces it.
+    runtimeLimits: { harnessControls: [], observes: [], observedSubagentDepth: 0 },
     mcp: codexMcpCapabilities,
     usage: { requestTokens: true, accountActivity: true, quotaWindows: true },
     workspace: { list: true }

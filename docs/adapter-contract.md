@@ -22,7 +22,7 @@ Current protocol version: `agent-wrapper/v1`.
 | `GET` | `/v1/workspace` | List durable workspace artifacts |
 | `GET` | `/v1/usage` | Read cached request and account usage |
 | `POST` | `/v1/usage/refresh` | Ask the adapter to refresh available usage sources |
-| `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "...", "modelPolicy": {...} }` and stream canonical NDJSON events |
+| `POST` | `/v1/tasks` | Run `{ "prompt": "...", "instructions": "...", "modelPolicy": {...}, "runtimeLimits": {...} }` and stream canonical NDJSON events |
 | `POST` | `/v1/tasks/cancel` | Cancel `{ "taskId": "..." }` only when it still identifies the active task |
 | `GET` | `/v1/conversations` | List conversations this worker can continue |
 | `GET`, `DELETE` | `/v1/conversations/:id` | Read one conversation, or forget the worker's mapping for it |
@@ -59,6 +59,53 @@ The mapping is durable, because provider sessions are: a harness records its ses
 
 One provider asymmetry is worth recording because it is not visible from the flags the worker passes: `codex exec resume` accepts neither `-C/--cd` nor `--sandbox`, unlike `codex exec`. The working directory comes from the spawned process instead, and a resumed thread carries the sandbox settings recorded with it. Verified against codex-cli 0.152.1.
 
+## Runtime limits and process supervision
+
+Two different things bound a task, and the contract keeps them apart because conflating them is how an operator ends up believing a limit is in force when nothing enforces it.
+
+**Agent Dock process supervision** applies to every adapter, because the wrapper owns it rather than the harness:
+
+- `taskWallTimeoutMs` — the longest a task may run at all.
+- `taskIdleTimeoutMs` — the longest a task may go without producing meaningful stdout/stderr or a normalized event. Whitespace-only output is not activity; treating it as activity is how an idle bound silently stops meaning anything.
+- `terminationGraceMs` — how long a graceful signal is given before the forced one.
+
+**Provider-native limits** are enforced only by a harness that exposes a control for them: `maxHarnessTurns`, `childCommandTimeoutMs`, `childCommandMaxTimeoutMs`, `maxConcurrentSubagents`, `maxSubagentDepth`, and `allowBackgroundTasks`.
+
+`runtimeLimits` is provider-neutral, durable, and injected by the control plane with every task alongside the saved instructions and model policy; a task-level value from a browser is overwritten, exactly as those are. An omitted field inherits the worker's own default. Two supplied values that contradict each other (an idle bound above the wall bound, a default child timeout above its ceiling) are rejected with 400; a supplied value that contradicts an *inherited* default clamps the inherited side, so tightening one bound never fails because of the other's default.
+
+`capabilities.runtimeLimits` reports both halves:
+
+```json
+{
+  "supervision": { "wallTimeout": true, "idleTimeout": true, "processTreeTermination": true, "gracefulThenForced": true },
+  "support": { "maxHarnessTurns": { "supported": true, "enforcedBy": "harness", "reason": null } },
+  "observes": ["subagent", "childCommand"],
+  "observedSubagentDepth": 1,
+  "defaults": { "taskWallTimeoutMs": 1800000 }
+}
+```
+
+`enforcedBy` is `wrapper`, `harness`, or `null`. A control the harness cannot honour is reported `supported: false` with a reason, and `task.started` carries `limits.configured`, `limits.effective`, and `limits.support`; the unsupported control remains configured so it survives a move to a capable runtime, but is `null` in the effective policy so nothing can mistake it for a bound that is in force. Inventing enforcement is the same failure as inventing telemetry.
+
+The current matrix, with the provider-side mechanism recorded here because it is not visible from the neutral names:
+
+| Neutral control | Claude Code | Codex | OpenCode |
+|---|---|---|---|
+| `maxHarnessTurns` | `--max-turns` | none | none |
+| `childCommandTimeoutMs` | `BASH_DEFAULT_TIMEOUT_MS` | none | none |
+| `childCommandMaxTimeoutMs` | `BASH_MAX_TIMEOUT_MS` | none | none |
+| `maxConcurrentSubagents` | `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | none | none |
+| `maxSubagentDepth` | `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` | none | none |
+| `allowBackgroundTasks` | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` when false | none | none |
+
+Those strings live in `worker/adapters/claude.mjs` and nowhere above it. Allowing background tasks means the disable switch is absent, not set to zero: the harness's own default is the honest expression of "no policy from us".
+
+Three Claude Code affordances were considered and deliberately not used. A spend budget is not a runtime limit and would need a usage model this POC does not have. `SubagentStart`/`SubagentStop` hooks and forwarded subagent stream events would deepen observability below the first level, but both require writing provider hook configuration into the agent's private volume, which is a larger change than this contract addition. The Agent SDK's in-process task cancellation is not reachable from a CLI wrapper, and process-group termination is the stronger guarantee anyway, because it also reaches descendants the SDK never knew about.
+
+Only Claude Code announces subagent and child-command lifecycle on its main stream, and only at the first level, so `observedSubagentDepth` is 1 for Claude Code and 0 elsewhere. Deeper nesting is bounded by `maxSubagentDepth` but is not observed, and the contract does not pretend otherwise.
+
+**Termination reaches the process tree, not the CLI.** The harness is spawned into its own process group. A cancel, either timeout, or a worker shutdown sends the graceful signal to that whole group and escalates to `SIGKILL` once `terminationGraceMs` is spent. The group is also reaped after a task ends normally, because a harness can exit while a descendant it started keeps running — the failure this exists to prevent. Detaching the harness is what makes the signal reach descendants, and it is also what stops the harness dying with the worker, so a worker asked to shut down terminates the tree deliberately. A runtime restart destroys the container and with it the tree; there is nothing to recover.
+
 ## Status model
 
 `GET /v1/status` returns these stable top-level concepts:
@@ -66,7 +113,8 @@ One provider asymmetry is worth recording because it is not visible from the fla
 - `agent`: logical agent ID, adapter identity, provider name, display name, runtime version, and start time.
 - `capabilities`: auth methods, refresh support, manual session-check support, task streaming/cancellation, usage sources, and workspace operations actually implemented by the adapter.
 - `authentication`: generic auth phase, optional device/browser challenge, safe session timestamps, and refresh state. It must never contain tokens, cookies, passwords, or account IDs. A browser authorization code submitted to `/v1/auth/complete` is forwarded to the waiting CLI process and is never logged or persisted. The input remains open until the CLI accepts a code or the operator calls `/v1/auth/cancel`, so a rejected or partially copied code can be corrected without wedging the worker.
-- `task.active`: the active task ID/status or `null`.
+- `task.active`: the active task ID/status or `null`. When a task is running it also reports `lifecycle` (`starting`, `running`, `stalled`, `terminating`, `force-terminated`, `completed`), `startedAt`, `lastActivityAt`, `elapsedMs`, `idleMs`, `stalled`, `terminalReason`, `forceTerminated`, the `limits` actually in force, and counts of open subagents and child commands. None of it discloses a prompt, an environment value, or a provider payload.
+- `task.last`: why the most recent task ended, kept after its stream closed — `{ id, status, reason, forceTerminated, startedAt, endedAt, exitCode, peakSubagents }`. "Cancelled", "timed out at the idle bound", and "force-terminated" are what an operator looks for once the connection they were watching is gone.
 - `execution`: the isolation boundary and workspace path.
 - `usage`: normalized request totals/history, `quotaWindows[]`, an optional `account` activity summary, `pollErrorKind` classifying why an account-usage source last failed, and `lastSuccessAt` recording when the quota data itself was last read successfully. `lastPollAt` advances on failed and skipped attempts, so it cannot be used to judge how old a reading is.
 
@@ -92,15 +140,23 @@ Stable event types:
 
 | Type | Required data |
 |---|---|
-| `task.started` | `executionMode`, effective `model` (`provider-default` when the harness chooses) |
+| `task.started` | `executionMode`, effective `model` (`provider-default` when the harness chooses), `limits` (`configured`, `effective`, and `support`) |
 | `message.completed` | `role`, `text` |
 | `activity.started` / `activity.completed` | generic `kind` plus optional `name`, `command`, or `text` |
 | `usage.observed` | normalized `request` token counts when the provider supplies them |
 | `log` | `level`, `source`, `message` |
 | `error` | `source`, `message` |
 | `usage.updated` | current normalized `usage` snapshot |
-| `task.completed` | `status`, `exitCode` |
+| `runtime.stalled` / `runtime.resumed` | `idleMs`; the stalled form also carries `since`, `idleTimeoutMs`, and open subagent/child counts |
+| `runtime.termination` | `reason`, `phase` (`graceful` then `force`), `signal`, `delivered`, `processGroup`, `graceMs` |
+| `subagent.started` / `subagent.completed` | `subagentId`, `name`, `depth`, `active`; the completed form adds `status` and `durationMs` |
+| `child.started` / `child.completed` | `childId`, `kind`, `name`, `active`; started adds `timeoutMs`, completed adds `status` and `durationMs` |
+| `task.completed` | `status`, `exitCode`, `reason`, `forceTerminated`, `durationMs` |
 | `provider.lifecycle` / `provider.event` | opaque provider event name only; the UI does not depend on it |
+
+Lifecycle events are metadata only: an id, a tool or agent-type name, a status, a duration. They never carry a delegated prompt, a command line, or a tool result — a lifecycle event is read by operators who are not entitled to the caller's data, and those values are available on the existing activity events for consumers that are.
+
+`task.completed.reason` is additive: an older consumer keeps reading `status` and `exitCode`, a current one can tell `wall_timeout` or `idle_timeout` from a plain `exit_code` failure. A terminal reason always wins over the exit code, because a harness killed at a bound can still exit 0, and reporting that as success is how a bounded task silently stops being bounded.
 
 Normalized request usage uses `inputTokens`, `cachedInputTokens`, `outputTokens`, and `totalTokens`. Quotas use flat `quotaWindows[]` entries with `id`, `label`, `scope`, `usedPercent`, `windowDurationMinutes`, `resetsAt` (epoch seconds), and `reached`. Account activity uses provider-neutral names such as `lifetimeTokens`, `peakDailyTokens`, and `dailyUsage`. Unsupported values are zero or absent; adapters must not invent provider data.
 
@@ -144,6 +200,7 @@ A new adapter must implement the following behaviors behind the wrapper:
 11. Validate, apply, inspect, and activate the canonical MCP desired state without returning resolved connector secrets.
 12. Advertise `placeholders` and `credentialDelivery` truthfully, and refuse any binding the worker cannot satisfy rather than applying a literal placeholder or omitting authentication.
 13. Advertise `conversations` truthfully, keep its provider's session identifier below the wrapper, and refuse a `conversationId` it cannot continue rather than answering without the earlier turns.
+14. Declare exactly which provider-neutral runtime limits its harness natively enforces, translate only those into the harness's own flags and environment, and report every other control as unsupported rather than accepting it silently. Where the harness announces subagent or child-command lifecycle, translate it into metadata-only canonical events; where it does not, advertise `observes: []`.
 
 The Codex, Claude Code, and OpenCode translators live under `worker/adapters/`. All satisfy this contract; the control plane does not branch on provider-specific event, credential, or MCP configuration formats.
 

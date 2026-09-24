@@ -16,7 +16,11 @@ export const opencodeAdapterManifest = Object.freeze({
   displayName: 'OpenCode',
   capabilities: {
     authentication: { methods: ['provider_device_code'], refresh: false, sessionCheck: { supported: false, mayConsumeUsage: false } },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true, runtimeLimits: true },
+    // `opencode run` exposes no documented turn cap, child-command timeout, or
+    // subagent concurrency/depth control, so none is claimed. Only the wrapper's
+    // own wall-clock, idle, and process-tree supervision bounds an OpenCode task.
+    runtimeLimits: { harnessControls: [], observes: [], observedSubagentDepth: 0 },
     providers: { list: true, discovery: true, localConnections: true },
     models: { discovery: true, selection: true, orderedFallback: false },
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },

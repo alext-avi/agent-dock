@@ -392,10 +392,24 @@ test('scheduled dispatch uses durable agent configuration and captures wrapper t
   assert.equal(response.status, 202);
   await control.scheduler.whenIdle();
 
+  // A scheduled run is bounded exactly like an interactive one: the saved
+  // instructions, the saved model policy, and the saved runtime limits all
+  // travel with the dispatch, because nobody is watching this one.
   assert.deepEqual(taskRequest, {
     prompt: 'Prepare the report.',
     instructions: 'Use the approved operating procedure.',
-    modelPolicy: { mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false }
+    modelPolicy: { mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false },
+    runtimeLimits: {
+      taskWallTimeoutMs: 1_800_000,
+      taskIdleTimeoutMs: 300_000,
+      terminationGraceMs: 10_000,
+      maxHarnessTurns: 40,
+      childCommandTimeoutMs: 120_000,
+      childCommandMaxTimeoutMs: 600_000,
+      maxConcurrentSubagents: 2,
+      maxSubagentDepth: 1,
+      allowBackgroundTasks: false
+    }
   });
   response = await fetch(`${controlUrl}/api/v1/schedules/wrapper-dispatch/runs`);
   const [run] = (await response.json()).runs;

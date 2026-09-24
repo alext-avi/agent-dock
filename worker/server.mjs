@@ -5,10 +5,25 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { codexAdapterManifest, normalizeCodexEvent, normalizeCodexQuotaWindows, observeCodexSessionId } from './adapters/codex.mjs';
-import { claudeAdapterManifest, normalizeClaudeEvent, observeClaudeSessionId } from './adapters/claude.mjs';
+import {
+  claudeAdapterManifest,
+  claudeRuntimeLimitArgs,
+  claudeRuntimeLimitEnv,
+  normalizeClaudeEvent,
+  observeClaudeLifecycle,
+  observeClaudeSessionId
+} from './adapters/claude.mjs';
 import { opencodeAdapterManifest, normalizeOpenCodeEvent, observeOpenCodeSessionId } from './adapters/opencode.mjs';
 import { ClaudeUsageError, MAX_RETRY_AFTER_SECONDS, claudeCredentialPaths, fetchClaudeUsage, normalizeClaudeQuotaWindows } from './adapters/claude-usage.mjs';
 import { normalizeTokenUsage, wrapperEvent, wrapperResponse } from './protocol.mjs';
+import {
+  describeRuntimeLimits,
+  normalizeRuntimePolicy,
+  runtimePolicyFromEnv,
+  runtimePolicySupport,
+  stallThresholdMs
+} from './runtime-policy.mjs';
+import { createTaskSupervisor, isMeaningfulOutput, reapProcessGroup, terminateProcessTree } from './supervisor.mjs';
 import { connectorSecrets, createMcpManager } from './mcp/manager.mjs';
 import { createConversationStore, normalizeConversationId } from './conversations.mjs';
 import { authorizeWorkerRequest } from './workload-auth.mjs';
@@ -231,6 +246,11 @@ export function createWorkerServer(options = {}) {
   const observeProviderSessionId = adapterId === 'claude-code'
     ? observeClaudeSessionId
     : adapterId === 'opencode' ? observeOpenCodeSessionId : observeCodexSessionId;
+  // Observable subagent and child-command lifecycle. An adapter whose harness
+  // announces neither returns nothing, and the capability says so rather than
+  // the wrapper synthesising a hierarchy it cannot see.
+  const observeProviderLifecycle = adapterId === 'claude-code' ? observeClaudeLifecycle : () => [];
+  const adapterRuntimeLimits = adapterManifest.capabilities.runtimeLimits ?? { harnessControls: [], observes: [] };
   const config = {
     token: options.token ?? process.env.WORKER_TOKEN ?? '',
     authMode: options.authMode ?? process.env.WORKER_AUTH_MODE ?? 'hybrid',
@@ -270,7 +290,13 @@ export function createWorkerServer(options = {}) {
     sessionCheckTimeoutMs: positiveInterval(
       options.sessionCheckTimeoutMs ?? process.env.SESSION_CHECK_TIMEOUT_MS,
       CLAUDE_SESSION_CHECK_TIMEOUT_MS
-    )
+    ),
+    // This runtime's own defaults. The control plane injects a per-agent policy
+    // with every task; these apply when it does not, and give an operator a way
+    // to bound a runtime without going through the registry.
+    runtimeLimits: normalizeRuntimePolicy(options.runtimeLimits ?? {}, {
+      defaults: runtimePolicyFromEnv(process.env)
+    })
   };
   if (!config.token) throw new Error('WORKER_TOKEN is required');
   if (!['token', 'jwt', 'hybrid'].includes(config.authMode)) throw new Error('WORKER_AUTH_MODE must be token, jwt, or hybrid');
@@ -299,6 +325,22 @@ export function createWorkerServer(options = {}) {
       // advertise that behavior. The control plane must see this positive flag
       // before it sends a cancellation that could otherwise kill unrelated work.
       targetedCancellation: true
+    },
+    // Two separable things, deliberately reported apart. `supervision` is what
+    // this wrapper does for every adapter; `support` says, control by control,
+    // whether a configured limit is actually enforced and by whom. A control the
+    // harness cannot honour reads as unsupported instead of quietly disappearing.
+    runtimeLimits: {
+      supervision: {
+        wallTimeout: true,
+        idleTimeout: true,
+        processTreeTermination: true,
+        gracefulThenForced: true
+      },
+      support: runtimePolicySupport(adapterRuntimeLimits),
+      observes: [...(adapterRuntimeLimits.observes ?? [])],
+      observedSubagentDepth: adapterRuntimeLimits.observedSubagentDepth ?? 0,
+      defaults: { ...config.runtimeLimits }
     }
   };
 
@@ -316,7 +358,11 @@ export function createWorkerServer(options = {}) {
     claudeAuthStatusPromise: null,
     claudeCredentialMarker: null,
     demoAuthLastRefreshAt: new Date().toISOString(),
-    providerLastCheckedAt: null
+    providerLastCheckedAt: null,
+    // Why the most recent task ended, kept after the stream closed. A task that
+    // timed out or was force-terminated is exactly the thing an operator looks
+    // for after the fact, and the NDJSON stream is gone by then.
+    lastTask: null
   };
 
   const providerEnv = config.adapterId === 'claude-code'
@@ -1417,6 +1463,16 @@ export function createWorkerServer(options = {}) {
     return scrubbed;
   }
 
+  // task.started already opens every stream, so the bounds this task runs under
+  // ride along with it rather than as a new event ahead of it — an extra event
+  // at the head of the stream would move every position a consumer relies on.
+  function emitTaskStarted(res, job, data) {
+    emitCanonical(res, 'task.started', {
+      taskId: job.id,
+      data: { ...data, limits: job.limits }
+    });
+  }
+
   function emitCanonical(res, type, { taskId = null, data = {} } = {}) {
     const safe = data && typeof data === 'object' && !Array.isArray(data)
       ? Object.fromEntries(Object.entries(data).map(([key, value]) => [key, redact(value)]))
@@ -1435,21 +1491,244 @@ export function createWorkerServer(options = {}) {
         conversations.attachSession(job.conversationId, session).catch(() => {});
       }
     }
+    for (const descriptor of observeProviderLifecycle(event)) emitLifecycleEvent(res, job, descriptor);
     const normalized = normalizeProviderEvent(event);
     if (!normalized) return;
+    // A translated event is the clearest evidence the harness is still working,
+    // and the only evidence when its output is quiet but structured.
+    job.supervisor?.touch();
     observeUsage(job, normalized);
     emitCanonical(res, normalized.type, { taskId: job.id, data: normalized.data });
   }
 
+  // Observable subagent and child-command lifecycle. Metadata only: an id, a
+  // tool or agent-type name, and a status. Never the delegated prompt, never the
+  // command line, never a tool result — those are the caller's data, and a
+  // lifecycle event is read by operators who are not entitled to them.
+  function emitLifecycleEvent(res, job, descriptor) {
+    if (!descriptor?.id) return;
+    if (descriptor.phase === 'started') {
+      const scope = descriptor.scope === 'subagent' ? job.subagents : job.childCommands;
+      if (scope.has(descriptor.id)) return;
+      scope.set(descriptor.id, { name: descriptor.name ?? null, startedAtMs: Date.now() });
+      if (descriptor.scope === 'subagent') {
+        job.peakSubagents = Math.max(job.peakSubagents, job.subagents.size);
+        emitCanonical(res, 'subagent.started', {
+          taskId: job.id,
+          data: {
+            subagentId: descriptor.id,
+            name: descriptor.name ?? null,
+            // Only the first level is announced on the main stream. Claiming a
+            // deeper number would be inventing hierarchy we cannot observe.
+            depth: 1,
+            active: job.subagents.size
+          }
+        });
+        return;
+      }
+      emitCanonical(res, 'child.started', {
+        taskId: job.id,
+        data: {
+          childId: descriptor.id,
+          kind: 'command',
+          name: descriptor.name ?? null,
+          active: job.childCommands.size,
+          timeoutMs: job.limits.effective.childCommandTimeoutMs
+        }
+      });
+      return;
+    }
+    if (descriptor.phase !== 'completed') return;
+    const subagent = job.subagents.get(descriptor.id);
+    if (subagent) {
+      job.subagents.delete(descriptor.id);
+      emitCanonical(res, 'subagent.completed', {
+        taskId: job.id,
+        data: {
+          subagentId: descriptor.id,
+          name: subagent.name,
+          depth: 1,
+          status: descriptor.status ?? 'succeeded',
+          durationMs: Date.now() - subagent.startedAtMs,
+          active: job.subagents.size
+        }
+      });
+      return;
+    }
+    const child = job.childCommands.get(descriptor.id);
+    if (!child) return;
+    job.childCommands.delete(descriptor.id);
+    emitCanonical(res, 'child.completed', {
+      taskId: job.id,
+      data: {
+        childId: descriptor.id,
+        kind: 'command',
+        name: child.name,
+        status: descriptor.status ?? 'succeeded',
+        durationMs: Date.now() - child.startedAtMs,
+        active: job.childCommands.size
+      }
+    });
+  }
+
+  // One termination path for cancel, both timeouts, and worker shutdown. The
+  // harness runs in its own process group, so the signal reaches the descendants
+  // that are the actual problem; an uncooperative group is force-killed once the
+  // configured grace period is spent.
+  function terminateJob(job, reason) {
+    if (!job || job.terminating) return;
+    job.terminating = true;
+    job.terminalReason ??= reason;
+    job.lifecycle = 'terminating';
+    if (reason === 'cancelled') job.cancelled = true;
+    const stream = job.stream;
+    const announce = (data) => { if (stream) emitCanonical(stream, 'runtime.termination', { taskId: job.id, data }); };
+    if (!job.child) {
+      // Nothing spawned yet: record the reason so the task cannot report success,
+      // and let the run path observe job.cancelled as it always has.
+      announce({ reason, phase: 'graceful', signal: null, delivered: false, graceMs: job.policy?.terminationGraceMs ?? 0 });
+      return;
+    }
+    job.termination = terminateProcessTree(job.child, {
+      graceMs: job.policy?.terminationGraceMs ?? 0,
+      processGroup: job.processGroup === true,
+      onPhase: ({ phase, signal, delivered, processGroup }) => {
+        if (phase === 'force') {
+          job.forceTerminated = true;
+          job.lifecycle = 'force-terminated';
+        }
+        announce({ reason, phase, signal, delivered, processGroup, graceMs: job.policy?.terminationGraceMs ?? 0 });
+      }
+    });
+  }
+
+  // Identical for every adapter, and deliberately so: supervision must not
+  // depend on which harness is running. Each adapter only chooses its command,
+  // arguments, and environment; the stream handling, idle accounting, and
+  // terminal classification are the wrapper's.
+  async function streamHarness(res, job, child) {
+    job.child = child;
+    job.lifecycle = 'running';
+    if (job.terminating) {
+      // Cancelled between the claim and the spawn. Terminate the tree we just
+      // created rather than leaving it to run unattended to completion.
+      job.terminating = false;
+      terminateJob(job, job.terminalReason ?? 'cancelled');
+    }
+    let stdoutBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      if (isMeaningfulOutput(text)) job.supervisor?.touch();
+      stdoutBuffer += text;
+      const lines = stdoutBuffer.split('\n');
+      stdoutBuffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { emitProviderEvent(res, JSON.parse(line), job); }
+        catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } }); }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = clean(chunk.toString('utf8'));
+      if (isMeaningfulOutput(text)) job.supervisor?.touch();
+      emitCanonical(res, 'log', { taskId: job.id, data: { level: 'warning', source: 'provider', message: text } });
+    });
+    const code = await new Promise((resolve) => {
+      child.once('error', (error) => {
+        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
+        resolve(-1);
+      });
+      child.once('close', (exitCode) => resolve(exitCode ?? -1));
+    });
+    job.termination?.dispose();
+    reapProcessGroup(child, { processGroup: job.processGroup === true });
+    if (stdoutBuffer.trim()) {
+      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
+      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
+    }
+    finishJob(job, code);
+  }
+
+  // A terminal reason always wins over the exit code. A harness killed at the
+  // wall-clock bound can still exit 0, and reporting that as success is exactly
+  // how a bounded task silently stops being bounded.
+  function finishJob(job, code) {
+    job.exitCode = code;
+    if (job.terminalReason === 'cancelled' || job.cancelled) {
+      job.status = 'cancelled';
+      job.terminalReason ??= 'cancelled';
+    } else if (job.terminalReason) {
+      job.status = 'failed';
+    } else {
+      job.status = code === 0 ? 'succeeded' : 'failed';
+      job.terminalReason = code === 0 ? 'completed' : 'exit_code';
+    }
+    job.lifecycle = 'completed';
+  }
+
+  // Everything an operator needs to tell working from stalled, without anything
+  // they are not entitled to: no prompt, no instructions, no environment.
+  function publicActiveTask(job) {
+    const supervision = job.supervisor?.snapshot() ?? null;
+    return {
+      id: job.id,
+      status: job.status,
+      startedAt: job.startedAt,
+      model: job.model ?? null,
+      lifecycle: job.lifecycle ?? 'running',
+      terminalReason: job.terminalReason,
+      forceTerminated: job.forceTerminated === true,
+      lastActivityAt: supervision?.lastActivityAt ?? null,
+      elapsedMs: supervision?.elapsedMs ?? null,
+      idleMs: supervision?.idleMs ?? null,
+      stalled: supervision?.stalled ?? false,
+      limits: job.limits ?? null,
+      subagents: { active: job.subagents?.size ?? 0, peak: job.peakSubagents ?? 0 },
+      childCommands: { active: job.childCommands?.size ?? 0 }
+    };
+  }
+
+  function completedTaskData(job) {
+    return {
+      status: job.status,
+      exitCode: job.exitCode ?? -1,
+      // Additive within agent-wrapper/v1: an older consumer keeps reading status
+      // and exitCode, a current one can tell a wall timeout from a plain failure.
+      reason: job.terminalReason ?? (job.status === 'succeeded' ? 'completed' : 'unknown'),
+      forceTerminated: job.forceTerminated === true,
+      durationMs: Date.now() - Date.parse(job.startedAt),
+      lifecycle: 'completed'
+    };
+  }
+
+  // Runs on every exit path. Disposing the escalation timer keeps a SIGKILL from
+  // outliving the process it was aimed at; reaping the group afterwards is what
+  // stops a task from *ending* while an orphaned descendant keeps running.
+  function concludeJob(job) {
+    job.supervisor?.stop();
+    job.termination?.dispose();
+    reapProcessGroup(job.child, { processGroup: job.processGroup === true });
+    job.stream = null;
+    state.lastTask = {
+      id: job.id,
+      status: job.status,
+      reason: job.terminalReason ?? 'unknown',
+      forceTerminated: job.forceTerminated === true,
+      startedAt: job.startedAt,
+      endedAt: new Date().toISOString(),
+      exitCode: job.exitCode ?? null,
+      peakSubagents: job.peakSubagents ?? 0
+    };
+  }
+
   async function runDemo(res, job, prompt) {
-    emitCanonical(res, 'task.started', { taskId: job.id, data: { executionMode: 'demo', model: job.model ?? 'provider-default' } });
+    emitTaskStarted(res, job, { executionMode: 'demo', model: job.model ?? 'provider-default' });
     await new Promise((resolve) => setTimeout(resolve, 120));
     emitCanonical(res, 'message.completed', { taskId: job.id, data: { role: 'assistant', text: `Demo worker received: ${prompt}` } });
     await new Promise((resolve) => setTimeout(resolve, 120));
     job.tokenUsage = normalizeTokenUsage({ input_tokens: 12, cached_input_tokens: 3, output_tokens: 8 });
     emitCanonical(res, 'usage.observed', { taskId: job.id, data: { request: job.tokenUsage } });
-    job.status = 'succeeded';
-    job.exitCode = 0;
+    finishJob(job, 0);
   }
 
   async function runCodex(res, job, prompt, instructions) {
@@ -1479,46 +1758,14 @@ export function createWorkerServer(options = {}) {
     const child = spawnProcess('codex', args, {
       cwd: config.workspace,
       env: mcpContext.env,
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // Its own process group, so a cancel or a timeout reaches the whole tree.
+      detached: true
     });
-    job.child = child;
-    emitCanonical(res, 'task.started', {
-      taskId: job.id,
-      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-sandbox' }
-    });
+    job.processGroup = true;
+    emitTaskStarted(res, job, { executionMode: config.allowUnsandboxed ? 'container' : 'provider-sandbox' });
     child.stdin.end(fullPrompt);
-
-    let stdoutBuffer = '';
-    child.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk.toString('utf8');
-      const lines = stdoutBuffer.split('\n');
-      stdoutBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          emitProviderEvent(res, JSON.parse(line), job);
-        } catch {
-          emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } });
-        }
-      }
-    });
-    child.stderr.on('data', (chunk) => emitCanonical(res, 'log', {
-      taskId: job.id,
-      data: { level: 'warning', source: 'provider', message: clean(chunk.toString('utf8')) }
-    }));
-    const code = await new Promise((resolve) => {
-      child.once('error', (error) => {
-        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
-        resolve(-1);
-      });
-      child.once('close', (exitCode) => resolve(exitCode ?? -1));
-    });
-    if (stdoutBuffer.trim()) {
-      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
-      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
-    }
-    job.status = code === 0 ? 'succeeded' : job.cancelled ? 'cancelled' : 'failed';
-    job.exitCode = code;
+    await streamHarness(res, job, child);
   }
 
   async function runClaude(res, job, prompt, instructions) {
@@ -1532,47 +1779,20 @@ export function createWorkerServer(options = {}) {
     if (instructions) args.push('--append-system-prompt', instructions);
     if (config.allowUnsandboxed) args.push('--dangerously-skip-permissions');
     else args.push('--permission-mode', 'dontAsk');
+    // Only the limits this harness actually enforces; the rest are reported
+    // unsupported rather than turned into a flag Claude Code does not have.
+    args.push(...claudeRuntimeLimitArgs(job.limits.effective));
 
     const child = spawnProcess('claude', args, {
       cwd: config.workspace,
-      env: mcpContext.env,
-      stdio: ['pipe', 'pipe', 'pipe']
+      env: { ...mcpContext.env, ...claudeRuntimeLimitEnv(job.limits.effective) },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true
     });
-    job.child = child;
-    emitCanonical(res, 'task.started', {
-      taskId: job.id,
-      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions' }
-    });
+    job.processGroup = true;
+    emitTaskStarted(res, job, { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions' });
     child.stdin.end(prompt);
-
-    let stdoutBuffer = '';
-    child.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk.toString('utf8');
-      const lines = stdoutBuffer.split('\n');
-      stdoutBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { emitProviderEvent(res, JSON.parse(line), job); }
-        catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } }); }
-      }
-    });
-    child.stderr.on('data', (chunk) => emitCanonical(res, 'log', {
-      taskId: job.id,
-      data: { level: 'warning', source: 'provider', message: clean(chunk.toString('utf8')) }
-    }));
-    const code = await new Promise((resolve) => {
-      child.once('error', (error) => {
-        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
-        resolve(-1);
-      });
-      child.once('close', (exitCode) => resolve(exitCode ?? -1));
-    });
-    if (stdoutBuffer.trim()) {
-      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
-      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
-    }
-    job.status = code === 0 ? 'succeeded' : job.cancelled ? 'cancelled' : 'failed';
-    job.exitCode = code;
+    await streamHarness(res, job, child);
   }
 
   async function runOpenCode(res, job, prompt, instructions) {
@@ -1589,45 +1809,18 @@ export function createWorkerServer(options = {}) {
     const child = spawnProcess('opencode', args, {
       cwd: config.workspace,
       env: mcpContext.env,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true
     });
-    job.child = child;
-    emitCanonical(res, 'task.started', {
-      taskId: job.id,
-      data: { executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions', model: job.model ?? 'provider-default' }
+    job.processGroup = true;
+    emitTaskStarted(res, job, {
+      executionMode: config.allowUnsandboxed ? 'container' : 'provider-permissions',
+      model: job.model ?? 'provider-default'
     });
-
-    let stdoutBuffer = '';
-    child.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk.toString('utf8');
-      const lines = stdoutBuffer.split('\n');
-      stdoutBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { emitProviderEvent(res, JSON.parse(line), job); }
-        catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: line } }); }
-      }
-    });
-    child.stderr.on('data', (chunk) => emitCanonical(res, 'log', {
-      taskId: job.id,
-      data: { level: 'warning', source: 'provider', message: clean(chunk.toString('utf8')) }
-    }));
-    const code = await new Promise((resolve) => {
-      child.once('error', (error) => {
-        emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
-        resolve(-1);
-      });
-      child.once('close', (exitCode) => resolve(exitCode ?? -1));
-    });
-    if (stdoutBuffer.trim()) {
-      try { emitProviderEvent(res, JSON.parse(stdoutBuffer), job); }
-      catch { emitCanonical(res, 'log', { taskId: job.id, data: { level: 'info', source: 'provider', message: stdoutBuffer } }); }
-    }
-    job.status = code === 0 ? 'succeeded' : job.cancelled ? 'cancelled' : 'failed';
-    job.exitCode = code;
+    await streamHarness(res, job, child);
   }
 
-  return createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://worker.local');
       const route = canonicalRoute(url.pathname);
@@ -1702,8 +1895,12 @@ export function createWorkerServer(options = {}) {
           authentication: publicAuthentication({ login, session }),
           task: {
             active: state.activeJob && state.activeJob.operation !== 'session-check'
-              ? { id: state.activeJob.id, status: state.activeJob.status, startedAt: state.activeJob.startedAt, model: state.activeJob.model ?? null }
-              : null
+              ? publicActiveTask(state.activeJob)
+              : null,
+            // Survives the stream. "Cancelled", "timed out at the idle bound",
+            // and "force-terminated" are precisely what an operator goes looking
+            // for once the NDJSON connection they were watching has closed.
+            last: state.lastTask
           },
           execution: {
             boundary: config.allowUnsandboxed ? 'container' : 'provider-workspace-sandbox',
@@ -1831,7 +2028,24 @@ export function createWorkerServer(options = {}) {
           authentication: publicAuthentication({ login })
         }));
 
+        // The control plane injects the agent's saved policy with every task, in
+        // the same breath as its durable instructions and model policy. A browser
+        // cannot reach this field: the control plane overwrites whatever arrives.
+        let policy;
+        try { policy = normalizeRuntimePolicy(body.runtimeLimits, { defaults: config.runtimeLimits }); }
+        catch (error) { return release() ?? json(res, error.status ?? 400, wrapperResponse({ error: error.message })); }
+
         const job = { id: randomUUID(), status: 'running', startedAt: new Date().toISOString(), child: null, cancelled: false, tokenUsage: null, exitCode: null, model: resolvedModel.model };
+        job.policy = policy;
+        job.limits = describeRuntimeLimits(policy, adapterRuntimeLimits);
+        job.lifecycle = 'starting';
+        job.terminalReason = null;
+        job.forceTerminated = false;
+        job.terminating = false;
+        job.processGroup = false;
+        job.subagents = new Map();
+        job.childCommands = new Map();
+        job.peakSubagents = 0;
         job.conversationId = conversationId;
         job.redactions = [];
         if (conversationId) {
@@ -1853,6 +2067,31 @@ export function createWorkerServer(options = {}) {
           'cache-control': 'no-store',
           'x-content-type-options': 'nosniff'
         });
+        // Kept so cancellation, a timeout, and shutdown can all report on the
+        // stream the operator is already watching.
+        job.stream = res;
+        job.supervisor = createTaskSupervisor({
+          policy,
+          stallAfterMs: stallThresholdMs(policy),
+          onStalled: (snapshot) => {
+            job.lifecycle = 'stalled';
+            emitCanonical(res, 'runtime.stalled', {
+              taskId: job.id,
+              data: {
+                idleMs: snapshot.idleMs,
+                since: snapshot.lastActivityAt,
+                idleTimeoutMs: policy.taskIdleTimeoutMs,
+                activeSubagents: job.subagents.size,
+                activeChildCommands: job.childCommands.size
+              }
+            });
+          },
+          onResumed: (snapshot) => {
+            if (job.lifecycle === 'stalled') job.lifecycle = 'running';
+            emitCanonical(res, 'runtime.resumed', { taskId: job.id, data: { idleMs: snapshot.idleMs } });
+          },
+          onExpired: (reason) => terminateJob(job, reason)
+        });
         try {
           if (conversationId) {
             emitCanonical(res, 'conversation.continued', {
@@ -1866,14 +2105,17 @@ export function createWorkerServer(options = {}) {
           else await runCodex(res, job, prompt, instructions);
           const usage = await finalizeJobUsage(job);
           emitCanonical(res, 'usage.updated', { taskId: job.id, data: { usage } });
-          emitCanonical(res, 'task.completed', { taskId: job.id, data: { status: job.status, exitCode: job.exitCode } });
+          emitCanonical(res, 'task.completed', { taskId: job.id, data: completedTaskData(job) });
         } catch (error) {
           job.status = job.cancelled ? 'cancelled' : 'failed';
+          job.terminalReason ??= 'wrapper_error';
+          job.lifecycle = 'completed';
           emitCanonical(res, 'error', { taskId: job.id, data: { source: 'wrapper', message: error.message } });
           const usage = await finalizeJobUsage(job);
           emitCanonical(res, 'usage.updated', { taskId: job.id, data: { usage } });
-          emitCanonical(res, 'task.completed', { taskId: job.id, data: { status: job.status, exitCode: job.exitCode ?? -1 } });
+          emitCanonical(res, 'task.completed', { taskId: job.id, data: completedTaskData(job) });
         } finally {
+          concludeJob(job);
           state.activeJob = null;
           res.end();
         }
@@ -1885,12 +2127,17 @@ export function createWorkerServer(options = {}) {
         if (state.activeJob.operation === 'session-check') {
           return json(res, 409, wrapperResponse({ error: 'The provider is checking its session; there is no active task to cancel' }));
         }
+        if (state.activeJob.claim) {
+          return json(res, 409, wrapperResponse({ error: 'A task is still starting; retry once it reports an id' }));
+        }
         const body = await readJson(req, 16 * 1024);
         if (body.taskId !== undefined && body.taskId !== state.activeJob.id) {
           return json(res, 409, wrapperResponse({ error: 'The requested task is no longer active' }));
         }
-        state.activeJob.cancelled = true;
-        state.activeJob.child?.kill('SIGTERM');
+        // Graceful signal to the whole process group now, forced termination once
+        // the configured grace period is spent. Killing only the CLI would leave
+        // exactly the descendants this exists to stop.
+        terminateJob(state.activeJob, 'cancelled');
         return json(res, 202, wrapperResponse({ task: { id: state.activeJob.id, status: 'cancelling' } }));
       }
 
@@ -1900,10 +2147,42 @@ export function createWorkerServer(options = {}) {
       else res.end(`${JSON.stringify(wrapperEvent('error', { data: { source: 'wrapper', message: error.message } }))}\n`);
     }
   });
+
+  // The harness runs in its own process group precisely so a signal can reach its
+  // descendants — which also means it no longer dies with the worker. A container
+  // stop or a runtime refresh must therefore tear the tree down deliberately,
+  // rather than leaving a detached subtree billing an account with nothing
+  // watching it.
+  server.shutdownRuntime = async ({ reason = 'worker_shutdown' } = {}) => {
+    const job = state.activeJob;
+    if (!job || job.claim) return { terminated: false };
+    terminateJob(job, reason);
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, job.policy?.terminationGraceMs ?? 0);
+      timer.unref?.();
+    });
+    job.termination?.dispose();
+    reapProcessGroup(job.child, { processGroup: job.processGroup === true });
+    return { terminated: true, taskId: job.id, reason, forceTerminated: job.forceTerminated === true };
+  };
+
+  return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const server = createWorkerServer();
   const port = Number(process.env.PORT ?? 7777);
   server.listen(port, '0.0.0.0', () => console.log(`[worker] listening on :${port}`));
+  let stopping = false;
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, async () => {
+      if (stopping) return;
+      stopping = true;
+      const result = await server.shutdownRuntime({ reason: 'worker_shutdown' }).catch(() => null);
+      if (result?.terminated) console.log(`[worker] terminated task ${result.taskId} on ${signal}`);
+      server.close(() => process.exit(0));
+      // A stream the client never reads must not hold the container open.
+      setTimeout(() => process.exit(0), 2_000).unref();
+    });
+  }
 }

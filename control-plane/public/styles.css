@@ -311,6 +311,12 @@ input:focus, select:focus { border-color: #758e42; box-shadow: 0 0 0 2px #c7ff4a
 .model-policy-card .field { max-width: 720px; }
 .model-policy-footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 10px; color: var(--faint); font: 10px/1.4 ui-monospace, monospace; }
 .model-policy-footer strong { color: var(--muted); font-weight: 500; white-space: nowrap; }
+.limits-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
+.limits-grid .field { max-width: none; }
+.limits-grid .checkbox-field { grid-column: 1 / -1; display: flex; align-items: center; gap: 9px; font-weight: 500; }
+.limits-grid .checkbox-field input { width: auto; }
+#runtime-limits-copy { margin: 0 0 13px; color: var(--faint); font-size: 11px; line-height: 1.5; }
+.limit-unsupported { color: var(--faint); }
 .task-panel { margin-top: 0; }
 .output-panel { margin-top: 18px; }
 label { display: flex; justify-content: space-between; color: var(--ink); font-size: 12px; font-weight: 700; margin: 16px 0 8px; }
@@ -504,6 +510,7 @@ footer { max-width: 1180px; margin: auto; padding: 18px 24px 30px; border-top: 1
   .mcp-toolbar { grid-template-columns: 1fr; }
   .mcp-footer { align-items: stretch; flex-direction: column; }
   .form-grid { grid-template-columns: 1fr; }
+  .limits-grid { grid-template-columns: 1fr; }
   .model-policy-footer { flex-direction: column; }
   .field.full { grid-column: auto; }
   .auth-box { grid-template-columns: 1fr; }

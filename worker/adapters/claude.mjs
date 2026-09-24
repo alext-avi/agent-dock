@@ -14,12 +14,105 @@ export const claudeAdapterManifest = Object.freeze({
       // request rather than any endpoint this wrapper could call directly.
       sessionCheck: { supported: true, mayConsumeUsage: true }
     },
-    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true },
+    tasks: { streaming: 'ndjson', cancellation: true, profileInstructions: true, conversations: true, runtimeLimits: true },
+    // Which provider-neutral runtime limits Claude Code itself enforces. The
+    // wall-clock bound, the idle bound, and graceful-then-forced process-tree
+    // termination are wrapper supervision and are deliberately not listed: they
+    // apply to every adapter. Anything absent here is reported unsupported
+    // rather than configured and quietly ignored.
+    runtimeLimits: {
+      harnessControls: [
+        'maxHarnessTurns',
+        'childCommandTimeoutMs',
+        'childCommandMaxTimeoutMs',
+        'maxConcurrentSubagents',
+        'maxSubagentDepth',
+        'allowBackgroundTasks'
+      ],
+      // Claude Code announces its own tool use on the main stream, so subagent
+      // and child-command starts and stops are observable. Work inside a
+      // subagent is not forwarded there, so nesting below the first level is
+      // bounded by the harness control but never reported as observed.
+      observes: ['subagent', 'childCommand'],
+      observedSubagentDepth: 1
+    },
     mcp: claudeMcpCapabilities,
     usage: { requestTokens: true, accountActivity: false, quotaWindows: false },
     workspace: { list: true }
   }
 });
+
+// Claude Code's own names for the two things this policy bounds. They stay
+// here, below the wrapper, like every other provider-shaped string.
+const CLAUDE_SUBAGENT_TOOL = 'Task';
+const CLAUDE_CHILD_COMMAND_TOOLS = new Set(['Bash', 'BashOutput', 'KillShell']);
+
+// Translates the effective provider-neutral policy into Claude Code's supported
+// flags and environment. Only fields the manifest claims are read: a null means
+// the control plane configured something this harness cannot enforce, and
+// inventing a flag for it would be worse than reporting the gap.
+export function claudeRuntimeLimitArgs(effective = {}) {
+  const args = [];
+  if (Number.isInteger(effective.maxHarnessTurns)) args.push('--max-turns', String(effective.maxHarnessTurns));
+  return args;
+}
+
+export function claudeRuntimeLimitEnv(effective = {}) {
+  const env = {};
+  if (Number.isInteger(effective.childCommandTimeoutMs)) {
+    env.BASH_DEFAULT_TIMEOUT_MS = String(effective.childCommandTimeoutMs);
+  }
+  if (Number.isInteger(effective.childCommandMaxTimeoutMs)) {
+    env.BASH_MAX_TIMEOUT_MS = String(effective.childCommandMaxTimeoutMs);
+  }
+  if (Number.isInteger(effective.maxConcurrentSubagents)) {
+    env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = String(effective.maxConcurrentSubagents);
+  }
+  if (Number.isInteger(effective.maxSubagentDepth)) {
+    env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = String(effective.maxSubagentDepth);
+  }
+  if (effective.allowBackgroundTasks === false) env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
+  return env;
+}
+
+// Observable subagent and child-command lifecycle, returned as descriptors
+// rather than finished events: a tool result names only the tool-use id it
+// answers, so the caller correlates it with the start it already saw. Pure, and
+// deliberately carrying no tool input — a command line or a delegated prompt is
+// exactly what must not leave the worker on a lifecycle event.
+export function observeClaudeLifecycle(event = {}) {
+  const descriptors = [];
+  if (event.type === 'assistant') {
+    for (const block of event.message?.content ?? []) {
+      if (block?.type !== 'tool_use') continue;
+      const scope = block.name === CLAUDE_SUBAGENT_TOOL
+        ? 'subagent'
+        : CLAUDE_CHILD_COMMAND_TOOLS.has(block.name) ? 'child' : null;
+      if (!scope) continue;
+      descriptors.push({
+        phase: 'started',
+        scope,
+        id: typeof block.id === 'string' ? block.id : null,
+        // For a subagent this is the named agent type, never the delegated
+        // prompt. For a child command it is the tool, never the command line.
+        name: scope === 'subagent' && typeof block.input?.subagent_type === 'string'
+          ? block.input.subagent_type
+          : block.name ?? null
+      });
+    }
+  }
+  if (event.type === 'user') {
+    for (const block of event.message?.content ?? []) {
+      if (block?.type !== 'tool_result') continue;
+      descriptors.push({
+        phase: 'completed',
+        id: typeof block.tool_use_id === 'string' ? block.tool_use_id : null,
+        status: block.is_error === true ? 'failed' : 'succeeded'
+      });
+    }
+  }
+  return descriptors;
+}
 
 function contentText(content = []) {
   if (!Array.isArray(content)) return '';

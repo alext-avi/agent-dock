@@ -18,6 +18,7 @@ import {
 import { createDelegationService } from './delegation-service.mjs';
 import { createDockerRuntimeManager } from './docker-runtime.mjs';
 import { createFleetUsageCache } from './fleet-usage.mjs';
+import { normalizeRuntimeLimits } from './runtime-limits.mjs';
 import { createMcpService, normalizeStoredMcpDefinition } from './mcp-service.mjs';
 import { createCredentialStore, environmentKeyProvider } from './credentials.mjs';
 import { createScheduler } from './scheduler.mjs';
@@ -135,6 +136,10 @@ function publicAgent(agent, runtime = null, attachmentCount = 0) {
     adapter: agent.adapter,
     durablePrompt: agent.durablePrompt,
     modelPolicy: agent.modelPolicy,
+    // What the operator configured. Whether a given limit is actually enforced
+    // is the runtime's answer, read from its status capabilities — a saved value
+    // is a preference, not a promise.
+    runtimeLimits: agent.runtimeLimits,
     runtime: publicRuntime(runtime, agent.runtimeBinding, attachmentCount),
     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt
@@ -201,6 +206,7 @@ function makeAgent(input, existingIds, defaults = {}) {
     adapter,
     durablePrompt: stringField(input.durablePrompt ?? defaults.durablePrompt ?? '', 'durablePrompt', { max: 50_000 }) ?? '',
     modelPolicy: normalizeModelPolicy(input.modelPolicy ?? defaults.modelPolicy),
+    runtimeLimits: normalizeRuntimeLimits(input.runtimeLimits ?? defaults.runtimeLimits ?? {}),
     runtimeId: input.runtimeId ?? defaults.runtimeId ?? null,
     runtimeBinding: input.runtimeBinding ?? defaults.runtimeBinding ?? 'unprovisioned',
     createdAt: now,
@@ -430,6 +436,9 @@ export function createControlPlane(options = {}) {
       adapter: agent.adapter ?? 'codex-cli',
       durablePrompt: agent.durablePrompt ?? '',
       modelPolicy: normalizeModelPolicy(agent.modelPolicy),
+      // An agent saved before runtime limits existed adopts the conservative
+      // defaults rather than running unbounded, which is the whole point of them.
+      runtimeLimits: normalizeRuntimeLimits(agent.runtimeLimits ?? {}),
       runtimeId: agent.runtimeId ?? null,
       runtimeBinding: agent.runtimeBinding ?? (agent.runtimeId ? 'attached' : 'unprovisioned'),
       createdAt: agent.createdAt ?? new Date().toISOString(),
@@ -822,7 +831,16 @@ export function createControlPlane(options = {}) {
     if (request.conversationId !== undefined && request.conversationId !== null) {
       await requireConversationSupport(agent);
     }
-    const body = JSON.stringify({ ...request, prompt, instructions: agent.durablePrompt, modelPolicy: agent.modelPolicy });
+    // Durable, never per-request: the saved prompt, the saved model policy, and
+    // the saved runtime limits are all injected here, and a browser attempt to
+    // widen any of them is overwritten rather than honoured.
+    const body = JSON.stringify({
+      ...request,
+      prompt,
+      instructions: agent.durablePrompt,
+      modelPolicy: agent.modelPolicy,
+      runtimeLimits: agent.runtimeLimits
+    });
     const { response: upstream } = await workerFetch(agent, '/v1/tasks', { method: 'POST', body, timeout: 24 * 60 * 60 * 1000 });
     if (!upstream.ok || !upstream.body) {
       const message = await upstream.text();
@@ -883,7 +901,8 @@ export function createControlPlane(options = {}) {
         body: JSON.stringify({
           prompt,
           instructions: agent.durablePrompt,
-          modelPolicy: agent.modelPolicy
+          modelPolicy: agent.modelPolicy,
+          runtimeLimits: agent.runtimeLimits
         }),
         timeout: timeoutMs
       });
@@ -1121,6 +1140,10 @@ export function createControlPlane(options = {}) {
       }
       if ('durablePrompt' in body) updated.durablePrompt = stringField(body.durablePrompt, 'durablePrompt', { max: 50_000 });
       if ('modelPolicy' in body) updated.modelPolicy = normalizeModelPolicy(body.modelPolicy);
+      // Merged onto the saved limits, not replacing them: the runtime-limits form
+      // submits the fields it renders, and a field it does not render must keep
+      // its configured bound rather than silently reverting to the default.
+      if ('runtimeLimits' in body) updated.runtimeLimits = normalizeRuntimeLimits(body.runtimeLimits, agent.runtimeLimits);
       updated.updatedAt = new Date().toISOString();
       agents.set(id, updated);
       await persistAgents();

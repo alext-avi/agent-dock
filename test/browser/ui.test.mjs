@@ -1868,3 +1868,100 @@ test('a local process is not described as limited by a host list', async (t) => 
   assert.doesNotMatch(text, /limited to/i);
   assert.doesNotMatch(text, /only\.example\.test/);
 });
+
+test('runtime limits are editable, and the page says which ones the harness enforces', async (t) => {
+  const page = await openPage(`/agents/${app.agents['codex-cli'].id}`);
+  t.after(() => page.close());
+  await page.waitForSelector('#limit-wall-timeout');
+
+  // Milliseconds in the API, seconds in the form.
+  assert.equal(await page.inputValue('#limit-wall-timeout'), '1800');
+  assert.equal(await page.inputValue('#limit-idle-timeout'), '300');
+  assert.equal(await page.isChecked('#limit-background-tasks'), false);
+
+  // Codex exposes no turn cap, no child-command timeout, and no subagent
+  // controls. The values are still saved, and the page has to say plainly that
+  // they are not in force rather than letting the operator assume they are.
+  await page.waitForFunction(() => document.querySelector('#runtime-limits-state')?.textContent === 'partly enforced');
+  const support = await page.locator('#runtime-limits-support').textContent();
+  assert.match(support, /Saved but not enforced/);
+  assert.match(support, /max turns/);
+  assert.match(support, /subagent concurrency/);
+  assert.equal(
+    await page.locator('#limit-max-turns').evaluate((input) => input.closest('.field').classList.contains('limit-unsupported')),
+    true
+  );
+  // The bounds the wrapper itself applies are never marked unenforced.
+  assert.equal(
+    await page.locator('#limit-idle-timeout').evaluate((input) => input.closest('.field').classList.contains('limit-unsupported')),
+    false
+  );
+
+  await page.fill('#limit-idle-timeout', '90');
+  await page.check('#limit-background-tasks');
+  await page.click('#save-agent');
+  await page.waitForFunction(() => document.querySelector('#save-message')?.textContent === 'Saved');
+
+  await page.reload();
+  await page.waitForSelector('#limit-idle-timeout');
+  assert.equal(await page.inputValue('#limit-idle-timeout'), '90');
+  assert.equal(await page.isChecked('#limit-background-tasks'), true);
+  // Restore, so a later case in this file is not reading a 90-second bound.
+  await page.fill('#limit-idle-timeout', '300');
+  await page.uncheck('#limit-background-tasks');
+  await page.click('#save-agent');
+  await page.waitForFunction(() => document.querySelector('#save-message')?.textContent === 'Saved');
+});
+
+test('a harness that enforces every configured limit says so', async (t) => {
+  const page = await openPage(`/agents/${app.agents['claude-code'].id}`);
+  t.after(() => page.close());
+  await page.waitForSelector('#limit-max-turns');
+  await page.waitForFunction(() => document.querySelector('#runtime-limits-state')?.textContent === 'enforced');
+  assert.match(await page.locator('#runtime-limits-support').textContent(), /Every configured limit is enforced/);
+});
+
+test('a contradictory pair of bounds is refused with the reason, not silently clamped', async (t) => {
+  const page = await openPage(`/agents/${app.agents['opencode'].id}`);
+  t.after(() => page.close());
+  await page.waitForSelector('#limit-wall-timeout');
+
+  await page.fill('#limit-wall-timeout', '120');
+  await page.fill('#limit-idle-timeout', '600');
+  await page.click('#save-agent');
+  await page.waitForFunction(() => /must not exceed/.test(document.querySelector('#save-message')?.textContent ?? ''));
+  assert.match(await page.locator('#save-message').textContent(), /taskIdleTimeoutMs/);
+});
+
+test('a task stopped at its wall-clock limit is distinguishable from one that simply failed', async (t) => {
+  const agentId = app.agents['codex-cli'].id;
+  // A ten-millisecond bound makes the outcome deterministic: the demo worker
+  // takes roughly a quarter of a second, so supervision always wins the race.
+  const patched = await fetch(`${app.url}/api/v1/agents/${agentId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeLimits: { taskWallTimeoutMs: 10 } })
+  });
+  assert.equal(patched.status, 200);
+  t.after(() => fetch(`${app.url}/api/v1/agents/${agentId}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runtimeLimits: { taskWallTimeoutMs: 1_800_000, taskIdleTimeoutMs: 300_000 } })
+  }));
+
+  const page = await openPage(`/agents/${agentId}#test`);
+  t.after(() => page.close());
+  await page.waitForSelector('#prompt');
+  await page.fill('#prompt', 'run something long');
+  await page.click('#run-button');
+
+  // "Failed" alone would send an operator looking for a broken harness. The
+  // reason is what points at the bound that actually stopped the work.
+  await page.waitForFunction(() => /wall-clock limit/.test(document.querySelector('.conversation')?.textContent ?? ''));
+  const transcript = await page.locator('.conversation').textContent();
+  assert.match(transcript, /Task failed: stopped at its wall-clock limit/);
+
+  // And it stays visible after the stream has closed, on the runtime summary.
+  await page.waitForFunction(() => /wall-clock limit/.test(document.querySelector('#job-state')?.textContent ?? ''));
+  assert.match(await page.locator('#job-state').textContent(), /last task stopped at its wall-clock limit/);
+});

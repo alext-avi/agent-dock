@@ -264,6 +264,28 @@
                   <strong>No automatic fallback</strong>
                 </div>
               </section>
+              <section id="runtime-limits-section" class="model-policy-card">
+                <div class="model-policy-heading">
+                  <div><p class="kicker">SUPERVISION</p><h3>Runtime limits</h3></div>
+                  <span id="runtime-limits-state" class="pill neutral">checking</span>
+                </div>
+                <p id="runtime-limits-copy">Agent Dock always bounds a task's wall-clock time and idle time and terminates the whole harness process tree. Turn, child-command, and subagent limits are enforced only by harnesses that expose them.</p>
+                <div class="form-grid limits-grid">
+                  <label class="field">Wall-clock timeout <span>seconds</span><input id="limit-wall-timeout" name="taskWallTimeoutMs" type="number" min="1" max="86400" step="1"></label>
+                  <label class="field">Idle timeout <span>seconds without output or events</span><input id="limit-idle-timeout" name="taskIdleTimeoutMs" type="number" min="1" max="86400" step="1"></label>
+                  <label class="field">Termination grace <span>seconds before force kill</span><input id="limit-grace" name="terminationGraceMs" type="number" min="0" max="120" step="1"></label>
+                  <label class="field">Max harness turns<input id="limit-max-turns" name="maxHarnessTurns" type="number" min="1" max="1000" step="1"></label>
+                  <label class="field">Child command timeout <span>seconds</span><input id="limit-child-timeout" name="childCommandTimeoutMs" type="number" min="1" max="3600" step="1"></label>
+                  <label class="field">Child command ceiling <span>seconds</span><input id="limit-child-max-timeout" name="childCommandMaxTimeoutMs" type="number" min="1" max="3600" step="1"></label>
+                  <label class="field">Max concurrent subagents<input id="limit-max-subagents" name="maxConcurrentSubagents" type="number" min="0" max="32" step="1"></label>
+                  <label class="field">Max subagent depth<input id="limit-subagent-depth" name="maxSubagentDepth" type="number" min="0" max="8" step="1"></label>
+                  <label class="field checkbox-field"><input id="limit-background-tasks" name="allowBackgroundTasks" type="checkbox"> Allow harness background tasks</label>
+                </div>
+                <div class="model-policy-footer">
+                  <span id="runtime-limits-support">Checking which limits this runtime enforces…</span>
+                  <strong>Whole process tree supervised</strong>
+                </div>
+              </section>
               <div class="actions"><button id="save-agent" class="button primary" type="submit">Save instructions</button><span id="save-message" class="run-message"></span></div>
             </form>
           </article>

@@ -133,6 +133,17 @@ const ui = {
   modelPolicyCopy: $('#model-policy-copy'),
   providerStatus: $('#provider-status'),
   providerModels: $('#provider-models'),
+  runtimeLimitsState: $('#runtime-limits-state'),
+  runtimeLimitsSupport: $('#runtime-limits-support'),
+  limitWallTimeout: $('#limit-wall-timeout'),
+  limitIdleTimeout: $('#limit-idle-timeout'),
+  limitGrace: $('#limit-grace'),
+  limitMaxTurns: $('#limit-max-turns'),
+  limitChildTimeout: $('#limit-child-timeout'),
+  limitChildMaxTimeout: $('#limit-child-max-timeout'),
+  limitMaxSubagents: $('#limit-max-subagents'),
+  limitSubagentDepth: $('#limit-subagent-depth'),
+  limitBackgroundTasks: $('#limit-background-tasks'),
   mcpCount: $('#mcp-count'),
   mcpLibrary: $('#mcp-library'),
   mcpList: $('#mcp-list'),
@@ -1265,6 +1276,119 @@ async function handleJobAction(event) {
   }
 }
 
+// Milliseconds in the API, seconds in the form. A stored value that is not a
+// whole number of seconds still round-trips, because the field keeps the
+// fraction rather than silently rounding the operator's bound.
+const SECONDS_LIMITS = new Map([
+  ['taskWallTimeoutMs', 'limitWallTimeout'],
+  ['taskIdleTimeoutMs', 'limitIdleTimeout'],
+  ['terminationGraceMs', 'limitGrace'],
+  ['childCommandTimeoutMs', 'limitChildTimeout'],
+  ['childCommandMaxTimeoutMs', 'limitChildMaxTimeout']
+]);
+const COUNT_LIMITS = new Map([
+  ['maxHarnessTurns', 'limitMaxTurns'],
+  ['maxConcurrentSubagents', 'limitMaxSubagents'],
+  ['maxSubagentDepth', 'limitSubagentDepth']
+]);
+
+const LIMIT_LABELS = {
+  taskWallTimeoutMs: 'wall-clock timeout',
+  taskIdleTimeoutMs: 'idle timeout',
+  terminationGraceMs: 'termination grace',
+  maxHarnessTurns: 'max turns',
+  childCommandTimeoutMs: 'child command timeout',
+  childCommandMaxTimeoutMs: 'child command ceiling',
+  maxConcurrentSubagents: 'subagent concurrency',
+  maxSubagentDepth: 'subagent depth',
+  allowBackgroundTasks: 'background tasks'
+};
+
+function populateRuntimeLimits(limits = {}) {
+  for (const [field, element] of SECONDS_LIMITS) {
+    const value = Number(limits[field]);
+    ui[element].value = Number.isFinite(value) ? String(value / 1000) : '';
+  }
+  for (const [field, element] of COUNT_LIMITS) {
+    const value = Number(limits[field]);
+    ui[element].value = Number.isFinite(value) ? String(value) : '';
+  }
+  ui.limitBackgroundTasks.checked = limits.allowBackgroundTasks === true;
+}
+
+function readRuntimeLimitsForm() {
+  const limits = {};
+  for (const [field, element] of SECONDS_LIMITS) {
+    const value = Number(ui[element].value);
+    if (ui[element].value !== '' && Number.isFinite(value)) limits[field] = Math.round(value * 1000);
+  }
+  for (const [field, element] of COUNT_LIMITS) {
+    const value = Number(ui[element].value);
+    if (ui[element].value !== '' && Number.isFinite(value)) limits[field] = Math.round(value);
+  }
+  limits.allowBackgroundTasks = ui.limitBackgroundTasks.checked;
+  return limits;
+}
+
+// Says, control by control, what the attached runtime enforces. An operator
+// reading "not enforced" next to a saved value is the intended outcome: the
+// setting is kept, and the gap is stated instead of implied.
+function renderRuntimeLimitSupport(capability) {
+  // Null until a status poll answers. A saved limit is a preference, and drawing
+  // it as enforced before the runtime has confirmed is the failure this reports.
+  const support = capability?.support ?? null;
+  if (!support) {
+    ui.runtimeLimitsState.textContent = 'unknown';
+    ui.runtimeLimitsState.className = 'pill neutral';
+    ui.runtimeLimitsSupport.textContent = 'This runtime has not reported which limits it enforces. Refresh the runtime onto the current image.';
+    for (const element of [...SECONDS_LIMITS.values(), ...COUNT_LIMITS.values(), 'limitBackgroundTasks']) {
+      ui[element].closest('.field')?.classList.remove('limit-unsupported');
+    }
+    return;
+  }
+  const unsupported = Object.entries(support).filter(([, entry]) => !entry.supported).map(([field]) => LIMIT_LABELS[field] ?? field);
+  for (const [field, element] of [...SECONDS_LIMITS, ...COUNT_LIMITS]) {
+    ui[element].closest('.field')?.classList.toggle('limit-unsupported', support[field]?.supported === false);
+  }
+  ui.limitBackgroundTasks.closest('.field')?.classList.toggle('limit-unsupported', support.allowBackgroundTasks?.supported === false);
+  ui.runtimeLimitsState.textContent = unsupported.length ? 'partly enforced' : 'enforced';
+  ui.runtimeLimitsState.className = `pill ${unsupported.length ? 'neutral' : 'ready'}`;
+  ui.runtimeLimitsSupport.textContent = unsupported.length
+    ? `Saved but not enforced by ${currentHarnessName}: ${unsupported.join(', ')}.`
+    : 'Every configured limit is enforced by the wrapper or this harness.';
+}
+
+// A terminal reason an operator can act on. "Failed" and "timed out at the idle
+// bound after ten minutes of silence" call for different responses, and the
+// second is the one this whole feature exists to make visible.
+const TERMINAL_REASON_LABELS = {
+  completed: null,
+  cancelled: 'cancelled',
+  wall_timeout: 'stopped at its wall-clock limit',
+  idle_timeout: 'stalled and stopped at its idle limit',
+  worker_shutdown: 'stopped when the runtime shut down',
+  wrapper_error: 'failed in the wrapper',
+  exit_code: 'failed'
+};
+
+function renderActiveTaskSupervision(task) {
+  const active = task?.active;
+  if (active) {
+    const lifecycle = active.stalled && active.lifecycle === 'running' ? 'stalled' : active.lifecycle ?? 'running';
+    const idleMs = Number(active.idleMs);
+    ui.jobState.textContent = Number.isFinite(idleMs) && idleMs > 0
+      ? `${lifecycle} · idle ${formatDuration(idleMs)}`
+      : lifecycle;
+    ui.jobState.title = Number.isFinite(Number(active.elapsedMs)) ? `running for ${formatDuration(Number(active.elapsedMs))}` : '';
+    return;
+  }
+  const last = task?.last;
+  const label = last ? TERMINAL_REASON_LABELS[last.reason] ?? null : null;
+  const forced = last?.forceTerminated ? ' · force-terminated' : '';
+  ui.jobState.textContent = label ? `idle · last task ${label}${forced}` : 'idle';
+  ui.jobState.title = last ? `task ${last.id} ended ${last.status}` : '';
+}
+
 function populateAgentConfig(agent) {
   ui.pageAgentName.textContent = agent.name;
   ui.pageAgentDescription.textContent = agent.description || 'Configure durable instructions, then send disposable test tasks to the runtime.';
@@ -1272,6 +1396,7 @@ function populateAgentConfig(agent) {
   ui.configName.value = agent.name;
   ui.configDescription.value = agent.description;
   ui.durablePrompt.value = agent.durablePrompt;
+  populateRuntimeLimits(agent.runtimeLimits ?? {});
   const selectedModel = agent.modelPolicy?.mode === 'pinned' ? agent.modelPolicy.primary : '';
   ui.modelSelect.value = selectedModel || '';
   ui.runtimeModel.textContent = selectedModel || 'provider default';
@@ -2465,7 +2590,8 @@ async function saveAgent(event) {
     durablePrompt: ui.durablePrompt.value,
     modelPolicy: ui.modelSelect.value
       ? { mode: 'pinned', primary: ui.modelSelect.value, fallbacks: [], externalFallback: false }
-      : { mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false }
+      : { mode: 'provider-default', primary: null, fallbacks: [], externalFallback: false },
+    runtimeLimits: readRuntimeLimitsForm()
   };
   try {
     const result = await api(agentApi(), { method: 'PATCH', body: JSON.stringify(body) });
@@ -2767,6 +2893,8 @@ function renderStatus(status) {
   // Test workbench must say so rather than promising continuity it can't keep.
   currentConversationsSupported = status.capabilities?.tasks?.conversations === true;
   renderTestContinuityCopy();
+  renderRuntimeLimitSupport(status.capabilities?.runtimeLimits);
+  renderActiveTaskSupervision(status.task);
   renderRuntimeDrift();
   ui.runButton.disabled = !readyToRun || active;
   currentUsageCapability = {
@@ -3344,6 +3472,13 @@ function observeTestEvent(turn, event) {
     setTestTurnStatus(turn, 'working', 'busy');
     turn.model.textContent = data.model || ui.runtimeModel.textContent || 'provider default';
     addTestTurnActivity(turn, 'started', `${data.executionMode || 'runtime'} · ${event.taskId?.slice(0, 8) || 'pending id'}`);
+    // The bounds this turn is actually running under, from the runtime rather
+    // than from the saved form — the two differ whenever a limit is configured
+    // that this harness cannot enforce.
+    const effective = data.limits?.effective;
+    if (effective) {
+      addTestTurnActivity(turn, 'limits', `wall ${formatDuration(Number(effective.taskWallTimeoutMs))} · idle ${formatDuration(Number(effective.taskIdleTimeoutMs))}`);
+    }
     return;
   }
   if (event.type === 'message.completed') {
@@ -3353,6 +3488,37 @@ function observeTestEvent(turn, event) {
   if (event.type === 'activity.started' || event.type === 'activity.completed') {
     const detail = data.command || data.name || data.text || event.type.replace('.', ' ');
     addTestTurnActivity(turn, data.kind || event.type.replace('.', ' '), detail);
+    return;
+  }
+  if (event.type === 'runtime.stalled') {
+    setTestTurnStatus(turn, 'stalled', 'error');
+    addTestTurnActivity(turn, 'stalled', `no output for ${formatDuration(Number(data.idleMs))} · ${data.activeSubagents ?? 0} subagent(s), ${data.activeChildCommands ?? 0} command(s) open`);
+    return;
+  }
+  if (event.type === 'runtime.resumed') {
+    setTestTurnStatus(turn, 'working', 'busy');
+    addTestTurnActivity(turn, 'resumed', 'the harness produced output again');
+    return;
+  }
+  if (event.type === 'runtime.termination') {
+    setTestTurnStatus(turn, data.phase === 'force' ? 'force-terminating' : 'terminating', 'error');
+    addTestTurnActivity(turn, 'termination', data.phase === 'force'
+      ? `grace period spent · killing the ${data.processGroup ? 'process tree' : 'harness'}`
+      : `${data.reason} · signalling the ${data.processGroup ? 'process tree' : 'harness'}`);
+    return;
+  }
+  if (event.type === 'subagent.started' || event.type === 'subagent.completed') {
+    const finished = event.type === 'subagent.completed';
+    addTestTurnActivity(turn, finished ? 'subagent done' : 'subagent', finished
+      ? `${data.name ?? 'subagent'} · ${data.status} · ${formatDuration(Number(data.durationMs))}`
+      : `${data.name ?? 'subagent'} · depth ${data.depth ?? 1} · ${data.active ?? 1} active`);
+    return;
+  }
+  if (event.type === 'child.started' || event.type === 'child.completed') {
+    const finished = event.type === 'child.completed';
+    addTestTurnActivity(turn, finished ? 'command done' : 'command', finished
+      ? `${data.name ?? 'command'} · ${data.status} · ${formatDuration(Number(data.durationMs))}`
+      : `${data.name ?? 'command'} · timeout ${data.timeoutMs ? formatDuration(Number(data.timeoutMs)) : 'harness default'}`);
     return;
   }
   if (event.type === 'log') {
@@ -3384,7 +3550,19 @@ function observeTestEvent(turn, event) {
     turn.completed = true;
     setTestTurnStatus(turn, data.status || 'completed', succeeded ? 'ready' : 'error');
     turn.duration.textContent = formatDuration(performance.now() - turn.startedAt);
-    if (!succeeded && turn.pending) appendTestAnswer(turn, `Task ${data.status || 'failed'}${Number.isFinite(data.exitCode) ? ` with exit code ${data.exitCode}` : ''}.`, 'test-turn-error');
+    // The reason is what distinguishes a harness that failed from one that was
+    // stopped because it stalled — the same terminal status, very different fix.
+    const reason = TERMINAL_REASON_LABELS[data.reason];
+    if (reason) setTestTurnStatus(turn, data.forceTerminated ? `${data.status} · force-terminated` : data.status, 'error');
+    // A provider may emit a final answer and then be stopped at a runtime
+    // boundary before the process exits. In that case `turn.pending` has already
+    // been removed, but hiding the terminal reason would make a timed-out task
+    // look successful in the transcript. Always append actionable supervision
+    // reasons; retain the old pending guard for an ordinary provider failure so
+    // we do not duplicate a provider-supplied error message.
+    if (!succeeded && (reason || turn.pending)) appendTestAnswer(turn, reason
+      ? `Task ${data.status || 'failed'}: ${reason}${data.forceTerminated ? ', and its process tree was force-terminated' : ''}.`
+      : `Task ${data.status || 'failed'}${Number.isFinite(data.exitCode) ? ` with exit code ${data.exitCode}` : ''}.`, 'test-turn-error');
   }
 }
 
